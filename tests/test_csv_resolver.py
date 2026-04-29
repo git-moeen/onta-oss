@@ -1,6 +1,13 @@
 """Tests for CSV schema inference and deterministic mapping."""
 
-from cograph_client.resolver.csv_resolver import CSVResolver, _safe_id, _snake_case
+import pytest
+
+from cograph_client.resolver.csv_resolver import (
+    CSVResolver,
+    _rank_sample_rows,
+    _safe_id,
+    _snake_case,
+)
 from cograph_client.resolver.models import ColumnMapping, ColumnRole, CSVSchemaMapping
 
 
@@ -96,6 +103,92 @@ class TestApplyMapping:
         city_entities = [e for e in entities if e.type_name == "City"]
         # Austin should only appear once as a stub entity
         assert len(city_entities) == 1
+
+
+class TestRankSampleRows:
+    def test_picks_dense_rows_first(self):
+        sparse = [{"slug": f"s{i}", "url": f"u{i}", "name": "", "bio": "", "email": ""} for i in range(12)]
+        dense = [
+            {"slug": f"d{i}", "url": f"u{i}", "name": f"n{i}", "bio": f"b{i}", "email": f"e{i}@x"}
+            for i in range(5)
+        ]
+        ranked = _rank_sample_rows(sparse + dense)
+        # All 5 dense rows should land in the top 5
+        assert all(r["name"] != "" for r in ranked[:5])
+
+    def test_stable_on_ties(self):
+        rows = [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}, {"a": "5", "b": "6"}]
+        ranked = _rank_sample_rows(rows)
+        # All scored equally — order preserved
+        assert ranked == rows
+
+    def test_does_not_mutate_input(self):
+        rows = [{"a": ""}, {"a": "x"}]
+        original = list(rows)
+        _rank_sample_rows(rows)
+        assert rows == original
+
+    def test_treats_whitespace_as_empty(self):
+        rows = [{"a": "   ", "b": ""}, {"a": "x", "b": "y"}]
+        ranked = _rank_sample_rows(rows)
+        assert ranked[0]["a"] == "x"
+
+    def test_handles_none_values(self):
+        rows = [{"a": None, "b": None}, {"a": "x", "b": "y"}]
+        ranked = _rank_sample_rows(rows)
+        assert ranked[0]["a"] == "x"
+
+
+class TestInferSchemaRetry:
+    @pytest.mark.asyncio
+    async def test_retries_on_validation_error(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        resolver = CSVResolver(client=None, openrouter_key="")
+        valid_data = {
+            "entity_type": "Mentor",
+            "columns": [
+                {"column_name": "slug", "role": "type_id", "datatype": "string"},
+                {"column_name": "name", "role": "attribute", "datatype": "string", "attribute_name": "name"},
+            ],
+        }
+        # First call: malformed key shape (raises KeyError in _build_mapping); second: valid
+        bad_data = {"entity_type_oops": "Mentor", "columns": []}
+
+        call_log: list[float] = []
+
+        async def fake_call(user_content: str, temperature: float = 0.0):
+            call_log.append(temperature)
+            return bad_data if len(call_log) == 1 else valid_data
+
+        monkeypatch.setattr(resolver, "_call_llm", fake_call)
+
+        mapping = await resolver.infer_schema(
+            headers=["slug", "name"],
+            sample_rows=[{"slug": "s", "name": "n"}],
+            existing_types={},
+            total_rows=1,
+        )
+        assert mapping.entity_type == "Mentor"
+        assert call_log == [0.0, 0.3]
+
+    @pytest.mark.asyncio
+    async def test_propagates_when_retry_also_fails(self, monkeypatch):
+        resolver = CSVResolver(client=None, openrouter_key="")
+        bad_data = {"entity_type_oops": "Mentor", "columns": []}
+
+        async def fake_call(user_content: str, temperature: float = 0.0):
+            return bad_data
+
+        monkeypatch.setattr(resolver, "_call_llm", fake_call)
+
+        with pytest.raises(KeyError):
+            await resolver.infer_schema(
+                headers=["slug"],
+                sample_rows=[{"slug": "s"}],
+                existing_types={},
+                total_rows=1,
+            )
 
 
 class TestBatchedInsertTriples:

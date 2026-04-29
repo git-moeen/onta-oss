@@ -1,8 +1,11 @@
 """POST /graphs/{tenant}/ingest — raw data ingestion with schema resolution."""
 
+import json
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import ValidationError
 
 from cograph_client.api.deps import get_neptune_client
 from cograph_client.api.rate_limit import limiter
@@ -16,6 +19,7 @@ from cograph_client.resolver.schema_resolver import SchemaResolver
 from cograph_client.resolver.verdict_cache import JsonVerdictCache
 
 router = APIRouter(prefix="/graphs/{tenant}")
+_log = structlog.stdlib.get_logger("cograph.api.ingest")
 
 # Verdict cache lives alongside the app data. For ECS/Fargate deployments,
 # this should be on an EFS mount or replaced with DynamoDB.
@@ -96,7 +100,18 @@ async def infer_csv_schema(
         anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key),
         settings.openrouter_api_key,
     )
-    return await csv_resolver.infer_schema(body.headers, body.sample_rows, existing_types, body.total_rows)
+    try:
+        return await csv_resolver.infer_schema(body.headers, body.sample_rows, existing_types, body.total_rows)
+    except (ValidationError, KeyError, json.JSONDecodeError) as e:
+        _log.warning("csv_schema_inference_failed", error=str(e))
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Schema inference failed after retry: {e}. "
+                "The CSV's leading rows may be too sparse — ensure at least a "
+                "few rows have most fields populated."
+            ),
+        )
 
 
 @router.post("/ingest/csv/rows", response_model=IngestResult)

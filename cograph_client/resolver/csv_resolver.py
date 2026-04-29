@@ -10,6 +10,7 @@ import re
 import anthropic
 import httpx
 import structlog
+from pydantic import ValidationError
 
 from cograph_client.resolver.models import (
     ColumnMapping,
@@ -94,38 +95,34 @@ class CSVResolver:
         existing_types: dict[str, str],
         total_rows: int = 0,
     ) -> CSVSchemaMapping:
-        """Infer column-to-ontology mapping from sample rows. Single LLM call."""
+        """Infer column-to-ontology mapping from sample rows. Single LLM call,
+        with one retry at higher temperature if the response fails validation."""
         types_str = "\n".join(f"- {name}" for name in existing_types) if existing_types else "(none)"
+
+        # Prefer rows with the most non-empty fields. CSVs whose leading rows
+        # are mostly-empty (e.g. `status=deleted` records with only slug+url)
+        # otherwise feed the LLM a near-blank sample, which reliably produces
+        # malformed JSON keys (observed: `column118 name`).
+        ranked_samples = _rank_sample_rows(sample_rows)[:10]
         sample_str = "\n".join(
-            json.dumps(row, default=str) for row in sample_rows[:10]
+            json.dumps(row, default=str) for row in ranked_samples
         )
 
         user_content = CSV_SCHEMA_USER.format(
             columns=", ".join(headers),
-            n=len(sample_rows[:10]),
+            n=len(ranked_samples),
             total=total_rows or len(sample_rows),
             sample_rows=sample_str,
             existing_types=types_str,
         )
 
-        if self.EXTRACT_PROVIDER == "openrouter" and self._openrouter_key:
-            data = await self._infer_via_openrouter(user_content)
-        else:
-            data = await self._infer_via_anthropic(user_content)
-        # Gemini Flash occasionally emits `datatype: null` for a column it
-        # can't classify. Coerce to "string" so the pydantic model doesn't
-        # reject the whole inference — callers can always retry the
-        # downstream resolver pass if the string guess turns out wrong.
-        for col in data.get("columns", []):
-            if col.get("datatype") is None:
-                col["datatype"] = "string"
-            if col.get("role") is None:
-                col["role"] = "attribute"
-
-        mapping = CSVSchemaMapping(
-            entity_type=data["entity_type"],
-            columns=[ColumnMapping(**col) for col in data["columns"]],
-        )
+        try:
+            data = await self._call_llm(user_content, temperature=0.0)
+            mapping = self._build_mapping(data)
+        except (ValidationError, KeyError, json.JSONDecodeError) as e:
+            logger.warning("csv_schema_validation_retry", error=str(e))
+            data = await self._call_llm(user_content, temperature=0.3)
+            mapping = self._build_mapping(data)
 
         # Validate: must have exactly one type_id
         id_cols = [c for c in mapping.columns if c.role == ColumnRole.TYPE_ID]
@@ -203,7 +200,27 @@ class CSVResolver:
         )
         return mapping
 
-    async def _infer_via_openrouter(self, user_content: str) -> dict:
+    async def _call_llm(self, user_content: str, temperature: float = 0.0) -> dict:
+        if self.EXTRACT_PROVIDER == "openrouter" and self._openrouter_key:
+            return await self._infer_via_openrouter(user_content, temperature)
+        return await self._infer_via_anthropic(user_content, temperature)
+
+    def _build_mapping(self, data: dict) -> CSVSchemaMapping:
+        # Gemini Flash occasionally emits `datatype: null` for a column it
+        # can't classify. Coerce to "string" so the pydantic model doesn't
+        # reject the whole inference — callers can always retry the
+        # downstream resolver pass if the string guess turns out wrong.
+        for col in data.get("columns", []):
+            if col.get("datatype") is None:
+                col["datatype"] = "string"
+            if col.get("role") is None:
+                col["role"] = "attribute"
+        return CSVSchemaMapping(
+            entity_type=data["entity_type"],
+            columns=[ColumnMapping(**col) for col in data["columns"]],
+        )
+
+    async def _infer_via_openrouter(self, user_content: str, temperature: float = 0.0) -> dict:
         async with httpx.AsyncClient(timeout=60) as client:
             res = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -218,7 +235,7 @@ class CSVResolver:
                         {"role": "user", "content": user_content},
                     ],
                     "max_tokens": 2048,
-                    "temperature": 0,
+                    "temperature": temperature,
                 },
             )
             res.raise_for_status()
@@ -229,10 +246,11 @@ class CSVResolver:
                 stripped = "\n".join(lines)
             return json.loads(stripped)
 
-    async def _infer_via_anthropic(self, user_content: str) -> dict:
+    async def _infer_via_anthropic(self, user_content: str, temperature: float = 0.0) -> dict:
         msg = await self._client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,
+            temperature=temperature,
             system=CSV_SCHEMA_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
             output_config={
@@ -367,6 +385,20 @@ class CSVResolver:
             ))
 
         return entities, relationships
+
+
+def _rank_sample_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Sort by descending non-empty field count; stable on ties (preserves
+    original order). Used so the LLM gets the most informative rows when the
+    head of the CSV is sparse (deleted/empty records). Does not mutate input."""
+    def score(row: dict) -> int:
+        return sum(
+            1 for v in row.values()
+            if v is not None and (not isinstance(v, str) or v.strip() != "")
+        )
+    indexed = list(enumerate(rows))
+    indexed.sort(key=lambda t: (-score(t[1]), t[0]))
+    return [r for _, r in indexed]
 
 
 def _safe_id(raw: str) -> str:

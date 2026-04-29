@@ -277,9 +277,25 @@ export class Client {
     if (rows.length === 0) throw new CographError("CSV is empty");
     const headers = Object.keys(rows[0]!);
 
+    // Pick the rows with the most non-empty fields for schema inference.
+    // Mostly-empty leading rows (e.g. soft-deleted records) otherwise feed
+    // the LLM a near-blank sample and reliably produce malformed JSON.
+    // Stable on ties — original order preserved within equal scores.
+    const sampleRows = rows
+      .map((row, idx) => ({
+        row,
+        idx,
+        score: Object.values(row).filter(
+          (v) => v != null && String(v).trim() !== "",
+        ).length,
+      }))
+      .sort((a, b) => b.score - a.score || a.idx - b.idx)
+      .slice(0, 10)
+      .map((s) => s.row);
+
     const schemaBody = {
       headers,
-      sample_rows: rows.slice(0, 5),
+      sample_rows: sampleRows,
       total_rows: rows.length,
     };
     const mapping = await this.request<Record<string, unknown>>(
