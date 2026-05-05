@@ -1,6 +1,13 @@
 import * as readline from "node:readline";
 import { stdin, stdout } from "node:process";
-import { Client, CographError, type TypeCount } from "./client.js";
+import {
+  Client,
+  CographError,
+  type TypeCount,
+  type EnrichJob,
+  type ConflictReview,
+  type JobSummary,
+} from "./client.js";
 
 const CYAN = "\x1b[36m";
 const CYAN_BOLD = "\x1b[1;36m";
@@ -60,6 +67,10 @@ function showCommands(): void {
     ["/types [query]", "List types in the current KG (with entity counts)"],
     ["/type <name>", "Drill into one type — attributes, relationships, samples"],
     ["/type <name> --system", "…also include auto-attached system attributes"],
+    ["/enrich <Type> <attr> ...", "Plan + run an enrichment job (interactive)"],
+    ["/enrich watch <job_id>", "Live progress for a running job"],
+    ["/enrich jobs", "List recent enrichment jobs"],
+    ["/enrich review <job_id>", "Walk through conflicts and accept/reject"],
     ["/login", "Re-authenticate (browser)"],
     ["/status", "Show graph stats"],
     ["/reset", "Clear the current KG"],
@@ -564,6 +575,339 @@ async function cmdType(
   stdout.write("\n");
 }
 
+function lastUriSegment(uri: string): string {
+  if (!uri) return uri;
+  const hash = uri.lastIndexOf("#");
+  if (hash >= 0 && hash < uri.length - 1) return uri.slice(hash + 1);
+  const slash = uri.lastIndexOf("/");
+  if (slash >= 0 && slash < uri.length - 1) return uri.slice(slash + 1);
+  return uri;
+}
+
+function relativeTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "—";
+  const diffMs = Date.now() - t;
+  const s = Math.max(0, Math.floor(diffMs / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+
+function progressBar(processed: number, total: number, width = 20): string {
+  if (!total || total <= 0) return "[" + " ".repeat(width) + "]";
+  const ratio = Math.max(0, Math.min(1, processed / total));
+  const filled = Math.round(ratio * width);
+  return "[" + "█".repeat(filled) + "░".repeat(width - filled) + "]";
+}
+
+function statusColor(status: string): string {
+  switch (status) {
+    case "applied":
+      return GREEN;
+    case "failed":
+      return RED;
+    case "review":
+      return YELLOW;
+    case "cancelled":
+      return DIM;
+    default:
+      return CYAN;
+  }
+}
+
+async function cmdEnrichRun(
+  client: Client,
+  kg: string,
+  rl: readline.Interface,
+  args: string[],
+): Promise<void> {
+  if (args.length < 2) {
+    stdout.write(
+      `  ${YELLOW}Usage:${RESET} /enrich <Type> <attr1> [<attr2> ...]\n`,
+    );
+    return;
+  }
+  const typeInput = args[0]!;
+  const attrs = args.slice(1).map((a) => a.replace(/^\./, ""));
+  const typeName = await resolveTypeName(client, kg, rl, typeInput);
+  if (!typeName) return;
+
+  const tier: "lite" = "lite";
+  const policy: "stage" = "stage";
+  stdout.write(
+    `\n  ${BOLD}Plan:${RESET} enrich ${CYAN}${typeName}${RESET}.${attrs
+      .map((a) => `${CYAN}${a}${RESET}`)
+      .join(`, .`)} in ${BOLD}${kg}${RESET}  ${DIM}·${RESET} tier: ${tier}  ${DIM}·${RESET} policy: ${policy}\n\n`,
+  );
+
+  const sp = startSpinner(`Queueing enrichment for ${typeName}...`);
+  let created;
+  try {
+    created = await client.enrichRun({
+      type_name: typeName,
+      attributes: attrs,
+      tier,
+      kg_name: kg,
+      conflict_policy: policy,
+    });
+  } catch (err) {
+    sp.stop();
+    if (err instanceof CographError) printError(err.message);
+    else printError(err instanceof Error ? err.message : String(err));
+    return;
+  }
+  sp.stop();
+
+  const cost = (created.estimated_cost_usd ?? 0).toFixed(4);
+  stdout.write(
+    `  ${GREEN}✓${RESET} Job queued: ${CYAN_BOLD}${created.job_id}${RESET} ${DIM}·${RESET} estimated cost ${BOLD}$${cost}${RESET} ${DIM}·${RESET} ${fmtNum(created.total_entities ?? 0)} entities\n`,
+  );
+
+  const watch = (await ask(rl, `  Watch progress? [Y/n]: `)).trim().toLowerCase();
+  if (watch === "" || watch === "y" || watch === "yes") {
+    await watchJob(client, created.job_id);
+  } else {
+    stdout.write(
+      `  ${DIM}Tip: /enrich watch ${created.job_id} to follow it.${RESET}\n`,
+    );
+  }
+}
+
+async function watchJob(client: Client, jobId: string): Promise<void> {
+  const startedAt = Date.now();
+  let lastJob: EnrichJob | null = null;
+  // Render in place
+  const draw = (job: EnrichJob): void => {
+    const p = job.progress;
+    const bar = progressBar(p.processed, p.total);
+    const elapsed = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+    const rate = p.processed / elapsed;
+    let etaStr = "—";
+    if (rate > 0 && p.total > p.processed) {
+      const remaining = Math.ceil((p.total - p.processed) / rate);
+      etaStr =
+        remaining < 60
+          ? `${remaining}s`
+          : remaining < 3600
+            ? `${Math.floor(remaining / 60)}m`
+            : `${Math.floor(remaining / 3600)}h`;
+    }
+    const sc = statusColor(job.status);
+    stdout.write(
+      `\r\x1b[2K  ${sc}${job.status}${RESET} ${bar} ${fmtNum(p.processed)}/${fmtNum(p.total)} ` +
+        `${DIM}·${RESET} filled ${GREEN}${fmtNum(p.filled)}${RESET} ` +
+        `${DIM}·${RESET} verified ${CYAN}${fmtNum(p.verified)}${RESET} ` +
+        `${DIM}·${RESET} conflicts ${YELLOW}${fmtNum(p.conflicts)}${RESET} ` +
+        `${DIM}·${RESET} ETA ${etaStr}`,
+    );
+  };
+
+  while (true) {
+    let job: EnrichJob;
+    try {
+      job = await client.enrichJob(jobId);
+    } catch (err) {
+      stdout.write("\r\x1b[2K");
+      if (err instanceof CographError) printError(err.message);
+      else printError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    lastJob = job;
+    draw(job);
+    if (job.status !== "running" && job.status !== "queued") break;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+
+  // Final newline after the live line.
+  stdout.write("\n");
+  if (!lastJob) return;
+  const p = lastJob.progress;
+  if (lastJob.status === "review") {
+    stdout.write(
+      `  ${YELLOW}✦${RESET} ${fmtNum(p.conflicts)} conflict${p.conflicts === 1 ? "" : "s"} need review. ` +
+        `${DIM}Run${RESET} /enrich review ${lastJob.id}${DIM} to walk through them.${RESET}\n`,
+    );
+  } else if (lastJob.status === "applied") {
+    stdout.write(
+      `  ${GREEN}✓${RESET} Applied ${DIM}·${RESET} filled ${fmtNum(p.filled)}, verified ${fmtNum(p.verified)}, skipped ${fmtNum(p.skipped)}\n`,
+    );
+  } else if (lastJob.status === "failed") {
+    printError(`Job failed: ${lastJob.error ?? "(no error message)"}`);
+  } else if (lastJob.status === "cancelled") {
+    stdout.write(`  ${DIM}Job cancelled.${RESET}\n`);
+  }
+}
+
+async function cmdEnrichJobs(client: Client): Promise<void> {
+  const sp = startSpinner("Loading enrichment jobs...");
+  let jobs: JobSummary[];
+  try {
+    jobs = await client.enrichJobs();
+  } catch (err) {
+    sp.stop();
+    if (err instanceof CographError) printError(err.message);
+    else printError(err instanceof Error ? err.message : String(err));
+    return;
+  }
+  sp.stop();
+
+  if (jobs.length === 0) {
+    stdout.write(`  ${DIM}No enrichment jobs yet.${RESET}\n`);
+    return;
+  }
+
+  const truncAttrs = (attrs: string[]): string => {
+    const max = 30;
+    const joined = attrs.join(", ");
+    if (joined.length <= max) return joined;
+    return joined.slice(0, max - 1) + "…";
+  };
+
+  const rows = jobs.map((j) => ({
+    id: j.id,
+    type: j.type_name,
+    attrs: truncAttrs(j.attributes ?? []),
+    status: j.status,
+    progress: `${fmtNum(j.progress?.processed ?? 0)}/${fmtNum(j.progress?.total ?? 0)}`,
+    created: relativeTime(j.created_at),
+  }));
+
+  const w = {
+    id: Math.max("ID".length, ...rows.map((r) => r.id.length)),
+    type: Math.max("Type".length, ...rows.map((r) => r.type.length)),
+    attrs: Math.max("Attrs".length, ...rows.map((r) => r.attrs.length)),
+    status: Math.max("Status".length, ...rows.map((r) => r.status.length)),
+    progress: Math.max("Progress".length, ...rows.map((r) => r.progress.length)),
+  };
+
+  stdout.write("\n");
+  stdout.write(
+    `  ${BOLD}${"ID".padEnd(w.id)}  ${"Type".padEnd(w.type)}  ${"Attrs".padEnd(w.attrs)}  ${"Status".padEnd(w.status)}  ${"Progress".padEnd(w.progress)}  Created${RESET}\n`,
+  );
+  for (const r of rows) {
+    const sc = statusColor(r.status);
+    stdout.write(
+      `  ${CYAN}${r.id.padEnd(w.id)}${RESET}  ${r.type.padEnd(w.type)}  ${DIM}${r.attrs.padEnd(w.attrs)}${RESET}  ${sc}${r.status.padEnd(w.status)}${RESET}  ${r.progress.padEnd(w.progress)}  ${DIM}${r.created}${RESET}\n`,
+    );
+  }
+  stdout.write("\n");
+}
+
+async function cmdEnrichReview(
+  client: Client,
+  rl: readline.Interface,
+  jobId: string,
+): Promise<void> {
+  if (!jobId) {
+    stdout.write(`  ${YELLOW}Usage:${RESET} /enrich review <job_id>\n`);
+    return;
+  }
+  const sp = startSpinner(`Loading conflicts for ${jobId}...`);
+  let conflicts: ConflictReview[];
+  try {
+    conflicts = await client.enrichConflicts(jobId);
+  } catch (err) {
+    sp.stop();
+    if (err instanceof CographError) printError(err.message);
+    else printError(err instanceof Error ? err.message : String(err));
+    return;
+  }
+  sp.stop();
+
+  if (conflicts.length === 0) {
+    stdout.write(`  ${DIM}No conflicts to review.${RESET}\n`);
+    return;
+  }
+
+  const decisions: ConflictReview[] = [];
+  let acceptAll = false;
+  let quitEarly = false;
+
+  for (let i = 0; i < conflicts.length; i++) {
+    const c = conflicts[i]!;
+    const entity = lastUriSegment(c.entity_uri);
+    const conf = (c.proposed?.confidence ?? 0).toFixed(2);
+    stdout.write("\n");
+    stdout.write(
+      `  ${DIM}[${i + 1}/${conflicts.length}]${RESET} ${BOLD}${entity}${RESET}.${CYAN}${c.attribute}${RESET}\n`,
+    );
+    stdout.write(
+      `    ${DIM}existing →${RESET} ${c.existing_value}\n` +
+        `    ${DIM}proposed →${RESET} ${BOLD}${c.proposed?.value ?? ""}${RESET} ${DIM}(conf ${conf}, src ${c.proposed?.source ?? "?"})${RESET}\n`,
+    );
+    if (c.proposed?.source_url) {
+      stdout.write(`    ${DIM}url      →${RESET} ${c.proposed.source_url}\n`);
+    }
+
+    let decision: "accept" | "reject" | "skip";
+    if (acceptAll) {
+      decision = "accept";
+      stdout.write(`    ${GREEN}auto-accepted${RESET}\n`);
+    } else {
+      const ans = (
+        await ask(
+          rl,
+          `    [a]ccept / [r]eject / [s]kip / [A]ccept all remaining / [q]uit (saves progress) [s]: `,
+        )
+      ).trim();
+      if (ans === "A") {
+        acceptAll = true;
+        decision = "accept";
+      } else if (ans === "a") {
+        decision = "accept";
+      } else if (ans === "r") {
+        decision = "reject";
+      } else if (ans === "q") {
+        quitEarly = true;
+        break;
+      } else {
+        decision = "skip";
+      }
+    }
+    decisions.push({ ...c, decision });
+  }
+
+  if (quitEarly) {
+    if (decisions.length === 0) {
+      stdout.write(`  ${DIM}No decisions made — nothing to save.${RESET}\n`);
+      return;
+    }
+    const save = (
+      await ask(rl, `  Save ${decisions.length} decision(s) so far? [Y/n]: `)
+    )
+      .trim()
+      .toLowerCase();
+    if (save !== "" && save !== "y" && save !== "yes") {
+      stdout.write(`  ${DIM}Discarded.${RESET}\n`);
+      return;
+    }
+  }
+
+  if (decisions.length === 0) {
+    stdout.write(`  ${DIM}No decisions to apply.${RESET}\n`);
+    return;
+  }
+
+  const sp2 = startSpinner(`Applying ${decisions.length} decision(s)...`);
+  try {
+    const res = await client.enrichApply(jobId, decisions);
+    sp2.stop();
+    stdout.write(
+      `  ${GREEN}✓${RESET} Applied ${BOLD}${fmtNum(res.applied)}${RESET} change${res.applied === 1 ? "" : "s"}.\n`,
+    );
+  } catch (err) {
+    sp2.stop();
+    if (err instanceof CographError) printError(err.message);
+    else printError(err instanceof Error ? err.message : String(err));
+  }
+}
+
 function makePrompt(kg: string, triples: number): string {
   const kgPart = `${DIM}(${kg})${RESET}`;
   if (triples > 0) {
@@ -698,6 +1042,27 @@ export async function runShell(opts: { kg?: string }): Promise<void> {
       } else if (line.startsWith("/type ") || line === "/type") {
         const arg = line === "/type" ? "" : line.slice("/type ".length);
         await cmdType(client, kg, rl, arg);
+      } else if (line === "/enrich" || line.startsWith("/enrich ")) {
+        const args = splitArgs(line.slice("/enrich".length).trim());
+        if (args.length === 0) {
+          stdout.write(
+            `  ${YELLOW}Usage:${RESET} /enrich <Type> <attr> ... | /enrich watch <id> | /enrich jobs | /enrich review <id>\n`,
+          );
+        } else if (args[0] === "jobs") {
+          await cmdEnrichJobs(client);
+        } else if (args[0] === "watch") {
+          const jid = args[1];
+          if (!jid) {
+            stdout.write(`  ${YELLOW}Usage:${RESET} /enrich watch <job_id>\n`);
+          } else {
+            await watchJob(client, jid);
+          }
+        } else if (args[0] === "review") {
+          await cmdEnrichReview(client, rl, args[1] ?? "");
+        } else {
+          await cmdEnrichRun(client, kg, rl, args);
+          await refresh();
+        }
       } else if (line === "/status") {
         await cmdStatus(client, kg);
         await refresh();
@@ -819,7 +1184,7 @@ export async function runShell(opts: { kg?: string }): Promise<void> {
         }
       } else if (line.startsWith("/")) {
         stdout.write(
-          `  ${YELLOW}Unknown command.${RESET} Try /ingest, /ask, /kg, /types, /type, /login, /status, /reset, /help, /quit\n`,
+          `  ${YELLOW}Unknown command.${RESET} Try /ingest, /ask, /kg, /types, /type, /enrich, /login, /status, /reset, /help, /quit\n`,
         );
       } else {
         // Bare line — auto-route to /ask

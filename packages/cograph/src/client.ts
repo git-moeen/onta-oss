@@ -436,6 +436,71 @@ export class Client {
     return Array.isArray(data) ? (data as TypeCount[]) : [];
   }
 
+  /** Plan + run an enrichment job. Returns immediately with the job id. */
+  async enrichRun(req: EnrichRequest): Promise<EnrichJobCreate> {
+    return this.request<EnrichJobCreate>(
+      "POST",
+      `${this.base()}/enrich/jobs`,
+      req,
+      30_000,
+    );
+  }
+
+  /** List recent enrichment jobs for the current tenant. */
+  async enrichJobs(): Promise<JobSummary[]> {
+    const data = await this.request<unknown>(
+      "GET",
+      `${this.base()}/enrich/jobs`,
+      undefined,
+      15_000,
+    );
+    return Array.isArray(data) ? (data as JobSummary[]) : [];
+  }
+
+  /** Fetch a single enrichment job (with truncated results). */
+  async enrichJob(jobId: string): Promise<EnrichJob> {
+    return this.request<EnrichJob>(
+      "GET",
+      `${this.base()}/enrich/jobs/${encodeURIComponent(jobId)}`,
+      undefined,
+      15_000,
+    );
+  }
+
+  /** Fetch the conflict review queue for a job. */
+  async enrichConflicts(jobId: string): Promise<ConflictReview[]> {
+    const data = await this.request<unknown>(
+      "GET",
+      `${this.base()}/enrich/jobs/${encodeURIComponent(jobId)}/conflicts`,
+      undefined,
+      30_000,
+    );
+    return Array.isArray(data) ? (data as ConflictReview[]) : [];
+  }
+
+  /** Apply a set of conflict review decisions to a job. */
+  async enrichApply(
+    jobId: string,
+    decisions: ConflictReview[],
+  ): Promise<{ applied: number }> {
+    return this.request<{ applied: number }>(
+      "POST",
+      `${this.base()}/enrich/jobs/${encodeURIComponent(jobId)}/apply`,
+      { decisions },
+      60_000,
+    );
+  }
+
+  /** Cancel an enrichment job. */
+  async enrichCancel(jobId: string): Promise<void> {
+    await this.request<void>(
+      "DELETE",
+      `${this.base()}/enrich/jobs/${encodeURIComponent(jobId)}`,
+      undefined,
+      15_000,
+    );
+  }
+
   /** Per-type breakdown for one type in one KG: definition + counts + samples.
    *
    * System predicates (rdfs:label, ingested_at, source) are hidden by default
@@ -486,4 +551,94 @@ export interface TypeUsage {
   attributes: AttributeUsage[];
   relationships: RelationshipUsage[];
   samples: EntitySample[];
+}
+
+export type EnrichmentTier = "lite" | "base" | "core" | "pro";
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "review"
+  | "applied"
+  | "cancelled"
+  | "failed";
+export type ConflictPolicy = "skip" | "verify" | "overwrite" | "stage";
+export type RowAction =
+  | "filled"
+  | "verified"
+  | "conflict"
+  | "skipped"
+  | "no_match";
+export type ReviewDecision = "accept" | "reject" | "skip";
+
+export interface EnrichRequest {
+  type_name: string;
+  attributes: string[];
+  tier?: EnrichmentTier;
+  kg_name: string;
+  conflict_policy?: ConflictPolicy;
+  confidence_min?: number;
+  limit?: number;
+}
+
+export interface EnrichJobCreate {
+  job_id: string;
+  status: JobStatus;
+  estimated_cost_usd: number;
+  total_entities: number;
+}
+
+export interface Verdict {
+  value: string;
+  confidence: number;
+  source: string;
+  source_url?: string | null;
+  reasoning?: string | null;
+}
+
+export interface JobProgress {
+  total: number;
+  processed: number;
+  filled: number;
+  verified: number;
+  conflicts: number;
+  skipped: number;
+  cache_hits: number;
+}
+
+export interface RowResult {
+  entity_uri: string;
+  attribute: string;
+  existing_value: string | null;
+  verdict: Verdict | null;
+  action: RowAction;
+}
+
+export interface JobSummary {
+  id: string;
+  tenant_id: string;
+  kg_name: string;
+  type_name: string;
+  attributes: string[];
+  tier: EnrichmentTier;
+  status: JobStatus;
+  progress: JobProgress;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  conflict_policy: ConflictPolicy;
+  confidence_min: number;
+  error?: string | null;
+}
+
+export interface EnrichJob extends JobSummary {
+  results?: RowResult[];
+  limit?: number | null;
+}
+
+export interface ConflictReview {
+  entity_uri: string;
+  attribute: string;
+  existing_value: string;
+  proposed: Verdict;
+  decision?: ReviewDecision | null;
 }
