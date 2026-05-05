@@ -1,6 +1,23 @@
 import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { Client, CographError } from "./client.js";
+
+// Read version from package.json at runtime so we never drift again.
+// dist/cli.js sits next to package.json once published; in dev (`npm link`)
+// dist/cli.js sits inside packages/cograph/dist/, so the parent dir is the
+// package root either way.
+function pkgVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf-8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 function client(): Client {
   return new Client();
@@ -40,7 +57,7 @@ const program = new Command();
 program
   .name("cograph")
   .description("Cograph Knowledge Graph CLI")
-  .version("0.1.7")
+  .version(pkgVersion())
   // Default action when no subcommand is given: drop into the interactive
   // shell. So `cograph` (or `npx cograph`) Just Works for the common case;
   // subcommands like `cograph ingest <file>` still route to their own
