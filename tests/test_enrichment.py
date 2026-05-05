@@ -24,7 +24,10 @@ from cograph_client.enrichment.models import (
     JobStatus,
     Verdict,
 )
-from cograph_client.enrichment.sources.wikidata import WikidataAdapter
+from cograph_client.enrichment.sources.wikidata import (
+    WikidataAdapter,
+    _clean_label_candidates,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +215,143 @@ def test_wikidata_adapter_no_search_results():
     async def run():
         adapter = WikidataAdapter()
         client = AsyncMock()
-        client.get.side_effect = [_mk_response({"search": []})]
+        # All 4 fallback candidates return no hits — capped at 4 search calls.
+        client.get.side_effect = [_mk_response({"search": []})] * 4
         adapter._client = client
         verdicts = await adapter.lookup("ZZZNOPE", "country", {})
         assert verdicts == []
 
     asyncio.run(run())
+
+
+def test_wikidata_label_strips_trailing_sku():
+    """First search (full label) misses; SKU-stripped candidate hits.
+
+    Confidence is reduced by 0.05 because we used the first fallback step.
+    """
+    async def run():
+        adapter = WikidataAdapter()
+        client = AsyncMock()
+        # 1) original "Apple MacBook Pro M3" → empty
+        # 2) "Apple MacBook Pro" → hit Q312 (Apple Inc.)
+        # 3) entity claims for manufacturer (P176) → string value
+        client.get.side_effect = [
+            _mk_response({"search": []}),
+            _mk_response({"search": [{"id": "Q312"}]}),
+            _mk_response(
+                {
+                    "entities": {
+                        "Q312": {
+                            "claims": {
+                                "P176": [
+                                    {
+                                        "mainsnak": {
+                                            "datavalue": {
+                                                "type": "string",
+                                                "value": "Apple Inc.",
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            ),
+        ]
+        adapter._client = client
+        verdicts = await adapter.lookup(
+            "Apple MacBook Pro M3", "manufacturer", {}
+        )
+        assert len(verdicts) == 1
+        assert verdicts[0].value == "Apple Inc."
+        # Direct hit would be 0.95; one fallback step → 0.90.
+        assert verdicts[0].confidence == pytest.approx(0.90)
+
+    asyncio.run(run())
+
+
+def test_wikidata_label_falls_back_to_first_two_tokens():
+    """Original + SKU-strip both miss; first-2-tokens candidate hits.
+
+    Confidence reduced by 0.10 (two fallback steps).
+    """
+    async def run():
+        adapter = WikidataAdapter()
+        client = AsyncMock()
+        # Candidates for "Bosch fuel injector 0261545109":
+        #   ["...", "Bosch fuel injector", "Bosch fuel", "Bosch"]
+        # 1) original → empty
+        # 2) "Bosch fuel injector" → empty
+        # 3) "Bosch fuel" → hit Q234021
+        # 4) entity claims for country (P17) → entity-id
+        # 5) label for Q183 → "Germany"
+        client.get.side_effect = [
+            _mk_response({"search": []}),
+            _mk_response({"search": []}),
+            _mk_response({"search": [{"id": "Q234021"}]}),
+            _mk_response(
+                {
+                    "entities": {
+                        "Q234021": {
+                            "claims": {
+                                "P17": [
+                                    {
+                                        "mainsnak": {
+                                            "datavalue": {
+                                                "type": "wikibase-entityid",
+                                                "value": {"id": "Q183"},
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            ),
+            _mk_response(
+                {
+                    "entities": {
+                        "Q183": {"labels": {"en": {"value": "Germany"}}}
+                    }
+                }
+            ),
+        ]
+        adapter._client = client
+        verdicts = await adapter.lookup(
+            "Bosch fuel injector 0261545109", "country", {}
+        )
+        assert len(verdicts) == 1
+        assert verdicts[0].value == "Germany"
+        # Two fallback steps → 0.95 - 0.10 = 0.85.
+        assert verdicts[0].confidence == pytest.approx(0.85)
+
+    asyncio.run(run())
+
+
+def test_wikidata_label_cleaning_unit():
+    """Pure tokenizer/cleaner behavior."""
+    assert _clean_label_candidates("Apple MacBook Pro M3") == [
+        "Apple MacBook Pro M3",
+        "Apple MacBook Pro",
+        "Apple MacBook",
+        "Apple",
+    ]
+    assert _clean_label_candidates("Bosch fuel injector 0261545109") == [
+        "Bosch fuel injector 0261545109",
+        "Bosch fuel injector",
+        "Bosch fuel",
+        "Bosch",
+    ]
+    # Sony case: trailing-only stripping leaves "headphones" in place;
+    # SKU "WH-1000XM5" sits in the middle and is not stripped. Length is 3
+    # so Candidate B (first 2 tokens) fires from the original list.
+    assert _clean_label_candidates("Sony WH-1000XM5 headphones") == [
+        "Sony WH-1000XM5 headphones",
+        "Sony WH-1000XM5",
+        "Sony",
+    ]
 
 
 # ---------------------------------------------------------------------------

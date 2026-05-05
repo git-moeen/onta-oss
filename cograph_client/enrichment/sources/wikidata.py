@@ -10,6 +10,7 @@ returns []. Network calls have a 10s timeout.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 import httpx
@@ -23,6 +24,80 @@ logger = structlog.stdlib.get_logger("cograph.enrichment")
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 WIKIDATA_ENTITY_BASE = "https://www.wikidata.org/wiki/"
 TIMEOUT_S = 10.0
+
+
+_CLEAN_CACHE: dict[str, list[str]] = {}
+
+
+def _is_sku_token(tok: str) -> bool:
+    """A token is SKU/model-code-ish if it's:
+    - all digits, or
+    - alphanumeric mix containing at least one digit (e.g. M3, WH-1000XM5), or
+    - contains a hyphen with digits (e.g. 33-2304).
+    """
+    if not tok:
+        return False
+    if tok.isdigit():
+        return True
+    has_digit = any(c.isdigit() for c in tok)
+    if not has_digit:
+        return False
+    # Strip hyphens for the alphanumeric check; if there are digits anywhere
+    # and it's not purely letters, treat as SKU-ish.
+    cleaned = tok.replace("-", "")
+    if cleaned.isalnum() and has_digit:
+        return True
+    if "-" in tok and has_digit:
+        return True
+    return False
+
+
+def _clean_label_candidates(label: str) -> list[str]:
+    """Generate progressively cleaner label candidates for Wikidata search.
+
+    Layered approach (each step makes the label fuzzier):
+      0. Original label.
+      A. Strip trailing SKU-ish tokens until a wordy (mostly letters) token.
+      B. If A is still > 3 words, take just the first 2 tokens.
+      C. First token only (last resort, often resolves to brand alone).
+
+    Returns a deduped, order-preserving list. Cached on `label`.
+    """
+    if label in _CLEAN_CACHE:
+        return list(_CLEAN_CACHE[label])
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(s: str) -> None:
+        s = s.strip()
+        if s and s not in seen:
+            seen.add(s)
+            candidates.append(s)
+
+    _add(label)
+
+    tokens = re.split(r"\s+", label.strip()) if label.strip() else []
+
+    # Candidate A: strip trailing SKU-ish tokens until a wordy token.
+    a_tokens = list(tokens)
+    while a_tokens and _is_sku_token(a_tokens[-1]):
+        a_tokens.pop()
+    if a_tokens and a_tokens != tokens:
+        _add(" ".join(a_tokens))
+
+    # Candidate B: if A is still > 3 words (>= 3 tokens), first 2 tokens.
+    # Spec example: "Apple MacBook Pro" (3 tokens) collapses to "Apple MacBook".
+    base_for_b = a_tokens if a_tokens else tokens
+    if len(base_for_b) >= 3:
+        _add(" ".join(base_for_b[:2]))
+
+    # Candidate C: first token only.
+    if tokens:
+        _add(tokens[0])
+
+    _CLEAN_CACHE[label] = list(candidates)
+    return candidates
 
 
 WIKIDATA_PROPS: dict[str, str] = {
@@ -51,7 +126,19 @@ class WikidataAdapter:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=TIMEOUT_S)
+            # Wikimedia's UA policy 403s the default python-httpx UA; identify
+            # ourselves with project + contact so the request is honored.
+            # See https://meta.wikimedia.org/wiki/User-Agent_policy
+            self._client = httpx.AsyncClient(
+                timeout=TIMEOUT_S,
+                headers={
+                    "User-Agent": (
+                        "cograph-enrichment/0.1 "
+                        "(+https://github.com/git-moeen/cograph-oss; ops@cograph.tech)"
+                    ),
+                    "Accept": "application/json",
+                },
+            )
         return self._client
 
     async def lookup(
@@ -64,10 +151,21 @@ class WikidataAdapter:
             return []
 
         try:
-            qid = await self._search_entity(entity_label)
+            qid, penalty = await self._search_entity_with_fallback(entity_label)
             if not qid:
                 return []
-            return await self._fetch_claims(qid, attribute, prop)
+            verdicts = await self._fetch_claims(qid, attribute, prop)
+            if penalty > 0.0 and verdicts:
+                verdicts = [
+                    Verdict(
+                        value=v.value,
+                        confidence=max(0.0, round(v.confidence - penalty, 4)),
+                        source=v.source,
+                        source_url=v.source_url,
+                    )
+                    for v in verdicts
+                ]
+            return verdicts
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             logger.warning(
                 "wikidata_lookup_failed",
@@ -84,6 +182,25 @@ class WikidataAdapter:
                 error=str(e),
             )
             return []
+
+    async def _search_entity_with_fallback(
+        self, label: str
+    ) -> tuple[Optional[str], float]:
+        """Layered label resolution.
+
+        wbsearchentities is a strict prefix/term matcher and won't find labels
+        with SKU/model-code suffixes (e.g. "Apple MacBook Pro M3"). We try the
+        original first, then progressively cleaner candidates produced by
+        `_clean_label_candidates`. Each fallback step costs 0.05 in confidence
+        so direct hits beat fuzzy ones. Capped at 4 search calls total
+        (original + 3 candidates) to avoid runaway.
+        """
+        candidates = _clean_label_candidates(label)[:4]
+        for idx, cand in enumerate(candidates):
+            qid = await self._search_entity(cand)
+            if qid:
+                return qid, idx * 0.05
+        return None, 0.0
 
     async def _search_entity(self, label: str) -> Optional[str]:
         client = await self._get_client()
