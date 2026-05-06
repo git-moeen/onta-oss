@@ -16,12 +16,42 @@ That's it. The first run opens your browser to sign in, saves a key to `~/.cogra
   /kg list|switch|create|delete <name>
   /types [query]      Types in the active KG, with entity counts
   /type <name>        Drill into one type — attributes & relationships
+  /enrich <Type> <attrs...>   Plan + run an enrichment job (interactive)
+  /enrich watch <job_id>      Live progress for a running job
+  /enrich jobs                List recent enrichment jobs
+  /enrich review <job_id>     Walk through conflicts and accept/reject
   /status             Graph stats
   /login              Re-authenticate
   /quit
 ```
 
 Bare lines (no leading `/`) auto-route to `/ask`. Full walkthrough at [cograph.cloud/docs/quickstart](https://cograph.cloud/docs/quickstart).
+
+## Self-hosted mode
+
+Pointing the CLI at your own backend skips the browser sign-in:
+
+```bash
+cograph --local                         # defaults to http://localhost:8000
+cograph --no-login                      # uses COGRAPH_API_URL env var
+COGRAPH_API_URL=http://my-host:8000 cograph
+```
+
+When self-hosted, the prompt shows the host suffix: `cograph@localhost:8000 (kg) ▸`. Bare `cograph` still triggers the hosted-version login flow.
+
+## Auto-enrichment
+
+Fill and verify attributes on entities of a given type by looking them up in external sources, with a human review step before any write:
+
+```text
+> /enrich LineItem brand manufacturer
+Plan: enrich LineItem.brand, .manufacturer · tier: lite · policy: stage
+Job queued: enr_xxxxxxxx · 12,450 entities
+[████████████████████] filled 6,200 · verified 1,400 · conflicts 320
+Status: review · 320 conflicts pending. Run /enrich review enr_xxxxxxxx
+```
+
+Use `/enrich watch <job_id>` for live progress, `/enrich jobs` to list recent jobs, and `/enrich review <job_id>` to walk through conflicts and accept/reject each one. The `lite` tier uses Wikidata only (free, no API key).
 
 ## Install
 

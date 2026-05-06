@@ -82,12 +82,48 @@ The Node CLI (`npm install -g cograph`, requires Node 20+) covers both an intera
   /kg list|switch|create|delete <name>
   /types [query]      Types in the active KG, with entity counts
   /type <name>        Drill into one type — attributes & relationships
+  /enrich <Type> <attrs...>   Plan + run an enrichment job (interactive)
+  /enrich watch <job_id>      Live progress for a running job
+  /enrich jobs                List recent enrichment jobs
+  /enrich review <job_id>     Walk through conflicts and accept/reject
   /status             Graph stats
   /login              Re-authenticate
   /quit
 ```
 
 `/types` and `/type` are the fastest way to look around after an ingest — see the [npm README](packages/cograph/README.md) for screenshots. Bare lines auto-route to `/ask`.
+
+### Self-hosted CLI mode
+
+The CLI runs against a self-hosted backend without a hosted-version account — pass `--local` (or `--no-login`) to skip the browser sign-in:
+
+```bash
+cograph --local                                   # defaults to http://localhost:8000
+cograph --no-login                                # uses COGRAPH_API_URL env var
+COGRAPH_API_URL=http://my-host:8000 cograph
+```
+
+When self-hosted, the prompt shows the host suffix: `cograph@localhost:8000 (kg) ▸`. The backend detects open-access vs auth-required mode by looking at `OMNIX_API_KEYS` — empty means no auth, `tenant=default`.
+
+### Auto-enrichment
+
+Enrichment fills and verifies attributes on entities of a given type by looking them up in external sources, surfacing conflicts (existing value vs source value) for human review before writing.
+
+```text
+> /enrich LineItem brand manufacturer
+Plan: enrich LineItem.brand, .manufacturer in parts · tier: lite · policy: stage
+Job queued: enr_xxxxxxxx · 12,450 entities · est. $0.00
+Watch progress? [Y/n] y
+[████████████████████] 12,450/12,450 · filled 6,200 · verified 1,400 · conflicts 320
+Status: review · 320 conflicts pending. Run /enrich review enr_xxxxxxxx
+
+> /enrich review enr_xxxxxxxx
+LineItem #4471: "K&N 33-2304 air filter, red"
+  brand: "KN" → "K&N" (confidence 0.97, kn-filters.com)
+Accept? [a]/[r]/[s]/[A]ll/[q]uit:
+```
+
+In this OSS build, the **lite** tier uses Wikidata as the only source (free, no API key). The `base`/`core`/`pro` tiers are scaffolded but require additional adapters (web search, LLM extraction) wired in by the hosted version.
 
 Or one-shot, useful in scripts and CI:
 
@@ -142,6 +178,12 @@ All endpoints at `http://localhost:8000`. No auth required for local usage.
 | GET | `/graphs/{tenant}/kgs` | List knowledge graphs |
 | POST | `/graphs/{tenant}/query` | Raw SPARQL query |
 | GET | `/graphs/{tenant}/ontology/schema` | View ontology |
+| POST | `/graphs/{tenant}/enrich/jobs` | Create + queue an enrichment job |
+| GET | `/graphs/{tenant}/enrich/jobs` | List enrichment jobs |
+| GET | `/graphs/{tenant}/enrich/jobs/{job_id}` | Status + progress |
+| GET | `/graphs/{tenant}/enrich/jobs/{job_id}/conflicts` | Pending conflicts |
+| POST | `/graphs/{tenant}/enrich/jobs/{job_id}/apply` | Apply accepted changes |
+| DELETE | `/graphs/{tenant}/enrich/jobs/{job_id}` | Cancel a job |
 | GET | `/health` | Health check |
 
 Interactive docs at [localhost:8000/docs](http://localhost:8000/docs) when running.
