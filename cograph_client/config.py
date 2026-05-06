@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     # their own key verification backend (Clerk, WorkOS, custom, ...).
     auth_plugin: str = ""
 
+    # Optional enrichment plugin: a dotted "module.path:callable" that will
+    # be imported at app startup. The callable is invoked with no arguments
+    # and is expected to register paid source adapters via
+    # cograph_client.enrichment.sources.base.register_adapter and override
+    # tier→chain mappings via cograph_client.enrichment.tiers.register_tier.
+    # Keeps cograph-oss vendor-neutral while allowing downstream deployments
+    # to plug in proprietary adapters (web search, LLM, GS1, ...).
+    enrichment_plugin: str = ""
+
     def get_api_keys_map(self) -> dict[str, str]:
         return json.loads(self.api_keys)
 

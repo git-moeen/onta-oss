@@ -41,6 +41,32 @@ def _load_auth_plugin() -> None:
         logger.error("auth_plugin_load_failed", plugin=spec, error=str(exc))
 
 
+def _load_enrichment_plugin() -> None:
+    """Import and invoke the configured enrichment plugin, if any.
+
+    Format: "module.path:callable". The callable is invoked with no
+    arguments and is expected to register paid source adapters via
+    cograph_client.enrichment.sources.base.register_adapter and override
+    tier→chain mappings via cograph_client.enrichment.tiers.register_tier.
+    Failures are logged but do not prevent the app from starting — the
+    app will simply fall back to the OSS defaults (lite tier, Wikidata).
+    """
+    spec = settings.enrichment_plugin.strip()
+    if not spec:
+        return
+    if ":" not in spec:
+        logger.warning("enrichment_plugin_invalid_format", spec=spec)
+        return
+    module_name, attr = spec.split(":", 1)
+    try:
+        module = importlib.import_module(module_name)
+        fn = getattr(module, attr)
+        fn()
+        logger.info("enrichment_plugin_loaded", plugin=spec)
+    except Exception as exc:
+        logger.error("enrichment_plugin_load_failed", plugin=spec, error=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging(settings.log_level)
@@ -53,6 +79,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     _load_auth_plugin()
+    _load_enrichment_plugin()
     app = FastAPI(
         title="Omnix",
         description="Living Knowledge Graph Platform",

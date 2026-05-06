@@ -967,3 +967,32 @@ def test_canonicalize_title_case_handles_ampersand():
     assert apply_canonicalizer("nope", "anything") == "anything"
     assert apply_canonicalizer(None, "x") == "x"
     assert apply_canonicalizer("trim", "  hi  ") == "hi"
+
+
+def test_enrichment_plugin_loaded_at_startup(monkeypatch):
+    """Plugin's register() runs during create_app()."""
+    from cograph_client.api import app as app_module
+    from cograph_client.config import settings
+
+    monkeypatch.setattr(
+        settings, "enrichment_plugin", "tests.fake_enrichment_plugin:register"
+    )
+    try:
+        app_module.create_app()
+        from tests import fake_enrichment_plugin
+
+        assert fake_enrichment_plugin.LOADED is True
+    finally:
+        from tests import fake_enrichment_plugin
+
+        fake_enrichment_plugin.LOADED = False
+
+
+def test_enrichment_plugin_invalid_format_logged(monkeypatch):
+    """Malformed plugin spec is logged but does not raise."""
+    from cograph_client.api import app as app_module
+    from cograph_client.config import settings
+
+    monkeypatch.setattr(settings, "enrichment_plugin", "no_colon_here")
+    # Must not raise.
+    app_module.create_app()
