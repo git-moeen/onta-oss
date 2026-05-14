@@ -140,6 +140,10 @@ class SchemaResolver:
         self._type_matcher = TypeMatcher(self._anthropic, verdict_cache, embedding_service)
         from cograph_client.config import settings
         self._openrouter_key = settings.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        # Cross-file entity resolution. Best-effort: failures never block ingest.
+        from cograph_client.resolver.er import ERPipeline
+        self._er = ERPipeline(neptune)
+        self._er_enabled = os.environ.get("COGRAPH_ER_ENABLED", "1") != "0"
 
     async def ingest(
         self,
@@ -259,6 +263,11 @@ class SchemaResolver:
         # Pass 1: Resolve types and compute entity URIs
         resolved_types: dict[str, str] = {}  # entity.id → resolved_type
         pending_uris: list[str] = []
+        # ER index triples (block keys + denormalized signals) for newly minted
+        # entities. Empty for merged/dedup'd entities.
+        er_index_triples: list[tuple[str, str, str]] = []
+        # Track which entity IDs were merged into existing URIs (for telemetry)
+        er_merged_count = 0
         for i, entity in enumerate(extraction.entities):
             if i > 0 and i % self.ONTOLOGY_REFRESH_INTERVAL == 0:
                 await self._refresh_ontology(graph_uri, existing_types, existing_attrs)
@@ -269,9 +278,68 @@ class SchemaResolver:
             if resolved_type:
                 resolved_types[entity.id] = resolved_type
                 entity_uri = f"https://cograph.tech/entities/{resolved_type}/{_safe_id(entity.id)}"
+
+                # Cross-file ER: see if this entity matches an existing one.
+                # Failures here MUST never block ingest — log and fall through.
+                if self._er_enabled:
+                    try:
+                        from cograph_client.resolver.er import MergeAction, config_for
+                        er_applies = config_for(resolved_type) is not None
+                        type_uri = f"https://cograph.tech/types/{resolved_type}"
+                        decision = await self._er.find_match(
+                            entity, resolved_type, type_uri, instance_graph,
+                        )
+                        if decision.action == MergeAction.AUTO_MERGE and decision.canonical_uri:
+                            entity_uri = decision.canonical_uri
+                            er_merged_count += 1
+                            # Merge expansion: write the incoming entity's
+                            # ER signals onto the CANONICAL URI so future
+                            # ingests can find this same person via the new
+                            # signals (e.g. a CRM merge adds the secondary
+                            # email as an alias of the canonical Guest,
+                            # letting a Loyalty ingest match later via that
+                            # email). Triples are idempotent on Neptune.
+                            normalized, keys = self._er.signals_and_keys(entity)
+                            if normalized and keys:
+                                er_index_triples.extend(
+                                    self._er._blocker.index_triples(entity_uri, normalized, keys)
+                                )
+                        else:
+                            # No match — mint a new URI. For ER-enabled types
+                            # we add a short signal-hash suffix so two unrelated
+                            # humans sharing a name (e.g. two distinct John
+                            # Smiths) get distinct URIs and don't quietly
+                            # contaminate each other's signal store.
+                            if er_applies:
+                                import hashlib
+                                normalized, keys = self._er.signals_and_keys(entity)
+                                if normalized is not None:
+                                    fingerprint_parts = [
+                                        normalized.email or "",
+                                        normalized.phone_e164 or "",
+                                        normalized.dob_iso or "",
+                                        "|".join(normalized.email_aliases),
+                                    ]
+                                    fp = hashlib.sha1("|".join(fingerprint_parts).encode("utf-8")).hexdigest()[:8]
+                                    entity_uri = f"{entity_uri}-{fp}"
+                                if normalized and keys:
+                                    er_index_triples.extend(
+                                        self._er._blocker.index_triples(entity_uri, normalized, keys)
+                                    )
+                            else:
+                                normalized, keys = self._er.signals_and_keys(entity)
+                                if normalized and keys:
+                                    er_index_triples.extend(
+                                        self._er._blocker.index_triples(entity_uri, normalized, keys)
+                                    )
+                    except Exception as e:
+                        logger.warning("er_pipeline_failed", error=str(e), entity_id=entity.id)
+
                 entity_uri_map[entity.id] = entity_uri
                 entity_type_map[entity.id] = resolved_type
                 pending_uris.append(entity_uri)
+        if er_merged_count:
+            logger.info("er_merged_entities", count=er_merged_count, total=len(extraction.entities))
 
         # Batch existence check: one SPARQL query per 500 URIs instead of N individual ASKs
         existing_uris: set[str] = set()
@@ -303,6 +371,11 @@ class SchemaResolver:
                 graph_uri, existing_types, existing_attrs, source, result, batch_id,
                 _collect_triples=all_entity_triples,
             )
+
+        # Append ER index triples (block keys + denormalized signals) to the
+        # same batch so future ingests can find these entities in O(1).
+        if er_index_triples:
+            all_entity_triples.extend(er_index_triples)
 
         # Batch insert ALL entity triples in one call (not per-entity)
         if all_entity_triples:
