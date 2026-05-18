@@ -237,11 +237,18 @@ LIMIT {MAX_CANDIDATES * 8}
         The caller batches these into the existing batched_insert_triples flow
         in schema_resolver — no new SPARQL write path needed.
         """
+        # IMPORTANT: do NOT pre-quote literal values here. The downstream
+        # SPARQL serializer (graph.queries._escape_value) wraps any non-URI
+        # string in "..." and escapes inner quotes. Passing a pre-quoted
+        # value here produces a doubly-quoted stored literal like
+        # `"\"lastname3_phone4:smi5506\""` (the inner quotes become part of
+        # the value), which causes every ER candidate-lookup FILTER to miss.
+        # Pass raw strings; the serializer handles quoting.
         triples: list[tuple[str, str, str]] = []
         s = f"<{entity_uri}>"
         # Block keys
         for k in keys:
-            triples.append((s, BLOCK_KEY_PRED, _quote_literal(f"{k.kind}:{k.value}")))
+            triples.append((s, BLOCK_KEY_PRED, f"{k.kind}:{k.value}"))
         # Denormalized signals (for fast scoring on future lookups)
         signal_fields = [
             ("name", normalized.name),
@@ -254,5 +261,5 @@ LIMIT {MAX_CANDIDATES * 8}
         for name, value in signal_fields:
             if value:
                 pred = f"<{ER_NS}erSignal_{name}>"
-                triples.append((s, pred, _quote_literal(value)))
+                triples.append((s, pred, value))
         return triples
