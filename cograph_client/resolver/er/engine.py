@@ -10,7 +10,7 @@ so we substring-match against a small set of known patterns.
 
 from __future__ import annotations
 
-import logging
+import structlog
 
 from cograph_client.resolver.er.blocking import SparqlBlocker, generate_block_keys
 from cograph_client.resolver.er.normalize import DefaultNormalizer
@@ -26,7 +26,12 @@ from cograph_client.resolver.er.types import (
 )
 from cograph_client.resolver.models import ExtractedEntity
 
-logger = logging.getLogger(__name__)
+# IMPORTANT: must be a structlog logger, not stdlib. The rest of the file
+# logs with structlog-style kwargs (error=..., type=...). Stdlib's
+# logging.getLogger raises TypeError on those kwargs, which masks the
+# original exception and prevents ER from cleanly returning SKIP. With
+# the structlog wrapper the kwargs are accepted as the event_dict.
+logger = structlog.stdlib.get_logger("cograph.resolver.er")
 
 
 # ---------------------------------------------------------------------------
