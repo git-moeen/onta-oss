@@ -209,13 +209,28 @@ DEFAULT_PROPERTY_CONFIG = ERConfig(
 )
 
 DEFAULTS_BY_TYPE: dict[str, ERConfig] = {
+    # Person-shaped types — Guest config (email decisive, phone + name +
+    # address + dob weighted). The LLM ontology inferrer doesn't always
+    # pick "Guest" — depending on the CSV shape it'll propose Person,
+    # User, Client, Patient, Subscriber. All collapse to the same config.
     "Guest": DEFAULT_GUEST_CONFIG,
-    "Customer": DEFAULT_CUSTOMER_CONFIG,
-    "Contact": DEFAULT_CUSTOMER_CONFIG,
+    "Person": DEFAULT_GUEST_CONFIG,
+    "User": DEFAULT_GUEST_CONFIG,
     "LoyaltyMember": DEFAULT_GUEST_CONFIG,
     "Member": DEFAULT_GUEST_CONFIG,
+    "Patient": DEFAULT_GUEST_CONFIG,
+    "Subscriber": DEFAULT_GUEST_CONFIG,
+    # Customer-shaped — same signals, slightly different weights (no dob).
+    "Customer": DEFAULT_CUSTOMER_CONFIG,
+    "Contact": DEFAULT_CUSTOMER_CONFIG,
+    "Client": DEFAULT_CUSTOMER_CONFIG,
+    "Lead": DEFAULT_CUSTOMER_CONFIG,
+    # Property / location types.
     "Property": DEFAULT_PROPERTY_CONFIG,
     "Hotel": DEFAULT_PROPERTY_CONFIG,
+    "Building": DEFAULT_PROPERTY_CONFIG,
+    "Location": DEFAULT_PROPERTY_CONFIG,
+    "Venue": DEFAULT_PROPERTY_CONFIG,
 }
 
 
