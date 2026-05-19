@@ -556,6 +556,32 @@ export class Client {
       30_000,
     );
   }
+
+  /** Explorer summary for a type — like typeUsage but adds coverage_pct + avg_degree. */
+  async typeSummary(kg: string, typeName: string): Promise<TypeSummary> {
+    return this.request<TypeSummary>(
+      "GET",
+      `${this.base()}/explore/kgs/${encodeURIComponent(kg)}/types/${encodeURIComponent(typeName)}/summary`,
+      undefined,
+      30_000,
+    );
+  }
+
+  /** Search types or attributes by name substring within a KG. */
+  async exploreSearch(
+    kg: string,
+    q: string,
+    kind: "type" | "attr" = "type",
+  ): Promise<Array<Record<string, unknown>>> {
+    const qs = new URLSearchParams({ kg, q, kind }).toString();
+    const data = await this.request<unknown>(
+      "GET",
+      `${this.base()}/explore/search?${qs}`,
+      undefined,
+      15_000,
+    );
+    return Array.isArray(data) ? (data as Array<Record<string, unknown>>) : [];
+  }
 }
 
 export interface TypeCount {
@@ -588,6 +614,32 @@ export interface TypeUsage {
   attributes: AttributeUsage[];
   relationships: RelationshipUsage[];
   samples: EntitySample[];
+}
+
+export interface AttributeSummary {
+  name: string;
+  predicate_uri: string;
+  datatype: string;
+  count: number;
+  coverage_pct: number;
+}
+
+export interface RelationshipSummary {
+  name: string;
+  predicate_uri: string;
+  target_type: string | null;
+  count: number;
+  coverage_pct: number;
+  avg_degree: number;
+}
+
+export interface TypeSummary {
+  name: string;
+  description: string;
+  parent_type: string | null;
+  entity_count: number;
+  attributes: AttributeSummary[];
+  relationships: RelationshipSummary[];
 }
 
 export type EnrichmentTier = "lite" | "base" | "core" | "pro";

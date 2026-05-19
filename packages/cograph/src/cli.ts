@@ -281,6 +281,72 @@ onto
   });
 
 // ---------------------------------------------------------------------------
+// vis
+// ---------------------------------------------------------------------------
+
+program
+  .command("vis <type>")
+  .description("Visualise a type — instance count, attribute coverage, top relations")
+  .option("--kg <name>", "Knowledge graph to inspect")
+  .action(async (typeName: string, opts: { kg?: string }) => {
+    await withErrors(async () => {
+      const c = client();
+
+      // Resolve KG: use --kg flag, or pick first available KG.
+      let kg = opts.kg;
+      if (!kg) {
+        const kgs = await c.listKgs();
+        if (!kgs.length) {
+          fail("No knowledge graphs found. Run 'cograph ingest' first.");
+        }
+        kg = String(kgs[0].name ?? "");
+      }
+
+      let summary: import("./client.js").TypeSummary;
+      try {
+        summary = await c.typeSummary(kg, typeName);
+      } catch {
+        fail(`Type '${typeName}' not found in KG '${kg}'.`);
+      }
+
+      const { entity_count, attributes, relationships, description, parent_type } = summary;
+      const header = `${typeName}${parent_type ? ` (subClassOf ${parent_type})` : ""} — ${entity_count.toLocaleString()} instances`;
+      process.stdout.write(`\n${header}\n${"─".repeat(header.length)}\n`);
+      if (description) process.stdout.write(`${description}\n`);
+
+      // Attributes table
+      if (attributes.length) {
+        process.stdout.write(`\nAttributes (${attributes.length}):\n`);
+        const sorted = [...attributes].sort((a, b) => b.coverage_pct - a.coverage_pct);
+        for (const a of sorted.slice(0, 10)) {
+          const bar = "█".repeat(Math.round(a.coverage_pct / 10));
+          const pct = `${a.coverage_pct}%`.padStart(6);
+          process.stdout.write(`  ${a.name.padEnd(24)} ${pct}  ${bar}\n`);
+        }
+        if (attributes.length > 10) {
+          process.stdout.write(`  … and ${attributes.length - 10} more\n`);
+        }
+      }
+
+      // Relations table
+      if (relationships.length) {
+        process.stdout.write(`\nRelationships (${relationships.length}):\n`);
+        for (const r of relationships.slice(0, 8)) {
+          const target = r.target_type ? ` → ${r.target_type}` : "";
+          const pct = `${r.coverage_pct}%`.padStart(6);
+          const avg = r.avg_degree ? ` (avg ${r.avg_degree})` : "";
+          process.stdout.write(`  ${(r.name + target).padEnd(36)} ${pct}${avg}\n`);
+        }
+      }
+
+      const tenant = c.tenant;
+      const explorerUrl = `https://app.cograph.cloud/${tenant}/explore/${encodeURIComponent(typeName)}?kg=${encodeURIComponent(kg)}`;
+      process.stdout.write(`\n→ Open visually at ${explorerUrl}\n`);
+      process.stdout.write("  (Sign in for interactive viz, search, and click-to-enrich.)\n\n");
+    });
+  });
+
+// ---------------------------------------------------------------------------
 // clear
 // ---------------------------------------------------------------------------
 
