@@ -5,6 +5,9 @@ endpoints add convenience (bundling, coverage %, search) on top of the raw
 ontology + KG queries already used by the CLI.
 """
 
+import asyncio
+import time
+
 from fastapi import APIRouter, Depends, Query
 
 from cograph_client.api.deps import get_neptune_client
@@ -17,13 +20,22 @@ from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
 router = APIRouter(prefix="/graphs/{tenant}/explore")
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+RDF_PROPERTY = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
 RDFS = "http://www.w3.org/2000/01/rdf-schema"
 TYPE_URI_PREFIX = "https://cograph.tech/types/"
+ENTITY_URI_PREFIX = "https://cograph.tech/entities/"
 SYSTEM_PREDICATES: frozenset[str] = frozenset({
     f"{RDFS}#label",
     "https://cograph.tech/onto/ingested_at",
     "https://cograph.tech/onto/source",
 })
+
+# Type summaries are read-heavy and only change on ingest, but each cold build
+# scans every instance triple of the type (seconds on a large KG). Cache the
+# assembled payload per (tenant, kg, type) with a short TTL so repeat Explorer
+# loads — and the per-bubble navigations in the web app — return instantly.
+_SUMMARY_TTL_SECONDS = 300.0
+_summary_cache: dict[tuple[str, str, str], tuple[float, dict]] = {}
 
 
 @router.get("/kgs/{kg_name}/types/{type_name}/summary")
@@ -38,11 +50,16 @@ async def get_type_summary(
     Returns instance count, attributes + coverage %, relationships + coverage %
     and avg multiplicity. All percentages are relative to entity_count.
     """
+    cache_key = (tenant.tenant_id, kg_name, type_name)
+    cached = _summary_cache.get(cache_key)
+    if cached is not None and (time.monotonic() - cached[0]) < _SUMMARY_TTL_SECONDS:
+        return cached[1]
+
     onto_graph = tenant_graph_uri(tenant.tenant_id)
     kg_graph = kg_graph_uri(tenant.tenant_id, kg_name)
     t_uri = type_uri(type_name)
 
-    # 1) Ontology description for this type.
+    # 1) Ontology description for this type (small — ontology graph).
     onto_sparql = (
         f"SELECT ?label ?comment ?parent FROM <{onto_graph}> WHERE {{\n"
         f"  <{t_uri}> <{RDFS}#label> ?label .\n"
@@ -50,66 +67,68 @@ async def get_type_summary(
         f"  OPTIONAL {{ <{t_uri}> <{RDFS}#subClassOf> ?parent }}\n"
         f"}}"
     )
-    _, onto_rows = parse_sparql_results(await client.query(onto_sparql))
-    onto_row = onto_rows[0] if onto_rows else {}
-    parent_uri = onto_row.get("parent", "")
-    parent_type = parent_uri.rstrip("/").split("/")[-1] if parent_uri else None
 
     # 2) Ontology attribute definitions (name + datatype per predicate URI).
     attr_def_sparql = (
         f"SELECT ?attr ?attrLabel ?range FROM <{onto_graph}> WHERE {{\n"
-        f"  ?attr <{RDF_TYPE}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> .\n"
+        f"  ?attr <{RDF_TYPE}> <{RDF_PROPERTY}> .\n"
         f"  ?attr <{RDFS}#domain> <{t_uri}> .\n"
         f"  ?attr <{RDFS}#label> ?attrLabel .\n"
         f"  OPTIONAL {{ ?attr <{RDFS}#range> ?range }}\n"
         f"}}"
     )
-    _, attr_def_rows = parse_sparql_results(await client.query(attr_def_sparql))
+
+    # 3) Per-predicate usage in ONE instance scan: distinct-subject count
+    #    (coverage), a sample object (attr/rel classification + target type),
+    #    and the entity-valued object total (relationship avg degree). The
+    #    rdf:type row's count is the entity count, so this single query
+    #    replaces the former separate count / predicate / degree queries.
+    pred_sparql = (
+        f"SELECT ?p (COUNT(DISTINCT ?e) AS ?cnt) (SAMPLE(?o) AS ?sample)\n"
+        f'  (SUM(IF(STRSTARTS(STR(?o), "{ENTITY_URI_PREFIX}"), 1, 0)) AS ?relTotal)\n'
+        f"FROM <{kg_graph}> WHERE {{\n"
+        f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
+        f"  ?e ?p ?o .\n"
+        f"}} GROUP BY ?p ORDER BY DESC(?cnt)"
+    )
+
+    # Independent queries → run concurrently (wall time ≈ the slowest scan,
+    # not the sum). Ontology lookups are tiny; the instance scan dominates.
+    onto_raw, attr_def_raw, pred_raw = await asyncio.gather(
+        client.query(onto_sparql),
+        client.query(attr_def_sparql),
+        client.query(pred_sparql),
+    )
+
+    _, onto_rows = parse_sparql_results(onto_raw)
+    onto_row = onto_rows[0] if onto_rows else {}
+    parent_uri = onto_row.get("parent", "")
+    parent_type = parent_uri.rstrip("/").split("/")[-1] if parent_uri else None
+
+    _, attr_def_rows = parse_sparql_results(attr_def_raw)
     attr_defs: dict[str, dict[str, str]] = {
         r["attr"]: {"name": r.get("attrLabel", ""), "range": r.get("range", "")}
         for r in attr_def_rows
         if r.get("attr")
     }
 
-    # 3) Instance count.
-    count_sparql = (
-        f"SELECT (COUNT(DISTINCT ?e) AS ?n) FROM <{kg_graph}> WHERE {{\n"
-        f"  ?e <{RDF_TYPE}> <{t_uri}>\n"
-        f"}}"
-    )
-    _, count_rows = parse_sparql_results(await client.query(count_sparql))
-    try:
-        entity_count = int(count_rows[0].get("n", "0")) if count_rows else 0
-    except ValueError:
-        entity_count = 0
-
-    # 4) Per-predicate usage: how many distinct subjects have this predicate,
-    #    plus a sample object so we can classify attr vs. relationship.
-    pred_sparql = (
-        f"SELECT ?p (COUNT(DISTINCT ?e) AS ?cnt) (SAMPLE(?o) AS ?sample)\n"
-        f"FROM <{kg_graph}> WHERE {{\n"
-        f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
-        f"  ?e ?p ?o .\n"
-        f"  FILTER(?p != <{RDF_TYPE}>)\n"
-        f"}} GROUP BY ?p ORDER BY DESC(?cnt)"
-    )
-    _, pred_rows = parse_sparql_results(await client.query(pred_sparql))
-
-    # 5) Per-relationship target counts for avg degree.
-    #    We need COUNT(?o) (not DISTINCT ?e) to compute avg.
-    rel_degree_sparql = (
-        f"SELECT ?p (COUNT(?o) AS ?total) FROM <{kg_graph}> WHERE {{\n"
-        f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
-        f"  ?e ?p ?o .\n"
-        f"  FILTER(?p != <{RDF_TYPE}>)\n"
-        f"  FILTER(STRSTARTS(STR(?o), 'https://cograph.tech/entities/'))\n"
-        f"}} GROUP BY ?p"
-    )
-    _, rel_degree_rows = parse_sparql_results(await client.query(rel_degree_sparql))
+    _, all_pred_rows = parse_sparql_results(pred_raw)
+    # Entity count comes from the rdf:type row of the same scan.
+    entity_count = 0
+    pred_rows = []
     rel_degrees: dict[str, int] = {}
-    for r in rel_degree_rows:
+    for r in all_pred_rows:
+        p_uri = r.get("p", "")
         try:
-            rel_degrees[r["p"]] = int(r.get("total", "0"))
+            cnt = int(r.get("cnt", "0"))
+        except ValueError:
+            cnt = 0
+        if p_uri == RDF_TYPE:
+            entity_count = cnt
+            continue
+        pred_rows.append(r)
+        try:
+            rel_degrees[p_uri] = int(r.get("relTotal", "0"))
         except (ValueError, KeyError):
             pass
 
@@ -175,7 +194,7 @@ async def get_type_summary(
                 "coverage_pct": cov,
             })
 
-    return {
+    result = {
         "name": type_name,
         "description": onto_row.get("comment", ""),
         "parent_type": parent_type,
@@ -183,6 +202,8 @@ async def get_type_summary(
         "attributes": attributes,
         "relationships": relationships,
     }
+    _summary_cache[cache_key] = (time.monotonic(), result)
+    return result
 
 
 @router.get("/search")
