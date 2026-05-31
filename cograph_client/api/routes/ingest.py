@@ -75,6 +75,13 @@ async def ingest(
                 await svc.embed_types(graph_uri, list(affected_types), client)
             except Exception:
                 pass  # non-blocking
+    # Refresh precomputed Explorer type-stats for this KG (non-blocking).
+    if body.kg_name:
+        try:
+            from cograph_client.api.routes.explore import recompute_kg_stats
+            await recompute_kg_stats(client, tenant.tenant_id, body.kg_name)
+        except Exception:
+            pass
     return result
 
 
