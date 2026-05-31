@@ -339,8 +339,7 @@ program
         }
       }
 
-      const tenant = c.tenant;
-      const explorerUrl = `https://app.cograph.cloud/${tenant}/explore/${encodeURIComponent(typeName)}?kg=${encodeURIComponent(kg)}`;
+      const explorerUrl = `https://cograph.cloud/dashboard/explore/${encodeURIComponent(typeName)}?kg=${encodeURIComponent(kg)}`;
       process.stdout.write(`\n→ Open visually at ${explorerUrl}\n`);
       process.stdout.write("  (Sign in for interactive viz, search, and click-to-enrich.)\n\n");
     });
