@@ -397,6 +397,23 @@ export class Client {
     }
     await Promise.all(workers);
 
+    // All batches are in — kick off a background recompute of the Explorer
+    // type-stats for this KG so type-detail views load instantly. The endpoint
+    // returns immediately (the scan runs server-side in the background); this
+    // is best-effort and never fails the ingest.
+    if (kgName) {
+      try {
+        await this.request(
+          "POST",
+          `${this.base()}/explore/kgs/${encodeURIComponent(kgName)}/recompute-stats`,
+          {},
+          15_000,
+        );
+      } catch {
+        // non-fatal — stats fall back to a live scan until the next recompute
+      }
+    }
+
     return {
       entities_resolved: totalEntities,
       triples_inserted: totalTriples,
