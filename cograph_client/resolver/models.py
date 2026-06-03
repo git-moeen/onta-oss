@@ -141,11 +141,42 @@ class ColumnMapping(BaseModel):
     target_type: str | None = None
     datatype: str = "string"
     attribute_name: str | None = None
+    # Multi-entity ingest: which in-row entity (EntitySpec.name) owns this
+    # column. None = the main/legacy entity (single-entity mode).
+    entity: str | None = None
+
+
+class EntitySpec(BaseModel):
+    """One real-world entity embedded in a (wide) CSV row.
+
+    A denormalized row often packs several entities — e.g. a hotel PMS row holds
+    a guest (Person), a reservation (Reservation), and a property (Property).
+    Each EntitySpec names one of them and how to key it: a single natural-key
+    column (`id_column`) or a deterministic composite of columns (`id_from`).
+    """
+
+    name: str                         # local handle referenced by columns + relationships
+    type_name: str                    # ontology type, e.g. "Person" / "Reservation"
+    id_column: str | None = None      # column whose value is this entity's key
+    id_from: list[str] | None = None  # OR deterministic composite key from these columns
+
+
+class EntityRelationSpec(BaseModel):
+    """An edge between two in-row entities (names refer to EntitySpec.name)."""
+
+    subject: str
+    predicate: str
+    object: str
 
 
 class CSVSchemaMapping(BaseModel):
     entity_type: str
     columns: list[ColumnMapping]
+    # Multi-entity mode (optional, backward-compatible): when `entities` is set,
+    # one row expands into several fully-attributed, linked entities and
+    # `entity_type` is ignored. When None, the legacy single-entity path runs.
+    entities: list[EntitySpec] | None = None
+    relationships: list[EntityRelationSpec] | None = None
 
 
 # ---------------------------------------------------------------------------

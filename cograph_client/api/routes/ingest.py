@@ -145,32 +145,45 @@ async def ingest_csv_rows(
     # of rows has empty values for some columns. Without this, types can
     # end up with 0 ontology attributes when all columns are relationships.
     from cograph_client.graph.ontology_queries import insert_attribute, insert_type
-    from cograph_client.resolver.models import ColumnRole
-    entity_type = body.mapping.get("entity_type", "") if isinstance(body.mapping, dict) else body.mapping.entity_type
-    if entity_type and entity_type not in existing_types:
-        sparql = insert_type(graph_uri, entity_type, "")
-        await client.update(sparql)
-        existing_types[entity_type] = ""
-        existing_attrs[entity_type] = {}
 
-    columns = body.mapping.get("columns", []) if isinstance(body.mapping, dict) else body.mapping.columns
-    for col in columns:
-        col_role = col.get("role", "") if isinstance(col, dict) else col.role
-        col_name = col.get("attribute_name") or col.get("column_name", "") if isinstance(col, dict) else (col.attribute_name or col.column_name)
-        col_name = col_name.lower().replace(" ", "_") if col_name else ""
-        col_datatype = col.get("datatype", "string") if isinstance(col, dict) else col.datatype
-        col_target = col.get("target_type") if isinstance(col, dict) else col.target_type
+    def _mget(obj, key, default=None):
+        return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
-        if not col_name or col_role == "type_id":
-            continue
+    # Group (type_name, owned columns) for ontology pre-registration. Multi-entity
+    # mode registers each in-row entity's type with its owned columns; legacy mode
+    # registers the single `entity_type` with all columns (unchanged behavior).
+    all_columns = _mget(body.mapping, "columns", []) or []
+    entities_spec = _mget(body.mapping, "entities")
+    if entities_spec:
+        groups = [
+            (_mget(spec, "type_name"),
+             [c for c in all_columns if _mget(c, "entity") == _mget(spec, "name")])
+            for spec in entities_spec
+        ]
+    else:
+        groups = [(_mget(body.mapping, "entity_type", ""), all_columns)]
 
-        type_attrs = existing_attrs.get(entity_type, {})
-        if col_name not in type_attrs:
-            if col_role == "relationship" and col_target:
-                sparql = insert_attribute(graph_uri, entity_type, col_name, "", col_target)
-            else:
-                sparql = insert_attribute(graph_uri, entity_type, col_name, "", col_datatype)
-            await client.update(sparql)
+    for type_name, cols in groups:
+        if type_name and type_name not in existing_types:
+            await client.update(insert_type(graph_uri, type_name, ""))
+            existing_types[type_name] = ""
+            existing_attrs[type_name] = {}
+        for col in cols:
+            col_role = _mget(col, "role", "")
+            raw_name = _mget(col, "attribute_name") or _mget(col, "column_name", "")
+            col_name = raw_name.lower().replace(" ", "_") if raw_name else ""
+            col_datatype = _mget(col, "datatype", "string")
+            col_target = _mget(col, "target_type")
+
+            if not col_name or col_role == "type_id":
+                continue
+
+            type_attrs = existing_attrs.get(type_name, {})
+            if col_name not in type_attrs:
+                if col_role == "relationship" and col_target:
+                    await client.update(insert_attribute(graph_uri, type_name, col_name, "", col_target))
+                else:
+                    await client.update(insert_attribute(graph_uri, type_name, col_name, "", col_datatype))
 
     entities, relationships = CSVResolver.apply_mapping(body.mapping, body.rows)
 

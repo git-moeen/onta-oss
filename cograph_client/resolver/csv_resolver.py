@@ -16,6 +16,8 @@ from cograph_client.resolver.models import (
     ColumnMapping,
     ColumnRole,
     CSVSchemaMapping,
+    EntityRelationSpec,
+    EntitySpec,
     ExtractedAttribute,
     ExtractedEntity,
     ExtractedRelationship,
@@ -47,8 +49,28 @@ These should ALWAYS be relationships, never string attributes:
 Only use attribute for truly atomic values that will never need their own \
 properties: prices, counts, measurements, dates, booleans, IDs, URLs.
 
+Multi-entity detection — a WIDE row often packs SEVERAL real-world entities:
+A denormalized export (e.g. a hotel reservation row) can bundle a person, a
+transaction, and a place in one row. Detect this from column-name clusters /
+prefixes (e.g. `guest_*` → a Person, `reservation_*`/booking+stay fields → a
+Reservation, `property_*` → a Property). When you see this:
+- Return an `entities` array: one object per detected entity, each with a
+  `name` (local handle), a `type_name`, and EITHER an `id_column` (its natural
+  key, e.g. reservation_id, property_id) OR an `id_from` list of columns
+  forming a composite key (use this for a person who has no single id column).
+- Tag every column with an `entity` naming which entity it belongs to.
+- Return a `relationships` array of edges between entities, each
+  {{subject, predicate, object}} where subject/object are entity `name`s and
+  predicate is a snake_case verb (e.g. the reservation is `made_by` the person
+  and is `at_property` the place).
+FALLBACK: if the CSV describes a SINGLE real-world entity (all columns are
+properties of one thing), OMIT `entities` and `relationships` entirely and use
+the simple single-entity shape (entity_type + columns). Do not invent entities.
+
 Rules:
-- Exactly one column must be type_id (the primary identifier / natural key)
+- Single-entity mode: exactly one column must be type_id (the natural key).
+- Multi-entity mode: each entity needs exactly one id (id_column or id_from);
+  do NOT mark a type_id column — ids come from the `entities` specs.
 - Columns with numeric values → integer or float (as attributes)
 - Columns with dates → datetime (as attributes)
 - Columns with true/false → boolean (as attributes)
@@ -65,7 +87,7 @@ Sample rows (first {n} of {total}):
 Existing ontology types:
 {existing_types}
 
-Return JSON:
+Return JSON (omit "entities"/"relationships" for single-entity CSVs):
 {{
   "entity_type": "TypeName",
   "columns": [
@@ -74,8 +96,18 @@ Return JSON:
       "role": "type_id" | "attribute" | "relationship",
       "target_type": "TargetTypeName or null",
       "datatype": "string|integer|float|boolean|datetime|uri",
-      "attribute_name": "snake_case_name"
+      "attribute_name": "snake_case_name",
+      "entity": "entity_name or null (multi-entity only)"
     }}
+  ],
+  "entities": [
+    {{"name": "guest", "type_name": "Person", "id_from": ["guest_email"]}},
+    {{"name": "reservation", "type_name": "Reservation", "id_column": "reservation_id"}},
+    {{"name": "property", "type_name": "Property", "id_column": "property_id"}}
+  ],
+  "relationships": [
+    {{"subject": "reservation", "predicate": "made_by", "object": "guest"}},
+    {{"subject": "reservation", "predicate": "at_property", "object": "property"}}
   ]
 }}"""
 
@@ -124,18 +156,25 @@ class CSVResolver:
             data = await self._call_llm(user_content, temperature=0.3)
             mapping = self._build_mapping(data)
 
-        # Validate: must have exactly one type_id
-        id_cols = [c for c in mapping.columns if c.role == ColumnRole.TYPE_ID]
-        if len(id_cols) != 1:
-            logger.warning("csv_schema_no_id", id_cols=len(id_cols))
-            # Fallback: use first column as ID
-            if mapping.columns:
-                mapping.columns[0].role = ColumnRole.TYPE_ID
+        # In multi-entity mode, ids come from the EntitySpec specs (not a
+        # type_id column), so the single-entity type_id enforcement below is
+        # skipped. The geographic/entity promotion pass still runs (columns keep
+        # their `entity` owner).
+        multi = mapping.entities is not None
+
+        # Validate: must have exactly one type_id (single-entity mode only)
+        if not multi:
+            id_cols = [c for c in mapping.columns if c.role == ColumnRole.TYPE_ID]
+            if len(id_cols) != 1:
+                logger.warning("csv_schema_no_id", id_cols=len(id_cols))
+                # Fallback: use first column as ID
+                if mapping.columns:
+                    mapping.columns[0].role = ColumnRole.TYPE_ID
 
         # Post-processing: if the chosen type_id is numeric, prefer a string
         # column with a name-like label (institution, title, name, etc.)
         # Numeric IDs cause deduplication when values repeat.
-        id_col = next((c for c in mapping.columns if c.role == ColumnRole.TYPE_ID), None)
+        id_col = None if multi else next((c for c in mapping.columns if c.role == ColumnRole.TYPE_ID), None)
         if id_col and id_col.datatype in ("integer", "float"):
             NAME_HINTS = {"name", "title", "institution", "series_title", "label", "id"}
             for col in mapping.columns:
@@ -215,9 +254,25 @@ class CSVResolver:
                 col["datatype"] = "string"
             if col.get("role") is None:
                 col["role"] = "attribute"
+        # Multi-entity mode is opt-in: the model returns a non-empty `entities`
+        # array only for wide CSVs that bundle several entities. Absent → legacy.
+        entities = data.get("entities") or None
+        relationships = data.get("relationships") or None
+        # `entity_type` is required in single-entity mode — its absence signals a
+        # malformed LLM response and (by raising KeyError) triggers the retry. In
+        # multi-entity mode it's ignored, so a placeholder is fine.
+        entity_type = data.get("entity_type")
+        if entity_type is None:
+            if entities is None:
+                raise KeyError("entity_type")
+            entity_type = "Entity"
         return CSVSchemaMapping(
-            entity_type=data["entity_type"],
+            entity_type=entity_type,
             columns=[ColumnMapping(**col) for col in data["columns"]],
+            entities=[EntitySpec(**e) for e in entities] if entities else None,
+            relationships=(
+                [EntityRelationSpec(**r) for r in relationships] if relationships else None
+            ),
         )
 
     async def _infer_via_openrouter(self, user_content: str, temperature: float = 0.0) -> dict:
@@ -270,8 +325,36 @@ class CSVResolver:
                                         "target_type": {"type": ["string", "null"]},
                                         "datatype": {"type": "string"},
                                         "attribute_name": {"type": ["string", "null"]},
+                                        "entity": {"type": ["string", "null"]},
                                     },
                                     "required": ["column_name", "role", "datatype"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "entities": {
+                                "type": ["array", "null"],
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "type_name": {"type": "string"},
+                                        "id_column": {"type": ["string", "null"]},
+                                        "id_from": {"type": ["array", "null"], "items": {"type": "string"}},
+                                    },
+                                    "required": ["name", "type_name"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "relationships": {
+                                "type": ["array", "null"],
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "subject": {"type": "string"},
+                                        "predicate": {"type": "string"},
+                                        "object": {"type": "string"},
+                                    },
+                                    "required": ["subject", "predicate", "object"],
                                     "additionalProperties": False,
                                 },
                             },
@@ -290,6 +373,11 @@ class CSVResolver:
         rows: list[dict[str, str]],
     ) -> tuple[list[ExtractedEntity], list[ExtractedRelationship]]:
         """Deterministically convert all CSV rows to entities + relationships. No LLM."""
+        # Multi-entity mode: one row expands into several fully-attributed,
+        # linked entities. Legacy single-entity path below is untouched.
+        if mapping.entities:
+            return CSVResolver._apply_multi_entity(mapping, rows)
+
         id_col = next((c for c in mapping.columns if c.role == ColumnRole.TYPE_ID), None)
         if not id_col:
             return [], []
@@ -386,6 +474,118 @@ class CSVResolver:
 
         return entities, relationships
 
+    @staticmethod
+    def _entity_key(spec, row: dict) -> str | None:
+        """Deterministic key for one in-row entity: its id_column value, or a
+        composite of id_from columns. None when the key resolves empty."""
+        if spec.id_column:
+            v = (row.get(spec.id_column) or "").strip()
+            return _safe_id(v) if v else None
+        if spec.id_from:
+            parts = [(row.get(c) or "").strip() for c in spec.id_from]
+            if not any(parts):
+                return None
+            return _safe_id("|".join(parts))
+        return None
+
+    @staticmethod
+    def _apply_multi_entity(
+        mapping: CSVSchemaMapping,
+        rows: list[dict[str, str]],
+    ) -> tuple[list[ExtractedEntity], list[ExtractedRelationship]]:
+        """Multi-entity mode: one row → several fully-attributed, linked entities.
+
+        Each `EntitySpec` is keyed by its id_column or an id_from composite.
+        Columns route to their owner entity (`ColumnMapping.entity`). Inter-entity
+        relationships reference the same deterministic ids the entities are minted
+        from, so edges resolve to real URIs (not stubs). Entities dedup across
+        rows by (type, id) with attribute union — collapsing repeated keys (e.g.
+        many reservations → 5 Properties) into one entity. ER fires per
+        ER-enabled type downstream (schema_resolver); nothing ER-specific here.
+        """
+        specs = {e.name: e for e in (mapping.entities or [])}
+
+        # Route columns to their owner entity; drop (and log) unowned columns.
+        cols_by_entity: dict[str, list[ColumnMapping]] = {name: [] for name in specs}
+        for col in mapping.columns:
+            if col.role == ColumnRole.TYPE_ID:
+                continue  # in multi-entity mode, ids come from EntitySpec
+            owner = col.entity
+            if owner is None or owner not in specs:
+                logger.warning(
+                    "csv_multi_unowned_column", column=col.column_name, entity=owner,
+                )
+                continue
+            cols_by_entity[owner].append(col)
+
+        entities_by_key: dict[tuple[str, str], ExtractedEntity] = {}
+        relationships: list[ExtractedRelationship] = []
+
+        def add_entity(type_name: str, key: str, attrs: list[ExtractedAttribute]) -> None:
+            ekey = (type_name, key)
+            ent = entities_by_key.get(ekey)
+            if ent is None:
+                entities_by_key[ekey] = ExtractedEntity(
+                    type_name=type_name, id=key, attributes=list(attrs),
+                )
+                return
+            seen = {(a.name, a.value) for a in ent.attributes}
+            for a in attrs:
+                if (a.name, a.value) not in seen:
+                    ent.attributes.append(a)
+                    seen.add((a.name, a.value))
+
+        for row in rows:
+            row_ids: dict[str, str] = {}
+            for name, spec in specs.items():
+                key = CSVResolver._entity_key(spec, row)
+                if key is None:
+                    continue
+                row_ids[name] = key
+                attrs: list[ExtractedAttribute] = []
+                for col in cols_by_entity[name]:
+                    raw = row.get(col.column_name, "")
+                    if isinstance(raw, str):
+                        raw = raw.strip()
+                    if not raw:
+                        continue
+                    attr_name = col.attribute_name or _snake_case(col.column_name)
+                    if col.role == ColumnRole.RELATIONSHIP and col.target_type:
+                        # Out-of-row reference (e.g. country) → stub target + edge.
+                        for value in _rel_values(raw):
+                            tid = _safe_id(value)
+                            relationships.append(ExtractedRelationship(
+                                source_id=key, predicate=attr_name, target_id=tid,
+                            ))
+                            add_entity(col.target_type, tid, [ExtractedAttribute(
+                                name="name", value=value, datatype="string",
+                            )])
+                    elif col.role == ColumnRole.ATTRIBUTE:
+                        value = str(raw)
+                        if "|" in value and col.datatype == "string":
+                            for v in value.split("|"):
+                                v = v.strip()
+                                if v:
+                                    attrs.append(ExtractedAttribute(
+                                        name=attr_name, value=v, datatype=col.datatype,
+                                    ))
+                        else:
+                            attrs.append(ExtractedAttribute(
+                                name=attr_name, value=value, datatype=col.datatype,
+                            ))
+                add_entity(spec.type_name, key, attrs)
+
+            # Inter-entity edges — only when both endpoints exist this row.
+            for rel in (mapping.relationships or []):
+                s = row_ids.get(rel.subject)
+                o = row_ids.get(rel.object)
+                if s and o:
+                    relationships.append(ExtractedRelationship(
+                        source_id=s, predicate=rel.predicate, target_id=o,
+                    ))
+
+        return list(entities_by_key.values()), relationships
+
 
 def _rank_sample_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """Sort by descending non-empty field count; stable on ties (preserves
@@ -399,6 +599,22 @@ def _rank_sample_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     indexed = list(enumerate(rows))
     indexed.sort(key=lambda t: (-score(t[1]), t[0]))
     return [r for _, r in indexed]
+
+
+def _rel_values(raw_value) -> list[str]:
+    """Split a relationship cell into one or more target labels (JSON array,
+    pipe-delimited, or short comma-delimited). Mirrors the legacy single-entity
+    splitting so multi-entity and legacy paths behave identically."""
+    if isinstance(raw_value, list):
+        return [v.strip() for v in raw_value if isinstance(v, str) and v.strip()]
+    raw_value = str(raw_value)
+    if "|" in raw_value:
+        return [v.strip() for v in raw_value.split("|") if v.strip()]
+    if ", " in raw_value:
+        parts = [v.strip() for v in raw_value.split(", ") if v.strip()]
+        if all(len(p) < 30 for p in parts) and len(parts) >= 2:
+            return parts
+    return [raw_value.strip()] if raw_value.strip() else []
 
 
 def _safe_id(raw: str) -> str:
