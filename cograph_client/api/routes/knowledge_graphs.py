@@ -121,6 +121,12 @@ async def delete_kg(
     # Drop all triples in the KG graph
     await client.update(f"DROP SILENT GRAPH <{graph}>")
 
+    # Drop the precomputed type-stats graph + in-memory summary cache. The stats
+    # graph URI is derived from the KG name, so a KG recreated under the same
+    # name would otherwise serve this deleted graph's stale counts.
+    from cograph_client.api.routes.explore import drop_kg_stats
+    await drop_kg_stats(client, tenant.tenant_id, kg_name)
+
     # Remove KG metadata
     await client.update(
         f"DELETE WHERE {{\n"

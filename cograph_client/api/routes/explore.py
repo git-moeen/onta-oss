@@ -286,6 +286,19 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
     return {"types": len(entity_counts), "predicate_rows": len(triples) - len(entity_counts)}
 
 
+async def drop_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> None:
+    """Drop a KG's precomputed stats graph and evict its in-memory summaries.
+
+    Called when a KG is deleted. The stats graph URI is derived from the KG
+    name, so without this a KG later recreated under the same name would serve
+    the deleted graph's stale counts until the next recompute lands.
+    """
+    stats = _stats_graph_uri(tenant_id, kg_name)
+    await client.update(f"DROP SILENT GRAPH <{stats}>")
+    for key in [k for k in _summary_cache if k[0] == tenant_id and k[1] == kg_name]:
+        _summary_cache.pop(key, None)
+
+
 # Background recompute: the whole-KG scan takes ~15s, longer than the ALB
 # response timeout, so we never want a request to block on it. The Neptune
 # client is an app-state singleton, so a fire-and-forget task is safe.
