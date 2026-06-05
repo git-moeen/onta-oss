@@ -32,7 +32,11 @@ from cograph_client.resolver.er.types import (
     MergeDecision,
     NormalizedSignals,
     SignalContribution,
+    ancestor_chain,
     config_for,
+    config_for_with_hierarchy,
+    primary_config_type,
+    primary_type,
 )
 
 __all__ = [
@@ -46,11 +50,15 @@ __all__ = [
     "MergeDecision",
     "NormalizedSignals",
     "SignalContribution",
+    "ancestor_chain",
     "choose_canonical",
     "compute_clusters",
     "config_for",
+    "config_for_with_hierarchy",
     "extract_signals",
     "merge_operations",
+    "primary_config_type",
+    "primary_type",
     "rebuild_kg",
     "rebuild_type",
 ]

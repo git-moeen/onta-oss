@@ -499,6 +499,12 @@ class NLQueryPipeline:
             if not filter_uses_overview:
                 sparql = re.sub(overview_pattern, RDFS_LABEL[1:-1], sparql)
 
+        # Fix 4: Rewrite type-assertion predicates to subclass-closure paths so a
+        # query over a parent type returns subtype instances (ADR rule 2).
+        # Deterministic, idempotent, no ontology lookup needed.
+        from cograph_client.graph.ontology_queries import rewrite_type_predicate_to_closure
+        sparql = rewrite_type_predicate_to_closure(sparql)
+
         return sparql
 
     @staticmethod

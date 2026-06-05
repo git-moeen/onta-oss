@@ -28,6 +28,7 @@ from cograph_client.graph.ontology_queries import (
     insert_attribute,
     insert_subtype,
     insert_type,
+    parent_map_query,
     type_uri,
     attr_uri,
 )
@@ -144,6 +145,10 @@ class SchemaResolver:
         from cograph_client.resolver.er import ERPipeline
         self._er = ERPipeline(neptune)
         self._er_enabled = os.environ.get("COGRAPH_ER_ENABLED", "1") != "0"
+        # child->parent (type-name) map for subclass-chain walks. Built once per
+        # ingest from parent_map_query and mutated in-place as new subtypes are
+        # created so later entities in the same batch can climb the chain.
+        self._parent_of: dict[str, str] = {}
 
     async def ingest(
         self,
@@ -169,6 +174,10 @@ class SchemaResolver:
 
         # Step 1: Fetch existing ontology (needed for extraction context)
         existing_types, existing_attrs = await self._fetch_ontology(graph_uri)
+        # Build the child->parent subclass map once per ingest. Used to climb the
+        # hierarchy for ER config selection and ancestor synthesis. Mutated
+        # in-place as new subtypes are created during this ingest.
+        self._parent_of = await self._fetch_parent_map(graph_uri)
 
         # CSV: use schema-inference pipeline (1 LLM call for schema, deterministic for rows)
         if content_type == "csv":
@@ -283,11 +292,16 @@ class SchemaResolver:
                 # Failures here MUST never block ingest — log and fall through.
                 if self._er_enabled:
                     try:
-                        from cograph_client.resolver.er import MergeAction, config_for
-                        er_applies = config_for(resolved_type) is not None
+                        from cograph_client.resolver.er import MergeAction, config_for_with_hierarchy
+                        # Climb the subclass chain so a granular leaf (HotelGuest)
+                        # inherits a configured ancestor's (Guest) ER config and
+                        # ER fires on the subtype.
+                        er_config = config_for_with_hierarchy(resolved_type, self._parent_of)
+                        er_applies = er_config is not None
                         type_uri = f"https://cograph.tech/types/{resolved_type}"
                         decision = await self._er.find_match(
                             entity, resolved_type, type_uri, instance_graph,
+                            config=er_config, parent_of=self._parent_of,
                         )
                         if decision.action == MergeAction.AUTO_MERGE and decision.canonical_uri:
                             entity_uri = decision.canonical_uri
@@ -692,6 +706,78 @@ class SchemaResolver:
 
         return types, attrs
 
+    async def _fetch_parent_map(self, graph_uri: str) -> dict[str, str]:
+        """Fetch the child->parent subclass map (keyed by type *name*).
+
+        Reads every rdfs:subClassOf edge via parent_map_query and reduces each
+        URI to its last path segment (the type name) so it can feed the pure
+        hierarchy helpers (ancestor_chain / config_for_with_hierarchy). Returns
+        {} on any error — callers degrade to flat (zero-hierarchy) behavior.
+        """
+        try:
+            raw = await self._neptune.query(parent_map_query(graph_uri))
+            _, bindings = parse_sparql_results(raw)
+        except Exception:
+            logger.warning("parent_map_fetch_failed", exc_info=True)
+            return {}
+
+        parent_of: dict[str, str] = {}
+        prefix = "https://cograph.tech/types/"
+        for row in bindings:
+            child = row.get("child", "")
+            parent = row.get("parent", "")
+            if child.startswith(prefix) and parent.startswith(prefix):
+                child_name = child[len(prefix):].rstrip("/").split("/")[0]
+                parent_name = parent[len(prefix):].rstrip("/").split("/")[0]
+                if child_name and parent_name and child_name != parent_name:
+                    parent_of[child_name] = parent_name
+        return parent_of
+
+    async def _synthesize_ancestors(
+        self,
+        child_type: str,
+        parent_type: str,
+        graph_uri: str,
+        existing_types: dict[str, str],
+        existing_attrs: dict[str, dict[str, AttributeSchema]],
+        result: IngestResult,
+    ) -> None:
+        """Close the rdfs:subClassOf lineage from `child_type` up to the nearest
+        existing root after a child->parent link is created (ADR rule 3).
+
+        Records the child->parent edge in self._parent_of, then walks the known
+        parent chain root-ward; for each ancestor NOT yet in existing_types,
+        emits insert_type + insert_subtype to keep the chain unbroken and
+        registers it in existing_types / existing_attrs / result.types_created.
+
+        Idempotent: ancestors already present are skipped. With only a single
+        parent hint available the synthesis closes that one link plus any of its
+        already-known ancestors; deeper brand-new lineage requires the extractor
+        to emit the full chain (follow-up).
+        """
+        if not parent_type:
+            return
+        # Record the new edge so later entities in this batch can climb it.
+        if child_type and child_type != parent_type:
+            self._parent_of[child_type] = parent_type
+
+        # Walk root-ward from the parent. ancestor_chain is cycle-guarded.
+        from cograph_client.resolver.er import ancestor_chain
+
+        chain = ancestor_chain(parent_type, self._parent_of)
+        # For each (ancestor, its_parent) pair, ensure the ancestor type exists
+        # and is linked to its parent.
+        for i, ancestor in enumerate(chain):
+            grandparent = chain[i + 1] if i + 1 < len(chain) else None
+            if ancestor not in existing_types:
+                await self._neptune.update(insert_type(graph_uri, ancestor, ""))
+                if grandparent:
+                    await self._neptune.update(insert_subtype(graph_uri, grandparent, ancestor))
+                    self._parent_of[ancestor] = grandparent
+                result.types_created.append(ancestor)
+                existing_types[ancestor] = ""
+                existing_attrs[ancestor] = {}
+
     async def _refresh_ontology(
         self,
         graph_uri: str,
@@ -744,6 +830,10 @@ class SchemaResolver:
                 result.types_created.append(entity.type_name)
                 existing_types[entity.type_name] = ""
                 existing_attrs[entity.type_name] = {}
+                await self._synthesize_ancestors(
+                    entity.type_name, match.parent_type, graph_uri,
+                    existing_types, existing_attrs, result,
+                )
                 return entity.type_name
             elif match.inconclusive:
                 # Verifier couldn't reach a real decision (e.g. LLM unavailable).
@@ -774,6 +864,10 @@ class SchemaResolver:
                 result.types_created.append(entity.type_name)
                 existing_types[entity.type_name] = ""
                 existing_attrs[entity.type_name] = {}
+                await self._synthesize_ancestors(
+                    entity.type_name, match.parent_type, graph_uri,
+                    existing_types, existing_attrs, result,
+                )
                 return entity.type_name
             elif match.verdict == MatchVerdict.FLAGGED:
                 sparql = insert_type(graph_uri, entity.type_name, "")
@@ -781,6 +875,10 @@ class SchemaResolver:
                 if entity.parent_type and entity.parent_type in existing_types:
                     sparql = insert_subtype(graph_uri, entity.parent_type, entity.type_name)
                     await self._neptune.update(sparql)
+                    await self._synthesize_ancestors(
+                        entity.type_name, entity.parent_type, graph_uri,
+                        existing_types, existing_attrs, result,
+                    )
                 logger.warning("type_flagged_for_review", proposed=entity.type_name)
                 result.flagged_types.append(entity.type_name)
                 result.types_created.append(entity.type_name)
@@ -794,6 +892,10 @@ class SchemaResolver:
                     sparql = insert_subtype(graph_uri, entity.parent_type, entity.type_name)
                     await self._neptune.update(sparql)
                     logger.info("type_new_with_parent", child=entity.type_name, parent=entity.parent_type)
+                    await self._synthesize_ancestors(
+                        entity.type_name, entity.parent_type, graph_uri,
+                        existing_types, existing_attrs, result,
+                    )
                 result.types_created.append(entity.type_name)
                 existing_types[entity.type_name] = ""
                 existing_attrs[entity.type_name] = {}

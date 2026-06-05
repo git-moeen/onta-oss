@@ -23,6 +23,7 @@ from cograph_client.resolver.er.types import (
     MergeDecision,
     NormalizedSignals,
     config_for,
+    config_for_with_hierarchy,
 )
 from cograph_client.resolver.models import ExtractedEntity
 
@@ -131,14 +132,20 @@ class ERPipeline:
         type_uri: str,
         instance_graph: str,
         config: ERConfig | None = None,
+        parent_of: dict[str, str] | None = None,
     ) -> MergeDecision:
         """Run ER for one entity. Return a MergeDecision the caller acts on.
 
-        If `config` is None, look up defaults by type_name. If still None,
+        If `config` is None, look up defaults by type_name, climbing the
+        subclass chain supplied via `parent_of` (child->parent map) so a
+        granular leaf inherits a configured ancestor's ERConfig. If still None,
         ER is skipped (the caller falls back to exact-URI-match dedup).
+
+        `parent_of` defaults to {} (empty map) which reproduces the old flat
+        `config_for` behavior exactly — fully backward-compatible.
         """
         if config is None:
-            config = config_for(type_name)
+            config = config_for_with_hierarchy(type_name, parent_of or {})
         if config is None:
             return MergeDecision(action=MergeAction.SKIP)
 

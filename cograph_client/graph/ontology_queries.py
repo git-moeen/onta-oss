@@ -125,6 +125,79 @@ def get_type_functions_query(graph_uri: str, type_name: str) -> str:
     )
 
 
+def parent_map_query(graph_uri: str) -> str:
+    """Select every rdfs:subClassOf edge so a caller can build a child->parent map.
+
+    Returns ?child ?parent for all `?child rdfs:subClassOf ?parent` triples.
+    The caller turns these bindings into `parent_of: dict[str, str]` (keyed by
+    the type *name*, i.e. the last URI path segment) for hierarchy walks used by
+    config_for_with_hierarchy / primary_type / ancestor_chain.
+    """
+    return (
+        f"SELECT ?child ?parent FROM <{graph_uri}>\n"
+        f"WHERE {{\n"
+        f"  ?child <{RDFS}#subClassOf> ?parent .\n"
+        f"}}"
+    )
+
+
+def with_subclass_closure(type_name: str) -> str:
+    """Return the SPARQL property-path predicate that matches `type_name` and any
+    of its subtypes: `a/<RDFS#subClassOf>*`.
+
+    Used in place of a bare `a`/rdf:type predicate so a query over a parent type
+    returns subtype instances too (ADR rule 2 — query-time subclass closure).
+    The trailing `<type_uri(type_name)>` object is supplied by the caller.
+    """
+    return f"<{RDF}#type>/<{RDFS}#subClassOf>*"
+
+
+# Property path that turns a type-assertion predicate into its subclass closure.
+_CLOSURE_PATH = f"<{RDF}#type>/<{RDFS}#subClassOf>*"
+_TYPES_URI = "https://cograph.tech/types/"
+
+
+def rewrite_type_predicate_to_closure(sparql: str) -> str:
+    """Rewrite type-assertion triples to use subclass-closure property paths.
+
+    Turns `?var a <types/X>` and `?var <rdf:type> <types/X>` into
+    `?var <rdf:type>/<rdfs:subClassOf>* <types/X>`, so a query over a parent
+    type returns all subtype instances (ADR rule 2).
+
+    Deterministic and regex-based — no ontology lookup, no Neptune, no LLM:
+      - Only matches type-assertion predicate position whose OBJECT is a
+        `https://cograph.tech/types/...` URI (the only place rewriting is valid).
+      - Closure over a leaf type is set-equal to the leaf itself, so the rewrite
+        is safe to apply unconditionally.
+      - Idempotent: a triple already using the closure path (`.../subClassOf>*`)
+        is left untouched.
+
+    Pure string transform — unit-testable with a plain SPARQL string.
+    """
+    import re
+
+    rdf_type_full = f"<{RDF}#type>"
+    types_obj = re.escape(_TYPES_URI)
+
+    # Form A: `?var a <https://cograph.tech/types/X>`
+    sparql = re.sub(
+        rf'(\?\w+)\s+a\s+(<{types_obj}\w+>)',
+        rf'\1 {_CLOSURE_PATH} \2',
+        sparql,
+    )
+
+    # Form B: `?var <http://...#type> <https://cograph.tech/types/X>`
+    # The negative-lookahead on the predicate guards idempotence: skip when the
+    # predicate is already the closure path (which itself contains <...#type>).
+    sparql = re.sub(
+        rf'(\?\w+)\s+{re.escape(rdf_type_full)}(?!/)\s+(<{types_obj}\w+>)',
+        rf'\1 {_CLOSURE_PATH} \2',
+        sparql,
+    )
+
+    return sparql
+
+
 def get_full_ontology_query(graph_uri: str) -> str:
     """Get all types, attributes, and functions in one query for the NL pipeline."""
     return (

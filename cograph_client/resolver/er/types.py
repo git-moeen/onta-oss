@@ -234,11 +234,119 @@ DEFAULTS_BY_TYPE: dict[str, ERConfig] = {
 }
 
 
+def ancestor_chain(type_name: str, parent_of: dict[str, str]) -> list[str]:
+    """Return the subclass lineage [type_name, parent, grandparent, ... root].
+
+    `parent_of` is a flat child->parent map (one parent per child, as built from
+    the ontology's rdfs:subClassOf edges). The chain starts at `type_name` and
+    walks root-ward. Cycle-guarded with a visited set so malformed data
+    (self-parent, or a cyclic subClassOf graph) can never spin forever — the
+    first repeated type ends the walk.
+
+    Pure: no Neptune, no I/O. Testable with a literal dict.
+    """
+    chain: list[str] = []
+    seen: set[str] = set()
+    current: str | None = type_name
+    while current is not None and current not in seen:
+        chain.append(current)
+        seen.add(current)
+        current = parent_of.get(current)
+    return chain
+
+
+def config_for_with_hierarchy(type_name: str, parent_of: dict[str, str]) -> ERConfig | None:
+    """Look up the ERConfig for a type, climbing the subclass chain.
+
+    Walks `ancestor_chain(type_name, parent_of)` and returns the first ancestor
+    that has a configured ERConfig in DEFAULTS_BY_TYPE. This is the load-bearing
+    ER fix: a granular leaf like HotelGuest inherits Guest's config so ER fires
+    on the subtype even though only the ancestor is in DEFAULTS_BY_TYPE.
+
+    Returns None if no ancestor in the chain is ER-enabled — in which case ER is
+    skipped and the exact-URI-match path is used as today.
+
+    With an empty `parent_of` the chain is just [type_name], so behavior is
+    byte-identical to the flat `config_for`.
+    """
+    for ancestor in ancestor_chain(type_name, parent_of):
+        cfg = DEFAULTS_BY_TYPE.get(ancestor)
+        if cfg is not None:
+            return cfg
+    return None
+
+
 def config_for(type_name: str) -> ERConfig | None:
     """Look up the default ERConfig for a type. Returns None if the type
     isn't in our ER-enabled set — in which case ER is skipped and the
-    exact-URI-match path is used as today."""
-    return DEFAULTS_BY_TYPE.get(type_name)
+    exact-URI-match path is used as today.
+
+    Flat (zero-hierarchy) fast path: delegates to config_for_with_hierarchy
+    with an empty parent map, so the result is identical to a direct
+    DEFAULTS_BY_TYPE.get(type_name)."""
+    return config_for_with_hierarchy(type_name, {})
+
+
+def primary_type(asserted_types: list[str], parent_of: dict[str, str]) -> str | None:
+    """Pick the most-specific (deepest leaf) asserted type.
+
+    A candidate `t` is *dominated* if some OTHER asserted type `s` has `t` in
+    its ancestor_chain (i.e. `t` is an ancestor of `s`, so `s` is more specific).
+    We return a non-dominated candidate. Among ties (genuinely independent
+    multi-classification), pick the one with the longest ancestor_chain (deepest
+    in the hierarchy), then lexicographically smallest, so the result is stable
+    for tests.
+
+    Empty list -> None. Single element -> that element.
+
+    Used for URI minting, ER config selection, and stats counting per ADR rule 5.
+    Today's single-type ingest passes [resolved_type] and gets resolved_type back,
+    so adoption is non-breaking.
+    """
+    if not asserted_types:
+        return None
+    # Dedupe while preserving determinism.
+    candidates = list(dict.fromkeys(asserted_types))
+    if len(candidates) == 1:
+        return candidates[0]
+
+    non_dominated: list[str] = []
+    for t in candidates:
+        dominated = False
+        for s in candidates:
+            if s == t:
+                continue
+            # t is an ancestor of s (and not s itself) -> s is more specific.
+            chain_s = ancestor_chain(s, parent_of)
+            if t in chain_s[1:]:
+                dominated = True
+                break
+        if not dominated:
+            non_dominated.append(t)
+
+    pool = non_dominated or candidates
+    return max(pool, key=lambda t: (len(ancestor_chain(t, parent_of)), [-ord(c) for c in t]))
+
+
+def primary_config_type(asserted_types: list[str], parent_of: dict[str, str]) -> str | None:
+    """The most-specific asserted type that ALSO resolves to an ERConfig.
+
+    URI minting uses the most-specific-asserted type (`primary_type`); ER
+    selection uses the most-specific-CONFIGURED asserted type, which this
+    returns. Per ADR rule 5 these can differ (a leaf may have no config while
+    a slightly-coarser asserted sibling does).
+
+    Among asserted types whose config_for_with_hierarchy is non-None, returns
+    the deepest (longest ancestor_chain), tie-broken lexicographically. Returns
+    None if no asserted type resolves to a config. Pure, no I/O.
+    """
+    configured = [
+        t for t in dict.fromkeys(asserted_types)
+        if config_for_with_hierarchy(t, parent_of) is not None
+    ]
+    if not configured:
+        return None
+    return max(configured, key=lambda t: (len(ancestor_chain(t, parent_of)), [-ord(c) for c in t]))
 
 
 # ---------------------------------------------------------------------------
