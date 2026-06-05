@@ -70,15 +70,27 @@ Rules:
 
 Type placement:
 You will be given the existing ontology types. For each entity you extract:
+- Always pick the MOST SPECIFIC type the data justifies (HotelGuest over Guest \
+over Person; Condo over Property) — granularity is recovered later, coarseness \
+is not.
 - If its type already exists in the ontology, use that exact type name and set \
 same_as to that name.
 - If its type is new but is a subtype of an existing type (is-a relationship), \
-set parent_type to the existing type name. Prefer connecting to the hierarchy \
+set parent_type to the EXISTING type name. Prefer connecting to the hierarchy \
 over creating orphaned types. A Broker is a Person. A City is a Place. A Condo \
 is a Property. But geographic containment is NOT a subtype: State is NOT a \
 subtype of City, City is NOT a subtype of State. Use relationships for containment.
-- If its type is genuinely unrelated to anything in the ontology, leave both \
-same_as and parent_type as null.
+- parent_chain: list the FULL is-a lineage of type_name, most-specific first, up \
+to the most general type — e.g. type_name "HotelGuest" -> parent_chain \
+["Guest", "Person"]; "Condo" -> ["Property", "Asset"]. Include ancestors even if \
+they are NOT yet in the ontology (they will be created). This closes a brand-new \
+multi-level hierarchy in one shot. Omit or leave empty only for a top-level type.
+- also_types: ONLY for genuine, independent multi-classification — when the entity \
+truly IS two unrelated things at once (a hotel employee who is also a guest: \
+type_name "Employee", also_types ["Guest"]). These are NOT ancestors. Leave empty \
+in the common case.
+- If its type is genuinely unrelated to anything in the ontology, leave same_as \
+and parent_type null and parent_chain empty.
 
 Entity-first principle:
 When unsure whether a value should be a literal attribute or a separate entity \
@@ -103,10 +115,12 @@ Return JSON:
 {{
   "entities": [
     {{
-      "type_name": "TypeName",
+      "type_name": "MostSpecificTypeName",
       "id": "identifier",
       "same_as": "<existing type name if this is the same concept, else null>",
       "parent_type": "<existing type name if this is a subtype, else null>",
+      "parent_chain": ["<immediate parent>", "<grandparent>", "..."],
+      "also_types": ["<independent co-type, rare>"],
       "attributes": [
         {{"name": "attr_name", "value": "attr_value", "datatype": "string"}}
       ]
@@ -275,6 +289,9 @@ class SchemaResolver:
         # ER index triples (block keys + denormalized signals) for newly minted
         # entities. Empty for merged/dedup'd entities.
         er_index_triples: list[tuple[str, str, str]] = []
+        # Genuine independent co-classifications per entity id (ADR rule 1).
+        # Empty for the common single-type case.
+        entity_also_types: dict[str, list[str]] = {}
         # Track which entity IDs were merged into existing URIs (for telemetry)
         er_merged_count = 0
         for i, entity in enumerate(extraction.entities):
@@ -286,6 +303,14 @@ class SchemaResolver:
             )
             if resolved_type:
                 resolved_types[entity.id] = resolved_type
+                # Resolve genuine co-types so they exist in the ontology; record
+                # them for the multi-type write in pass 2. The declared primary
+                # type (resolved_type) still owns URI minting + ER.
+                also = await self._resolve_also_types(
+                    entity, resolved_type, graph_uri, existing_types, existing_attrs, result,
+                )
+                if also:
+                    entity_also_types[entity.id] = also
                 entity_uri = f"https://cograph.tech/entities/{resolved_type}/{_safe_id(entity.id)}"
 
                 # Cross-file ER: see if this entity matches an existing one.
@@ -384,6 +409,7 @@ class SchemaResolver:
                 entity, resolved_type, entity_uri, is_duplicate,
                 graph_uri, existing_types, existing_attrs, source, result, batch_id,
                 _collect_triples=all_entity_triples,
+                also_types=entity_also_types.get(entity.id),
             )
 
         # Append ER index triples (block keys + denormalized signals) to the
@@ -736,37 +762,56 @@ class SchemaResolver:
     async def _synthesize_ancestors(
         self,
         child_type: str,
-        parent_type: str,
+        parent_type: str | None,
         graph_uri: str,
         existing_types: dict[str, str],
         existing_attrs: dict[str, dict[str, AttributeSchema]],
         result: IngestResult,
+        parent_chain: list[str] | None = None,
+        emit_child_edge: bool = False,
     ) -> None:
         """Close the rdfs:subClassOf lineage from `child_type` up to the nearest
-        existing root after a child->parent link is created (ADR rule 3).
+        existing root (ADR 0001 rule 3).
 
-        Records the child->parent edge in self._parent_of, then walks the known
-        parent chain root-ward; for each ancestor NOT yet in existing_types,
-        emits insert_type + insert_subtype to keep the chain unbroken and
-        registers it in existing_types / existing_attrs / result.types_created.
+        `parent_type` is the immediate parent (may be None when only an extractor
+        chain is available). `parent_chain` is the extractor's full ancestor list
+        for `child_type`, most-specific first — seeding it lets a brand-new
+        MULTI-LEVEL lineage (e.g. Condo < Property < Asset, all new) close in a
+        single pass. `emit_child_edge=True` makes this method emit the
+        child->immediate-parent subClassOf edge itself; callers that already
+        emitted it (the SUBTYPE branches) pass False to avoid a redundant write.
 
-        Idempotent: ancestors already present are skipped. With only a single
-        parent hint available the synthesis closes that one link plus any of its
-        already-known ancestors; deeper brand-new lineage requires the extractor
-        to emit the full chain (follow-up).
+        For each ancestor NOT yet in existing_types, emits insert_type +
+        insert_subtype and registers it in existing_types / existing_attrs /
+        result.types_created. Idempotent: ancestors already present are skipped.
         """
-        if not parent_type:
-            return
-        # Record the new edge so later entities in this batch can climb it.
-        if child_type and child_type != parent_type:
-            self._parent_of[child_type] = parent_type
-
-        # Walk root-ward from the parent. ancestor_chain is cycle-guarded.
         from cograph_client.resolver.er import ancestor_chain
 
+        parent_chain = parent_chain or []
+        # Immediate parent: explicit hint wins; otherwise top of the extractor chain.
+        if not parent_type:
+            parent_type = parent_chain[0] if parent_chain else None
+        if not parent_type:
+            return
+
+        # Record the child->parent edge so later entities in this batch can climb it.
+        if child_type and child_type != parent_type:
+            self._parent_of[child_type] = parent_type
+        # Seed the deeper extractor lineage (ancestors of child, most-specific
+        # first) without clobbering edges already recorded (setdefault).
+        prev = child_type
+        for anc in parent_chain:
+            if prev and anc and prev != anc:
+                self._parent_of.setdefault(prev, anc)
+            prev = anc
+
+        # Brand-new lineage: the caller couldn't link child->parent because the
+        # parent didn't exist yet. Emit that edge here.
+        if emit_child_edge and child_type and child_type != parent_type:
+            await self._neptune.update(insert_subtype(graph_uri, parent_type, child_type))
+
+        # Walk root-ward from the immediate parent. ancestor_chain is cycle-guarded.
         chain = ancestor_chain(parent_type, self._parent_of)
-        # For each (ancestor, its_parent) pair, ensure the ancestor type exists
-        # and is linked to its parent.
         for i, ancestor in enumerate(chain):
             grandparent = chain[i + 1] if i + 1 < len(chain) else None
             if ancestor not in existing_types:
@@ -777,6 +822,46 @@ class SchemaResolver:
                 result.types_created.append(ancestor)
                 existing_types[ancestor] = ""
                 existing_attrs[ancestor] = {}
+
+    async def _link_parent(
+        self,
+        entity: ExtractedEntity,
+        graph_uri: str,
+        existing_types: dict[str, str],
+        existing_attrs: dict[str, dict[str, AttributeSchema]],
+        result: IngestResult,
+    ) -> None:
+        """Attach a freshly-created type to its parent lineage.
+
+        Two cases:
+        - immediate parent already exists → link directly, then synthesize any
+          deeper ancestors the extractor named (parent_chain);
+        - brand-new lineage (parent not in the ontology, or only a parent_chain) →
+          let _synthesize_ancestors create every missing ancestor AND the
+          child->parent edge (emit_child_edge=True). This closes a fully-new
+          multi-level chain like Condo < Property < Asset in one row (ADR rule 3).
+        """
+        pt = entity.parent_type
+        if pt and pt in existing_types:
+            # Immediate parent exists — link directly, then synthesize any deeper
+            # ancestors the extractor named.
+            await self._neptune.update(insert_subtype(graph_uri, pt, entity.type_name))
+            await self._synthesize_ancestors(
+                entity.type_name, pt, graph_uri, existing_types, existing_attrs, result,
+                parent_chain=entity.parent_chain,
+            )
+            logger.info("type_new_with_parent", child=entity.type_name, parent=pt)
+        elif entity.parent_chain:
+            # Brand-new lineage. We DON'T trust a parent_type that names a
+            # non-existing type (preserves the "parent_type must be existing"
+            # contract); the full chain comes from parent_chain instead.
+            await self._synthesize_ancestors(
+                entity.type_name, None, graph_uri, existing_types, existing_attrs, result,
+                parent_chain=entity.parent_chain, emit_child_edge=True,
+            )
+            logger.info(
+                "type_new_lineage", child=entity.type_name, parent=entity.parent_chain[0],
+            )
 
     async def _refresh_ontology(
         self,
@@ -804,6 +889,46 @@ class SchemaResolver:
                         existing_attrs[t][a] = schema
         if added:
             logger.info("ontology_refreshed", new_types=added)
+
+    async def _resolve_also_types(
+        self,
+        entity: ExtractedEntity,
+        primary_resolved: str,
+        graph_uri: str,
+        existing_types: dict[str, str],
+        existing_attrs: dict[str, dict[str, AttributeSchema]],
+        result: IngestResult,
+    ) -> list[str]:
+        """Resolve genuine co-classifications (entity.also_types) so each exists
+        in the ontology (ADR rule 1). Returns the resolved co-type names, deduped.
+
+        Skips any co-type that is actually in the primary's subClassOf lineage
+        (an ancestor or descendant) — those are recovered by query-time closure,
+        not asserted. Only genuinely INDEPENDENT types are returned.
+        """
+        if not entity.also_types:
+            return []
+        from cograph_client.resolver.er import ancestor_chain
+
+        resolved: list[str] = []
+        seen = {primary_resolved}
+        for co in entity.also_types:
+            if not co:
+                continue
+            proxy = ExtractedEntity(type_name=co, id=entity.id)
+            rt = await self._resolve_type(
+                proxy, graph_uri, existing_types, existing_attrs, result,
+            )
+            if not rt or rt in seen:
+                continue
+            # Same-lineage guard: skip if one is an ancestor of the other.
+            if rt in ancestor_chain(primary_resolved, self._parent_of) or \
+               primary_resolved in ancestor_chain(rt, self._parent_of):
+                logger.info("also_type_in_lineage_skipped", primary=primary_resolved, co_type=rt)
+                continue
+            resolved.append(rt)
+            seen.add(rt)
+        return resolved
 
     async def _resolve_type(
         self,
@@ -833,6 +958,7 @@ class SchemaResolver:
                 await self._synthesize_ancestors(
                     entity.type_name, match.parent_type, graph_uri,
                     existing_types, existing_attrs, result,
+                    parent_chain=entity.parent_chain,
                 )
                 return entity.type_name
             elif match.inconclusive:
@@ -867,38 +993,26 @@ class SchemaResolver:
                 await self._synthesize_ancestors(
                     entity.type_name, match.parent_type, graph_uri,
                     existing_types, existing_attrs, result,
+                    parent_chain=entity.parent_chain,
                 )
                 return entity.type_name
             elif match.verdict == MatchVerdict.FLAGGED:
                 sparql = insert_type(graph_uri, entity.type_name, "")
                 await self._neptune.update(sparql)
-                if entity.parent_type and entity.parent_type in existing_types:
-                    sparql = insert_subtype(graph_uri, entity.parent_type, entity.type_name)
-                    await self._neptune.update(sparql)
-                    await self._synthesize_ancestors(
-                        entity.type_name, entity.parent_type, graph_uri,
-                        existing_types, existing_attrs, result,
-                    )
-                logger.warning("type_flagged_for_review", proposed=entity.type_name)
-                result.flagged_types.append(entity.type_name)
                 result.types_created.append(entity.type_name)
                 existing_types[entity.type_name] = ""
                 existing_attrs[entity.type_name] = {}
+                await self._link_parent(entity, graph_uri, existing_types, existing_attrs, result)
+                logger.warning("type_flagged_for_review", proposed=entity.type_name)
+                result.flagged_types.append(entity.type_name)
                 return entity.type_name
             else:
                 sparql = insert_type(graph_uri, entity.type_name, "")
                 await self._neptune.update(sparql)
-                if entity.parent_type and entity.parent_type in existing_types:
-                    sparql = insert_subtype(graph_uri, entity.parent_type, entity.type_name)
-                    await self._neptune.update(sparql)
-                    logger.info("type_new_with_parent", child=entity.type_name, parent=entity.parent_type)
-                    await self._synthesize_ancestors(
-                        entity.type_name, entity.parent_type, graph_uri,
-                        existing_types, existing_attrs, result,
-                    )
                 result.types_created.append(entity.type_name)
                 existing_types[entity.type_name] = ""
                 existing_attrs[entity.type_name] = {}
+                await self._link_parent(entity, graph_uri, existing_types, existing_attrs, result)
                 return entity.type_name
 
     async def _resolve_and_insert_entity(
@@ -914,12 +1028,16 @@ class SchemaResolver:
         result: IngestResult,
         batch_id: str = "",
         _collect_triples: list[tuple[str, str, str]] | None = None,
+        also_types: list[str] | None = None,
     ) -> None:
         """Pass 2: Resolve attributes, validate, and collect triples for one entity.
 
         If _collect_triples is provided, triples are appended to that list instead of
         being inserted immediately. The caller is responsible for batch-inserting them.
         This is ~10-50x faster because it avoids per-entity Neptune INSERT calls.
+
+        `also_types` are genuine independent co-classifications (ADR rule 1): each
+        gets its own asserted rdf:type triple alongside the primary resolved_type.
         """
         type_attrs = existing_attrs.get(resolved_type, {})
 
@@ -949,6 +1067,12 @@ class SchemaResolver:
                 (entity_uri, rdf_type, type_uri(resolved_type)),
                 (entity_uri, rdfs_label, entity.id),
             ]
+            # Multi-typing: emit an additional asserted rdf:type per genuine
+            # co-classification (ADR rule 1). Ancestors are NOT asserted here —
+            # they are recovered via query-time subclass closure.
+            for co_type in (also_types or ()):
+                if co_type and co_type != resolved_type:
+                    triples_to_insert.append((entity_uri, rdf_type, type_uri(co_type)))
 
         promoted_entities: dict[str, str] = {}
 

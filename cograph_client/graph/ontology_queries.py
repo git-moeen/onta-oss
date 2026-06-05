@@ -160,9 +160,9 @@ _TYPES_URI = "https://cograph.tech/types/"
 def rewrite_type_predicate_to_closure(sparql: str) -> str:
     """Rewrite type-assertion triples to use subclass-closure property paths.
 
-    Turns `?var a <types/X>` and `?var <rdf:type> <types/X>` into
-    `?var <rdf:type>/<rdfs:subClassOf>* <types/X>`, so a query over a parent
-    type returns all subtype instances (ADR rule 2).
+    Turns `?var a <types/X>`, `?var <rdf:type> <types/X>`, and the prefixed
+    `?var rdf:type <types/X>` into `?var <rdf:type>/<rdfs:subClassOf>* <types/X>`,
+    so a query over a parent type returns all subtype instances (ADR rule 2).
 
     Deterministic and regex-based — no ontology lookup, no Neptune, no LLM:
       - Only matches type-assertion predicate position whose OBJECT is a
@@ -171,6 +171,14 @@ def rewrite_type_predicate_to_closure(sparql: str) -> str:
         is safe to apply unconditionally.
       - Idempotent: a triple already using the closure path (`.../subClassOf>*`)
         is left untouched.
+
+    NOTE: best-effort safety net. It fires only when the type is asserted as a
+    direct triple in one of the recognized forms. Inside the NL pipeline,
+    `_fix_common_sparql_issues` first normalizes `a` / `rdf:type` shorthand to the
+    full-IRI predicate (Form B) and then calls this, so the common shapes are
+    covered. A query that selects type via FILTER / VALUES / a UNION of explicit
+    subtypes is NOT rewritten and would still return only the named type — closing
+    those shapes (prompt guidance or a parser-level rewrite) is a tracked follow-up.
 
     Pure string transform — unit-testable with a plain SPARQL string.
     """
@@ -191,6 +199,15 @@ def rewrite_type_predicate_to_closure(sparql: str) -> str:
     # predicate is already the closure path (which itself contains <...#type>).
     sparql = re.sub(
         rf'(\?\w+)\s+{re.escape(rdf_type_full)}(?!/)\s+(<{types_obj}\w+>)',
+        rf'\1 {_CLOSURE_PATH} \2',
+        sparql,
+    )
+
+    # Form C: prefixed `?var rdf:type <https://cograph.tech/types/X>`. Common
+    # when the model declares `PREFIX rdf:`. Negative-lookahead on `/` keeps it
+    # idempotent against an already-rewritten `rdf:type/rdfs:subClassOf*`.
+    sparql = re.sub(
+        rf'(\?\w+)\s+rdf:type(?!/)\s+(<{types_obj}\w+>)',
         rf'\1 {_CLOSURE_PATH} \2',
         sparql,
     )

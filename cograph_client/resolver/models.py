@@ -28,6 +28,25 @@ class ExtractedEntity(BaseModel):
     id: str = Field(description="Identifier for this entity (name, URI, or generated)")
     same_as: str | None = Field(default=None, description="Existing type name if this is the same concept")
     parent_type: str | None = Field(default=None, description="Existing type name if this is a subtype")
+    parent_chain: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Full ancestor lineage of type_name, most-specific first "
+            "(e.g. Condo -> ['Property', 'Asset']). Lets ingest close a brand-new "
+            "multi-level subClassOf chain in one row (ADR 0001 rule 3). May include "
+            "types not yet in the ontology."
+        ),
+    )
+    also_types: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Genuine ADDITIONAL independent classifications (NOT ancestors of "
+            "type_name) — e.g. a hotel employee who is also a guest: type_name="
+            "'Employee', also_types=['Guest']. Each becomes a separate asserted "
+            "rdf:type (ADR 0001 rule 1). Leave empty unless the entity truly IS "
+            "two unrelated things."
+        ),
+    )
     attributes: list[ExtractedAttribute] = Field(default_factory=list)
 
 
