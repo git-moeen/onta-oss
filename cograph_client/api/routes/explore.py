@@ -53,6 +53,44 @@ _STAT_REL = _STATS_NS + "rel"
 _STAT_TARGET = _STATS_NS + "targetType"
 _STAT_ENTITY_COUNT = _STATS_NS + "entityCount"
 
+# --- Primary-type attribution (COG-35, follow-up to ADR 0001 multi-typing) ----
+# With multi-typing an instance can carry more than one asserted rdf:type (its
+# `also_types` co-classifications, e.g. an entity asserted as both Employee and
+# Guest). Grouping the stats scan by raw rdf:type would count such an instance
+# once PER asserted type — double-counting it across the Explorer's per-type
+# panels. ADR rule 5 says each instance is counted exactly once, under its
+# "primary type" (the most-specific asserted type).
+#
+# This guard reproduces, in pure SPARQL over the KG graph alone, the choice made
+# by resolver.er.types.primary_type for the data this system actually writes:
+#
+#   * Asserted co-types (`also_types`) are GENUINE INDEPENDENT classifications
+#     (ADR rule 1) — siblings, never an asserted subtype + its ancestor (ancestors
+#     are recovered via query-time subclass closure, never asserted). For equal-
+#     depth siblings, primary_type tie-breaks to the LEXICOGRAPHICALLY SMALLEST
+#     type name. Type URIs share the `…/types/` prefix, so URI string order equals
+#     type-name order — the guard below picks the smallest-URI asserted type.
+#
+# An instance therefore contributes to ?type only when ?type is its smallest
+# asserted type URI; the NOT EXISTS rejects every heavier co-type. For a single-
+# typed instance the inner pattern can never bind a different `types/` type, so
+# the NOT EXISTS is vacuously satisfied and behavior is byte-identical to before
+# — which is the common case and must not regress.
+#
+# Caveat (documented, out of scope): this matches primary_type for INDEPENDENT
+# co-types, the only multi-typing the resolver emits. It does NOT consult the
+# subClassOf hierarchy (which lives in the ontology graph, not this KG scan), so
+# if an asserted subtype + ancestor pair ever appeared it would attribute to the
+# smaller URI rather than the deeper type. The resolver does not produce that
+# shape today.
+_PRIMARY_TYPE_GUARD = (
+    f"  FILTER NOT EXISTS {{\n"
+    f"    ?e <{RDF_TYPE}> ?type2 .\n"
+    f'    FILTER(STRSTARTS(STR(?type2), "{TYPE_URI_PREFIX}") '
+    f"&& STR(?type2) < STR(?type))\n"
+    f"  }}\n"
+)
+
 
 def _target_from_entity_uri(obj: str) -> str | None:
     """Entity URIs are .../entities/{TargetType}/{id} → the target type leaf."""
@@ -158,6 +196,14 @@ async def _live_scan(client: NeptuneClient, kg_graph: str, t_uri: str) -> tuple[
         f"FROM <{kg_graph}> WHERE {{\n"
         f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
         f"  ?e ?p ?o .\n"
+        # Primary-type attribution: when ?e is multi-typed, count it only under
+        # its smallest asserted type URI so the fallback matches the precomputed
+        # stats (see _PRIMARY_TYPE_GUARD). Single-typed: vacuously satisfied.
+        f"  FILTER NOT EXISTS {{\n"
+        f"    ?e <{RDF_TYPE}> ?type2 .\n"
+        f'    FILTER(STRSTARTS(STR(?type2), "{TYPE_URI_PREFIX}") '
+        f'&& STR(?type2) < "{t_uri}")\n'
+        f"  }}\n"
         f"}} GROUP BY ?p ORDER BY DESC(?cnt)"
     )
     _, rows = parse_sparql_results(await client.query(pred_sparql))
@@ -234,6 +280,7 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
         f"  ?e <{RDF_TYPE}> ?type .\n"
         f"  ?e ?p ?o .\n"
         f'  FILTER(STRSTARTS(STR(?type), "{TYPE_URI_PREFIX}"))\n'
+        f"{_PRIMARY_TYPE_GUARD}"
         f"}} GROUP BY ?type ?p"
     )
     _, rows = parse_sparql_results(await client.query(scan))
@@ -460,7 +507,15 @@ async def search_explorer(
             t_uri = type_uri(type_name)
             count_sparql = (
                 f"SELECT (COUNT(DISTINCT ?e) AS ?n) FROM <{kg_graph}> WHERE {{\n"
-                f"  ?e <{RDF_TYPE}> <{t_uri}>\n"
+                f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
+                # Primary-type attribution: a multi-typed instance is counted
+                # only under its smallest asserted type URI (see
+                # _PRIMARY_TYPE_GUARD). Single-typed: vacuously satisfied.
+                f"  FILTER NOT EXISTS {{\n"
+                f"    ?e <{RDF_TYPE}> ?type2 .\n"
+                f'    FILTER(STRSTARTS(STR(?type2), "{TYPE_URI_PREFIX}") '
+                f'&& STR(?type2) < "{t_uri}")\n'
+                f"  }}\n"
                 f"}}"
             )
             try:
