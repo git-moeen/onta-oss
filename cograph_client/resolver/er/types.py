@@ -268,12 +268,15 @@ def config_for_with_hierarchy(type_name: str, parent_of: dict[str, str]) -> ERCo
 
     With an empty `parent_of` the chain is just [type_name], so behavior is
     byte-identical to the flat `config_for`.
+
+    Since ADR 0002 §3 this is a thin wrapper over the generalized
+    strategy-bundle resolver (resolver/strategy.py), whose default registry
+    carries DEFAULTS_BY_TYPE as 'er' entries — same chain walk, same result.
+    Imported lazily to avoid a module cycle (strategy.py imports this module).
     """
-    for ancestor in ancestor_chain(type_name, parent_of):
-        cfg = DEFAULTS_BY_TYPE.get(ancestor)
-        if cfg is not None:
-            return cfg
-    return None
+    from cograph_client.resolver.strategy import default_registry, resolve_entry
+
+    return resolve_entry(type_name, "er", parent_of, [default_registry()])
 
 
 def config_for(type_name: str) -> ERConfig | None:
