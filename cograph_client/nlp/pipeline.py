@@ -52,7 +52,16 @@ class NLQueryPipeline:
         self._query_model = DEFAULT_QUERY_MODEL
         self._query_provider = DEFAULT_QUERY_PROVIDER
 
-    async def ask(self, question: str, graph_uri: str, instance_graph: str | None = None, exclude_questions: list[str] | None = None) -> NLResult:
+    async def ask(self, question: str, graph_uri: str, instance_graph: str | None = None, exclude_questions: list[str] | None = None, layer_graph_uris: list[str] | None = None) -> NLResult:
+        """Answer a natural-language question over the graph.
+
+        layer_graph_uris (ADR 0002 §1, COG-37, opt-in): a LayerStack's
+        visible_graph_uris(). Generated queries are graph-scoped (FROM the
+        data graph), so without this the subclass-closure path can't see
+        subClassOf edges living in other layer graphs; when provided, each
+        generated query gains FROM clauses for every visible layer. When
+        None (the default), behavior is exactly as before.
+        """
         timing: dict[str, float] = {}
         timing["model"] = f"{self._query_provider}:{self._query_model}"
         # Ontology is always fetched from the base tenant graph
@@ -119,6 +128,11 @@ class NLQueryPipeline:
             sparql = self._fix_attribute_uris(sparql, ontology)
             # Fix cross-type attribute misuse and rdf:type shorthand
             sparql = self._fix_common_sparql_issues(sparql, ontology)
+            if layer_graph_uris:
+                # Layer-aware closure (COG-37): widen the graph scope so the
+                # subClassOf* walk sees edges in every visible layer graph.
+                from cograph_client.graph.ontology_queries import add_layer_from_clauses
+                sparql = add_layer_from_clauses(sparql, layer_graph_uris)
             explanation = llm_response.get("explanation", "")
             functions_needed = llm_response.get("functions_needed", [])
 

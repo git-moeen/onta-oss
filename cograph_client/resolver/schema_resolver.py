@@ -32,6 +32,7 @@ from cograph_client.graph.ontology_queries import (
     type_uri,
     attr_uri,
 )
+from cograph_client.graph.layers import LayerStack, type_name_from_uri
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.provenance import build_provenance_triples, provenance_graph_uri
 from cograph_client.graph.queries import BATCH_PREDICATE, batched_insert_triples, delete_batch_query, insert_triples, tenant_graph_uri
@@ -737,31 +738,67 @@ class SchemaResolver:
 
         return types, attrs
 
-    async def _fetch_parent_map(self, graph_uri: str) -> dict[str, str]:
+    async def _fetch_parent_map(
+        self, graph_uri: str, layer_stack: LayerStack | None = None
+    ) -> dict[str, str]:
         """Fetch the child->parent subclass map (keyed by type *name*).
 
         Reads every rdfs:subClassOf edge via parent_map_query and reduces each
-        URI to its last path segment (the type name) so it can feed the pure
-        hierarchy helpers (ancestor_chain / config_for_with_hierarchy). Returns
-        {} on any error — callers degrade to flat (zero-hierarchy) behavior.
+        URI to its type name so it can feed the pure hierarchy helpers
+        (ancestor_chain / config_for_with_hierarchy). Returns {} on any error —
+        callers degrade to flat (zero-hierarchy) behavior.
+
+        Layer-aware variant (ADR 0002 §1, COG-37): pass a LayerStack and the
+        edges are read from the UNION of the tenant's visible layer graphs in
+        one query — subClassOf edges may span layers (a tenant leaf under a
+        Public parent). Duplicate child names are resolved by shadowing: edges
+        from higher-precedence layers (Tenant > Enhanced > Public) win. With
+        no layer_stack the single-graph behavior is exactly as before.
         """
+        if layer_stack is None:
+            try:
+                raw = await self._neptune.query(parent_map_query(graph_uri))
+                _, bindings = parse_sparql_results(raw)
+            except Exception:
+                logger.warning("parent_map_fetch_failed", exc_info=True)
+                return {}
+            return self._parent_map_from_bindings(bindings)
+
         try:
-            raw = await self._neptune.query(parent_map_query(graph_uri))
+            raw = await self._neptune.query(
+                parent_map_query(layer_stack.visible_graph_uris())
+            )
             _, bindings = parse_sparql_results(raw)
         except Exception:
             logger.warning("parent_map_fetch_failed", exc_info=True)
             return {}
 
-        parent_of: dict[str, str] = {}
-        prefix = "https://cograph.tech/types/"
+        rows_by_graph: dict[str, list[dict]] = {}
         for row in bindings:
-            child = row.get("child", "")
-            parent = row.get("parent", "")
-            if child.startswith(prefix) and parent.startswith(prefix):
-                child_name = child[len(prefix):].rstrip("/").split("/")[0]
-                parent_name = parent[len(prefix):].rstrip("/").split("/")[0]
-                if child_name and parent_name and child_name != parent_name:
-                    parent_of[child_name] = parent_name
+            rows_by_graph.setdefault(row.get("graph", ""), []).append(row)
+        # Merge lowest-precedence layer first so higher layers overwrite
+        # duplicate child keys — Tenant > Enhanced > Public shadowing.
+        parent_of: dict[str, str] = {}
+        for g in reversed(layer_stack.visible_graph_uris()):
+            parent_of.update(self._parent_map_from_bindings(rows_by_graph.get(g, [])))
+        return parent_of
+
+    @staticmethod
+    def _parent_map_from_bindings(bindings: list[dict]) -> dict[str, str]:
+        """Reduce ?child/?parent URI bindings to a {child_name: parent_name} map.
+
+        Names are extracted via type_name_from_uri, which understands every
+        layer namespace — so a tenant-graph edge whose PARENT is a Public-layer
+        URI (`types/public/Person`) keys correctly instead of being dropped.
+        Edges with either end outside all layer namespaces are skipped, as are
+        self-edges.
+        """
+        parent_of: dict[str, str] = {}
+        for row in bindings:
+            child_name = type_name_from_uri(row.get("child", ""))
+            parent_name = type_name_from_uri(row.get("parent", ""))
+            if child_name and parent_name and child_name != parent_name:
+                parent_of[child_name] = parent_name
         return parent_of
 
     async def _synthesize_ancestors(

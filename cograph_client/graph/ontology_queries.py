@@ -125,18 +125,39 @@ def get_type_functions_query(graph_uri: str, type_name: str) -> str:
     )
 
 
-def parent_map_query(graph_uri: str) -> str:
+def parent_map_query(graph_uri: str | list[str]) -> str:
     """Select every rdfs:subClassOf edge so a caller can build a child->parent map.
 
     Returns ?child ?parent for all `?child rdfs:subClassOf ?parent` triples.
     The caller turns these bindings into `parent_of: dict[str, str]` (keyed by
     the type *name*, i.e. the last URI path segment) for hierarchy walks used by
     config_for_with_hierarchy / primary_type / ancestor_chain.
+
+    Layer-aware variant (ADR 0002 §1, COG-37): pass a LIST of graph URIs (a
+    LayerStack's visible_graph_uris()) and the query reads the UNION of those
+    graphs — subClassOf edges may span layers (a tenant leaf under a Public
+    parent). Each UNION branch is a GRAPH pattern (the form Neptune handles
+    cleanly) and BINDs its graph URI to ?graph so the caller can apply layer
+    precedence (shadowing) when merging duplicate child edges.
+
+    The single-graph (str) form is byte-identical to the pre-layer query —
+    regression-critical for existing callers.
     """
+    if isinstance(graph_uri, str):
+        return (
+            f"SELECT ?child ?parent FROM <{graph_uri}>\n"
+            f"WHERE {{\n"
+            f"  ?child <{RDFS}#subClassOf> ?parent .\n"
+            f"}}"
+        )
+    branches = "\n  UNION\n".join(
+        f"  {{ GRAPH <{g}> {{ ?child <{RDFS}#subClassOf> ?parent . }} BIND(<{g}> AS ?graph) }}"
+        for g in graph_uri
+    )
     return (
-        f"SELECT ?child ?parent FROM <{graph_uri}>\n"
+        f"SELECT ?child ?parent ?graph\n"
         f"WHERE {{\n"
-        f"  ?child <{RDFS}#subClassOf> ?parent .\n"
+        f"{branches}\n"
         f"}}"
     )
 
@@ -327,6 +348,43 @@ def _rewrite_indirect_type_constraints(sparql: str) -> str:
             sparql,
         )
 
+    return sparql
+
+
+def add_layer_from_clauses(sparql: str, graph_uris: list[str]) -> str:
+    """Add FROM <g> clauses for layer graphs missing from a graph-scoped query.
+
+    Generated NL queries are scoped to one data graph (`FROM <data-graph>`),
+    but with ontology layers (ADR 0002 §1) the subClassOf edges that the
+    closure path `rdf:type/rdfs:subClassOf*` walks may live in OTHER layer
+    graphs (a tenant leaf under a Public parent). Multiple FROM clauses make
+    the default graph the union of all of them, so the closure walk sees every
+    visible layer.
+
+    Pure string transform, idempotent: a graph already in a FROM clause is not
+    added twice. Queries with no FROM and no WHERE (shapes we don't understand)
+    are returned unchanged. With an empty `graph_uris` the input is untouched —
+    the single-graph call path stays byte-identical.
+    """
+    import re
+
+    missing = [
+        g for g in graph_uris
+        if not re.search(rf'FROM\s+<{re.escape(g)}>', sparql)
+    ]
+    if not missing:
+        return sparql
+    extra = " ".join(f"FROM <{g}>" for g in missing)
+
+    # Insert after the last existing FROM clause, else just before WHERE.
+    from_matches = list(re.finditer(r'FROM\s+<[^>]+>', sparql))
+    if from_matches:
+        end = from_matches[-1].end()
+        return f"{sparql[:end]} {extra}{sparql[end:]}"
+    where = re.search(r'\bWHERE\b', sparql, flags=re.IGNORECASE)
+    if where:
+        start = where.start()
+        return f"{sparql[:start]}{extra}\n{sparql[start:]}"
     return sparql
 
 

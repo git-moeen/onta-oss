@@ -70,6 +70,23 @@ def type_namespace(layer: Layer) -> str:
     return _TYPE_NAMESPACES[layer]
 
 
+def type_name_from_uri(uri: str) -> str | None:
+    """Extract the bare type name from a type URI in ANY layer's namespace.
+
+    Tries namespaces longest-first (the tenant namespace is a prefix of the
+    other two, so order matters): `types/public/Person`, `types/x/Person`, and
+    `types/Person` all yield "Person". Attribute URIs reduce to their type name
+    (`types/Person/attrs/email` -> "Person"), matching the existing parent-map
+    parsing. Returns None for URIs outside every layer namespace (e.g.
+    rdfs:Resource), which callers skip.
+    """
+    for ns in sorted(_TYPE_NAMESPACES.values(), key=len, reverse=True):
+        if uri.startswith(ns):
+            name = uri[len(ns):].rstrip("/").split("/")[0]
+            return name or None
+    return None
+
+
 def layer_type_uri(layer: Layer, type_name: str) -> str:
     """Type URI for `type_name` in `layer`'s namespace.
 
