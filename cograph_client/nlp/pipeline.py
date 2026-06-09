@@ -18,6 +18,9 @@ logger = structlog.stdlib.get_logger("cograph.nlp.pipeline")
 _ontology_cache: dict[str, tuple[str, float]] = {}
 ONTOLOGY_CACHE_TTL = 60  # seconds
 
+# Attribute-alias map cache (ADR 0002 §7): {graph_uri: (old->new map, timestamp)}
+_alias_cache: dict[str, tuple[dict[str, str], float]] = {}
+
 # Query generation provider config
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_QUERY_MODEL = os.environ.get("OMNIX_QUERY_MODEL", "llama3.1-8b")
@@ -51,6 +54,10 @@ class NLQueryPipeline:
         self._cerebras_key = os.environ.get("CEREBRAS_API_KEY", getattr(settings, "cerebras_api_key", ""))
         self._query_model = DEFAULT_QUERY_MODEL
         self._query_provider = DEFAULT_QUERY_PROVIDER
+        # Attribute aliases (ADR 0002 §7): resolve renamed attribute IRIs in
+        # generated SPARQL. Default OFF so the default Neptune call pattern
+        # stays byte-identical (same gating pattern as COGRAPH_ER_ENABLED).
+        self._aliases_enabled = os.environ.get("COGRAPH_ALIASES_ENABLED", "0") == "1"
 
     async def ask(self, question: str, graph_uri: str, instance_graph: str | None = None, exclude_questions: list[str] | None = None) -> NLResult:
         timing: dict[str, float] = {}
@@ -75,6 +82,13 @@ class NLQueryPipeline:
             ontology = await self._fetch_ontology(graph_uri, data_graph)
             timing["ontology_source"] = "full"
         timing["ontology_fetch_ms"] = round((time.time() - t0) * 1000, 1)
+
+        # Attribute-alias map (ADR 0002 §7). Only fetched when the feature is
+        # enabled; an empty map (no aliases registered) leaves every query
+        # untouched, so zero aliases => zero behavior change.
+        alias_map: dict[str, str] = {}
+        if self._aliases_enabled:
+            alias_map = await self._fetch_alias_map(graph_uri)
 
         # Retrieve few-shot examples from the example bank
         examples_text = ""
@@ -118,7 +132,7 @@ class NLQueryPipeline:
             # Fix bare attribute URIs using ontology context
             sparql = self._fix_attribute_uris(sparql, ontology)
             # Fix cross-type attribute misuse and rdf:type shorthand
-            sparql = self._fix_common_sparql_issues(sparql, ontology)
+            sparql = self._fix_common_sparql_issues(sparql, ontology, alias_map)
             explanation = llm_response.get("explanation", "")
             functions_needed = llm_response.get("functions_needed", [])
 
@@ -460,7 +474,7 @@ class NLQueryPipeline:
         return re.sub(r"<(https://cograph\.tech/[^>]+)>", _fix_uri, sparql)
 
     @staticmethod
-    def _fix_common_sparql_issues(sparql: str, ontology_summary: str) -> str:
+    def _fix_common_sparql_issues(sparql: str, ontology_summary: str, alias_map: dict[str, str] | None = None) -> str:
         """Fix common SPARQL generation mistakes that the LLM makes.
 
         1. Replace `a` shorthand with full rdf:type URI
@@ -505,7 +519,30 @@ class NLQueryPipeline:
         from cograph_client.graph.ontology_queries import rewrite_type_predicate_to_closure
         sparql = rewrite_type_predicate_to_closure(sparql)
 
+        # Fix 5: resolve attribute aliases (ADR 0002 §7) — a renamed attribute
+        # keeps answering through its alias until backfill retires it. A None
+        # or empty map (the default) leaves the query untouched.
+        if alias_map:
+            from cograph_client.graph.aliases import rewrite_query_attrs
+            sparql = rewrite_query_attrs(sparql, alias_map)
+
         return sparql
+
+    async def _fetch_alias_map(self, graph_uri: str) -> dict[str, str]:
+        """Cached attribute-alias map for the tenant ontology graph (ADR 0002 §7).
+
+        Failures degrade to an empty map — alias resolution never blocks /ask.
+        """
+        cached = _alias_cache.get(graph_uri)
+        if cached and (time.time() - cached[1]) < ONTOLOGY_CACHE_TTL:
+            return cached[0]
+        from cograph_client.graph.aliases import fetch_alias_map
+        try:
+            alias_map = await fetch_alias_map(self.neptune, graph_uri)
+        except Exception:
+            alias_map = {}
+        _alias_cache[graph_uri] = (alias_map, time.time())
+        return alias_map
 
     @staticmethod
     def invalidate_cache(graph_uri: str) -> None:
@@ -515,6 +552,8 @@ class NLQueryPipeline:
         keys_to_remove = [k for k in _ontology_cache if k.startswith(graph_uri)]
         for k in keys_to_remove:
             _ontology_cache.pop(k, None)
+        # Alias map is keyed by the ontology graph URI alone
+        _alias_cache.pop(graph_uri, None)
         # Invalidate embeddings
         svc = get_embedding_service()
         if svc:
