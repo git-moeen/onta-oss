@@ -33,6 +33,7 @@ from cograph_client.graph.ontology_queries import (
     attr_uri,
 )
 from cograph_client.graph.parser import parse_sparql_results
+from cograph_client.graph.provenance import build_provenance_triples, provenance_graph_uri
 from cograph_client.graph.queries import BATCH_PREDICATE, batched_insert_triples, delete_batch_query, insert_triples, tenant_graph_uri
 from cograph_client.resolver.attribute_resolver import (
     AttributeSchema,
@@ -159,6 +160,10 @@ class SchemaResolver:
         from cograph_client.resolver.er import ERPipeline
         self._er = ERPipeline(neptune)
         self._er_enabled = os.environ.get("COGRAPH_ER_ENABLED", "1") != "0"
+        # Per-fact provenance (ADR 0002 §4): statement-metadata nodes in the
+        # companion provenance graph. Default OFF so default triple output and
+        # Neptune call pattern stay byte-identical.
+        self._provenance_enabled = os.environ.get("COGRAPH_PROVENANCE_ENABLED", "0") == "1"
         # child->parent (type-name) map for subclass-chain walks. Built once per
         # ingest from parent_map_query and mutated in-place as new subtypes are
         # created so later entities in the same batch can climb the chain.
@@ -1075,6 +1080,10 @@ class SchemaResolver:
                     triples_to_insert.append((entity_uri, rdf_type, type_uri(co_type)))
 
         promoted_entities: dict[str, str] = {}
+        # Attribute assertions made for this entity — mirrors the attribute
+        # appends to triples_to_insert so per-fact provenance (ADR 0002 §4)
+        # can be emitted for them when enabled.
+        attr_facts: list[tuple[str, str, str]] = []
 
         for attr in entity.attributes:
             promo_match = next(
@@ -1109,6 +1118,7 @@ class SchemaResolver:
                 )
                 if isinstance(validated, ValidatedTriple):
                     triples_to_insert.append((validated.subject, validated.predicate, validated.object))
+                    attr_facts.append((validated.subject, validated.predicate, validated.object))
                     result.triples_inserted += 1
                 else:
                     result.rejections.append(validated)
@@ -1127,6 +1137,7 @@ class SchemaResolver:
                 )
                 if isinstance(validated, ValidatedTriple):
                     triples_to_insert.append((validated.subject, validated.predicate, validated.object))
+                    attr_facts.append((validated.subject, validated.predicate, validated.object))
                     result.triples_inserted += 1
                 else:
                     result.rejections.append(validated)
@@ -1144,6 +1155,7 @@ class SchemaResolver:
                 target_uri = f"https://cograph.tech/entities/{resolved.datatype}/{_safe_id(resolved.value)}"
                 pred_uri = attr_uri(resolved_type, resolved.name)
                 triples_to_insert.append((entity_uri, pred_uri, target_uri))
+                attr_facts.append((entity_uri, pred_uri, target_uri))
                 result.triples_inserted += 1
             else:
                 pred_uri = attr_uri(resolved_type, resolved.name)
@@ -1153,9 +1165,27 @@ class SchemaResolver:
                 )
                 if isinstance(validated, ValidatedTriple):
                     triples_to_insert.append((validated.subject, validated.predicate, validated.object))
+                    attr_facts.append((validated.subject, validated.predicate, validated.object))
                     result.triples_inserted += 1
                 else:
                     result.rejections.append(validated)
+
+        # Per-fact provenance (ADR 0002 §4), gated by COGRAPH_PROVENANCE_ENABLED
+        # (default off). Statement-metadata triples target the COMPANION
+        # provenance graph — a different graph than the instance-triple
+        # collector — so they are inserted here per entity, not collected.
+        # Confidence is 1.0 for directly-ingested facts.
+        if self._provenance_enabled and attr_facts:
+            instance_graph = getattr(self, "_instance_graph", graph_uri)
+            prov_ts = datetime.now(timezone.utc)
+            prov_triples: list[tuple[str, str, str]] = []
+            for s, p, o in attr_facts:
+                prov_triples.extend(build_provenance_triples(
+                    s, p, o, source=source, confidence=1.0,
+                    timestamp=prov_ts, graph_uri=instance_graph,
+                ))
+            for sparql in batched_insert_triples(provenance_graph_uri(instance_graph), prov_triples):
+                await self._neptune.update(sparql)
 
         # Provenance triples
         now = datetime.now(timezone.utc).isoformat()
