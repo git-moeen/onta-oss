@@ -37,6 +37,7 @@ from cograph_client.resolver.functions import (
     derived_predicate,
     derived_value_query,
     invalidate,
+    store_derived_update,
 )
 
 GRAPH = "https://cograph.tech/graphs/test-tenant/kg/test"
@@ -111,7 +112,8 @@ class TestDefaultMode:
         ]
         value = await FunctionExecutor(now=Clock(T0)).run(mock_neptune, GRAPH, ENTITY, fn)
         assert value == "39"
-        assert mock_neptune.update.call_count == 2  # delete stale + insert: it stored
+        # One ATOMIC update (COG-46): stale-pair delete + fresh insert together.
+        assert mock_neptune.update.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +165,7 @@ class TestCached:
         assert value == "39"
 
         updates = [c.args[0] for c in mock_neptune.update.call_args_list]
+        assert len(updates) == 1  # one atomic delete+insert update (COG-46)
         insert = updates[-1]
         # Value lands under the distinct derived namespace (ADR 0001 rule 6) …
         assert f"<{derived_predicate('age')}>" in insert
@@ -194,9 +197,28 @@ class TestCached:
 
         value = await FunctionExecutor(now=clock).run(mock_neptune, GRAPH, ENTITY, fn)
         assert value == "40"
-        updates = [c.args[0] for c in mock_neptune.update.call_args_list]
-        assert updates[0].startswith("DELETE WHERE")        # stale pair replaced
-        assert clock.t.isoformat() in updates[-1]           # fresh computed-at
+        # Exactly ONE update call for the recompute (COG-46): the stale-pair
+        # delete and the fresh insert ride a single atomic update request.
+        assert mock_neptune.update.call_count == 1
+        update = mock_neptune.update.call_args.args[0]
+        assert update.startswith("DELETE WHERE")            # stale pair replaced …
+        assert "INSERT DATA" in update                      # … in the SAME request
+        assert clock.t.isoformat() in update                # fresh computed-at
+
+    def test_store_update_is_atomic_delete_then_insert(self):
+        """The replace update is one string: stale-pair DELETE WHEREs first,
+        the fresh-pair INSERT DATA last, ';'-joined — a concurrent reader
+        never sees the no-value gap of the old two-call pattern."""
+        update = store_derived_update(GRAPH, ENTITY, "age", "40", T0.isoformat())
+        assert update.count(";") >= 2  # two DELETE WHEREs + the INSERT joined
+        delete_part, insert_part = update.rsplit(";", 1)
+        assert delete_part.startswith("DELETE WHERE")
+        assert f"<{derived_predicate('age')}>" in delete_part
+        assert f"<{computed_at_predicate('age')}>" in delete_part
+        assert insert_part.strip().startswith("INSERT DATA")
+        assert f"<{derived_predicate('age')}>" in insert_part
+        assert T0.isoformat() in insert_part
+        assert f"GRAPH <{GRAPH}>" in insert_part
 
     @pytest.mark.asyncio
     async def test_no_ttl_means_fresh_until_invalidated(self, mock_neptune):

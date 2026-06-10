@@ -480,9 +480,10 @@ async def test_flag_off_new_type_path_identical_regression(mock_neptune):
 
 @pytest.mark.asyncio
 async def test_flag_on_majority_approve_also_writes_public_layer(mock_neptune):
-    """Flag on + majority approve: tenant insert_type FIRST (today's behavior,
-    ingestion never waits on governance for usability), then the governed
-    Public-layer copy + provenance + changelog."""
+    """Flag on + majority approve: tenant insert_type happens synchronously
+    (today's behavior, ingestion never waits on governance for usability);
+    the judge panel + governed Public-layer copy + provenance + changelog run
+    as a BACKGROUND task (COG-46) awaited via drain_governance()."""
     resolver = _make_resolver(mock_neptune, governance=True)
     resolver._judge_panel = StubPanel(_verdicts(True, True, False))
     result = IngestResult(entities_extracted=1)
@@ -490,6 +491,14 @@ async def test_flag_on_majority_approve_also_writes_public_layer(mock_neptune):
     resolved = await resolver._resolve_type(_new_entity(), TENANT_GRAPH, {}, {}, result)
 
     assert resolved == "LoyaltyTier"
+    # The ingest path returned after the tenant write alone — governance is
+    # scheduled, retained on the resolver, and not yet (necessarily) done.
+    assert len(_update_sparql(mock_neptune)) == 1
+    assert len(resolver._governance_tasks) == 1
+
+    await resolver.drain_governance()
+
+    assert resolver._governance_tasks == []
     calls = _update_sparql(mock_neptune)
     assert len(calls) == 4
     # Tenant write happens first and is unchanged.
@@ -514,6 +523,7 @@ async def test_flag_on_majority_reject_stays_tenant_only(mock_neptune):
     result = IngestResult(entities_extracted=1)
 
     resolved = await resolver._resolve_type(_new_entity(), TENANT_GRAPH, {}, {}, result)
+    await resolver.drain_governance()
 
     assert resolved == "LoyaltyTier"
     calls = _update_sparql(mock_neptune)
@@ -523,15 +533,26 @@ async def test_flag_on_majority_reject_stays_tenant_only(mock_neptune):
 
 @pytest.mark.asyncio
 async def test_flag_on_governance_write_failure_never_blocks_ingest(mock_neptune):
-    """A Public-layer write blowing up is logged and swallowed — the type is
-    still created in the tenant layer and _resolve_type returns normally."""
+    """A Public-layer write blowing up in the background task is logged and
+    swallowed — the type is still created in the tenant layer, _resolve_type
+    returns normally, and drain_governance() never re-raises."""
     resolver = _make_resolver(mock_neptune, governance=True)
     resolver._judge_panel = StubPanel(_verdicts(True, True, True))
     resolver._governance.write_governed_type = AsyncMock(side_effect=RuntimeError("neptune down"))
     result = IngestResult(entities_extracted=1)
 
     resolved = await resolver._resolve_type(_new_entity(), TENANT_GRAPH, {}, {}, result)
+    await resolver.drain_governance()
 
     assert resolved == "LoyaltyTier"
     assert "LoyaltyTier" in result.types_created
     assert mock_neptune.update.call_count == 1  # the tenant insert_type only
+
+
+@pytest.mark.asyncio
+async def test_drain_governance_safe_with_nothing_pending(mock_neptune):
+    """drain_governance() is a no-op with no scheduled tasks — flag on or off."""
+    for governance in (False, True):
+        resolver = _make_resolver(mock_neptune, governance=governance)
+        await resolver.drain_governance()
+        assert resolver._governance_tasks == []

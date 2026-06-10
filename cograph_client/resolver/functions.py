@@ -93,6 +93,24 @@ def delete_derived_update(graph_uri: str, entity_uri: str, name: str) -> str:
     )
 
 
+def store_derived_update(
+    graph_uri: str, entity_uri: str, name: str, value: str, computed_at: str,
+) -> str:
+    """One ATOMIC SPARQL update replacing a stored derived value (COG-46).
+
+    The stale-pair DELETE WHERE statements and the fresh-pair INSERT DATA are
+    joined with ';' into a single update request, so the store processes them
+    as one transaction — a concurrent reader can never observe the gap where
+    the old value is gone and the new one is not yet written (the race the
+    previous two-call delete-then-insert pattern had).
+    """
+    insert = insert_triples(graph_uri, [
+        (entity_uri, derived_predicate(name), value),
+        (entity_uri, computed_at_predicate(name), f"{computed_at}^^{_XSD}#dateTime"),
+    ])
+    return f"{delete_derived_update(graph_uri, entity_uri, name)};\n{insert}"
+
+
 def _parse_timestamp(value: str) -> datetime | None:
     """Parse a stored computed-at value; None (=> stale) if unparseable."""
     try:
@@ -182,14 +200,11 @@ class FunctionExecutor:
         return (self._now() - ts).total_seconds() < ttl_seconds
 
     async def _store(self, neptune, graph_uri: str, entity_uri: str, name: str, value: str) -> None:
-        # Replace, don't accumulate: drop the stale pair before inserting.
-        await neptune.update(delete_derived_update(graph_uri, entity_uri, name))
-        ts = self._now().isoformat()
+        # Replace, don't accumulate — atomically: the stale-pair DELETE and
+        # the fresh-pair INSERT travel in ONE update request (COG-46), so a
+        # concurrent reader never sees a missing derived value mid-replace.
         await neptune.update(
-            insert_triples(graph_uri, [
-                (entity_uri, derived_predicate(name), value),
-                (entity_uri, computed_at_predicate(name), f"{ts}^^{_XSD}#dateTime"),
-            ])
+            store_derived_update(graph_uri, entity_uri, name, value, self._now().isoformat())
         )
 
 

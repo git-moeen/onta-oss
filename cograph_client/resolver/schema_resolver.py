@@ -9,6 +9,7 @@ schema-on-write validation, and Option D coexistence for structure promotion.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -175,6 +176,10 @@ class SchemaResolver:
             from cograph_client.resolver.governance import GovernanceEngine, LLMJudgePanel
             self._governance = GovernanceEngine(neptune)
             self._judge_panel = LLMJudgePanel(self._anthropic)
+        # Background governance tasks (COG-46): the judge panel + Public-layer
+        # write are scheduled off the ingest path; references are retained
+        # here so drain_governance() can await them deterministically.
+        self._governance_tasks: list[asyncio.Task] = []
         # child->parent (type-name) map for subclass-chain walks. Built once per
         # ingest from parent_map_query and mutated in-place as new subtypes are
         # created so later entities in the same batch can climb the chain.
@@ -411,6 +416,11 @@ class SchemaResolver:
         # All entity triples are collected into one list, then batch-inserted
         # in a single call. This is ~10-50x faster than per-entity INSERT.
         all_entity_triples: list[tuple[str, str, str]] = []
+        # Provenance collector (COG-46): statement-metadata triples for the
+        # COMPANION provenance graph accumulate here during entity processing
+        # and flush in one batched INSERT below, instead of one awaited
+        # Neptune update per entity. Stays empty unless the flag is on.
+        all_provenance_triples: list[tuple[str, str, str]] = []
         for entity in extraction.entities:
             if entity.id not in resolved_types:
                 continue
@@ -425,6 +435,7 @@ class SchemaResolver:
                 entity, resolved_type, entity_uri, is_duplicate,
                 graph_uri, existing_types, existing_attrs, source, result, batch_id,
                 _collect_triples=all_entity_triples,
+                _collect_provenance=all_provenance_triples,
                 also_types=entity_also_types.get(entity.id),
             )
 
@@ -437,6 +448,17 @@ class SchemaResolver:
         if all_entity_triples:
             instance_graph = getattr(self, "_instance_graph", graph_uri)
             for sparql in batched_insert_triples(instance_graph, all_entity_triples):
+                await self._neptune.update(sparql)
+
+        # Flush per-fact provenance in ONE batched INSERT per ingest (COG-46),
+        # chunked at the same batch size as the instance-triple batcher. The
+        # exact same triples a per-entity write would produce — only the
+        # write pattern changes.
+        if all_provenance_triples:
+            instance_graph = getattr(self, "_instance_graph", graph_uri)
+            for sparql in batched_insert_triples(
+                provenance_graph_uri(instance_graph), all_provenance_triples,
+            ):
                 await self._neptune.update(sparql)
 
         # Incrementally embed newly created types for future embedding pre-filter matches
@@ -1077,8 +1099,16 @@ class SchemaResolver:
 
         The tenant-layer write has ALREADY happened (today's behavior — the
         tenant uses the type immediately whatever the verdict); approval only
-        ADDS a Public-layer copy. Best-effort: any failure is logged and never
-        blocks ingest. No-op when COGRAPH_GOVERNANCE_ENABLED is off (default).
+        ADDS a Public-layer copy.
+
+        Scheduling (COG-46): the judge panel + Public-layer write run as a
+        BACKGROUND task — ingest never waits on LLM judges. Semantics are
+        eventually consistent: an approved type appears in the Public layer
+        shortly AFTER ingest returns. Task references are retained on
+        ``self._governance_tasks``; await :meth:`drain_governance` to
+        deterministically wait for all scheduled outcomes. Best-effort: any
+        failure (scheduling or in-task) is logged and never blocks or crashes
+        ingest. No-op when COGRAPH_GOVERNANCE_ENABLED is off (default).
         """
         if not self._governance_enabled:
             return
@@ -1098,13 +1128,45 @@ class SchemaResolver:
                 ),
                 proposer_model=self.EXTRACT_MODEL,
             )
+            # Drop references to finished tasks so the list stays bounded on
+            # long-lived resolvers, then schedule the panel off the ingest path.
+            self._governance_tasks = [t for t in self._governance_tasks if not t.done()]
+            self._governance_tasks.append(
+                asyncio.create_task(self._govern_in_background(proposal))
+            )
+        except Exception:
+            logger.warning("governance_failed", type_name=entity.type_name, exc_info=True)
+
+    async def _govern_in_background(self, proposal) -> None:
+        """Run propose-and-judge + the Public-layer write off the ingest path
+        (COG-46). Exceptions are logged and swallowed here, inside the task —
+        a governance failure never crashes ingest and never surfaces as an
+        unretrieved task exception.
+        """
+        try:
             decision = await self._governance.propose_and_judge(proposal, self._judge_panel)
             if decision.approved:
                 await self._governance.write_governed_type(proposal, decision)
             else:
-                logger.info("governance_type_tenant_only", type_name=entity.type_name)
+                logger.info("governance_type_tenant_only", type_name=proposal.type_name)
         except Exception:
-            logger.warning("governance_failed", type_name=entity.type_name, exc_info=True)
+            logger.warning("governance_failed", type_name=proposal.type_name, exc_info=True)
+
+    async def drain_governance(self) -> None:
+        """Await all pending background governance tasks (COG-46).
+
+        Governance is eventually consistent: :meth:`_maybe_govern_new_type`
+        schedules the judge panel + Public-layer write as background tasks,
+        so an approved type appears in the Public layer shortly after ingest
+        returns. Call this to deterministically wait for every scheduled
+        outcome — tests, and callers that need the Public layer settled
+        before reading it. Safe to call any time (no-op with nothing
+        pending). Task failures were already logged inside the tasks and are
+        never re-raised here.
+        """
+        tasks, self._governance_tasks = self._governance_tasks, []
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _resolve_and_insert_entity(
         self,
@@ -1119,6 +1181,7 @@ class SchemaResolver:
         result: IngestResult,
         batch_id: str = "",
         _collect_triples: list[tuple[str, str, str]] | None = None,
+        _collect_provenance: list[tuple[str, str, str]] | None = None,
         also_types: list[str] | None = None,
     ) -> None:
         """Pass 2: Resolve attributes, validate, and collect triples for one entity.
@@ -1126,6 +1189,11 @@ class SchemaResolver:
         If _collect_triples is provided, triples are appended to that list instead of
         being inserted immediately. The caller is responsible for batch-inserting them.
         This is ~10-50x faster because it avoids per-entity Neptune INSERT calls.
+
+        If _collect_provenance is provided (COG-46), per-fact provenance triples
+        (when COGRAPH_PROVENANCE_ENABLED is on) are likewise appended for the
+        caller to flush in one batched INSERT into the companion provenance
+        graph, instead of being inserted here per entity.
 
         `also_types` are genuine independent co-classifications (ADR rule 1): each
         gets its own asserted rdf:type triple alongside the primary resolved_type.
@@ -1259,7 +1327,9 @@ class SchemaResolver:
         # Per-fact provenance (ADR 0002 §4), gated by COGRAPH_PROVENANCE_ENABLED
         # (default off). Statement-metadata triples target the COMPANION
         # provenance graph — a different graph than the instance-triple
-        # collector — so they are inserted here per entity, not collected.
+        # collector. With a _collect_provenance collector (the batched fast
+        # path, COG-46) they accumulate for ONE batched INSERT by the caller;
+        # without one they are inserted here per entity (legacy path).
         # Confidence is 1.0 for directly-ingested facts.
         if self._provenance_enabled and attr_facts:
             instance_graph = getattr(self, "_instance_graph", graph_uri)
@@ -1270,8 +1340,11 @@ class SchemaResolver:
                     s, p, o, source=source, confidence=1.0,
                     timestamp=prov_ts, graph_uri=instance_graph,
                 ))
-            for sparql in batched_insert_triples(provenance_graph_uri(instance_graph), prov_triples):
-                await self._neptune.update(sparql)
+            if _collect_provenance is not None:
+                _collect_provenance.extend(prov_triples)
+            else:
+                for sparql in batched_insert_triples(provenance_graph_uri(instance_graph), prov_triples):
+                    await self._neptune.update(sparql)
 
         # Provenance triples
         now = datetime.now(timezone.utc).isoformat()

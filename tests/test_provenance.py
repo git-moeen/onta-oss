@@ -30,7 +30,12 @@ from cograph_client.graph.provenance import (
     statement_id,
 )
 from cograph_client.resolver.attribute_resolver import AttributeSchema
-from cograph_client.resolver.models import ExtractedAttribute, ExtractedEntity, IngestResult
+from cograph_client.resolver.models import (
+    ExtractedAttribute,
+    ExtractedEntity,
+    ExtractionResult,
+    IngestResult,
+)
 from cograph_client.resolver.schema_resolver import SchemaResolver
 
 
@@ -297,3 +302,78 @@ async def test_flag_on_entity_reference_attribute_gets_provenance(mock_neptune):
         "https://cograph.tech/entities/Guest/g3", attr_uri("Guest", "stays_at"), target,
     )
     assert sid in sparql
+
+
+# ---------------------------------------------------------------------------
+# Batched provenance writes on the fast path (COG-46)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flag_on_collector_defers_provenance_zero_per_entity_inserts(mock_neptune):
+    """Fast path: with a _collect_provenance collector supplied, entity
+    processing makes ZERO Neptune update calls — the statement-metadata
+    triples accumulate in the collector for one batched flush by the caller,
+    and they are the exact same triples the per-entity path would write."""
+    resolver = _make_resolver(mock_neptune, provenance=True)
+    prov: list[tuple[str, str, str]] = []
+    result = IngestResult(entities_extracted=1)
+
+    await resolver._resolve_and_insert_entity(
+        _guest_entity(), "Guest", SUBJ, is_duplicate=False,
+        graph_uri="g", existing_types={"Guest": ""}, existing_attrs=dict(EXISTING_ATTRS),
+        source="crm.csv", result=result, _collect_triples=[], _collect_provenance=prov,
+    )
+
+    assert mock_neptune.update.call_count == 0, "no per-entity provenance INSERT"
+    by_pred = {p: o for (_, p, o) in prov}
+    assert by_pred[f"{PROV_NS}statement"] == statement_id(SUBJ, PRED, OBJ)
+    assert by_pred[f"{PROV_NS}source"] == "crm.csv"
+
+
+@pytest.mark.asyncio
+async def test_multi_entity_ingest_flushes_one_batched_provenance_insert(mock_neptune):
+    """End-to-end through _resolve_and_insert: a multi-entity ingest emits
+    exactly ONE batched INSERT into the companion provenance graph (chunked
+    only past the instance batcher's 500-triple batch size), carrying every
+    entity's statement metadata — not one awaited update per entity."""
+    resolver = _make_resolver(mock_neptune, provenance=True)
+    mock_neptune.batch_exists.return_value = set()
+    graph = "https://cograph.tech/graphs/t1"
+    extraction = ExtractionResult(
+        entities=[
+            ExtractedEntity(
+                type_name="Guest", id="g1",
+                attributes=[ExtractedAttribute(name="email", value="alice@example.com", datatype="string")],
+            ),
+            ExtractedEntity(
+                type_name="Guest", id="g2",
+                attributes=[ExtractedAttribute(name="email", value="bob@example.com", datatype="string")],
+            ),
+        ],
+        relationships=[],
+        source_text="",
+    )
+    result = IngestResult(entities_extracted=2)
+
+    await resolver._resolve_and_insert(
+        extraction, graph, {"Guest": ""},
+        {"Guest": {"email": AttributeSchema(name="email", datatype="string")}},
+        "crm.csv", result, {}, {}, "batch-1",
+    )
+
+    prov_graph = provenance_graph_uri(graph)
+    calls = _update_sparql(mock_neptune)
+    prov_calls = [c for c in calls if f"GRAPH <{prov_graph}>" in c]
+    assert len(prov_calls) == 1, "ONE batched provenance INSERT per ingest"
+    sid1 = statement_id(
+        "https://cograph.tech/entities/Guest/g1", PRED, "alice@example.com",
+    )
+    sid2 = statement_id(
+        "https://cograph.tech/entities/Guest/g2", PRED, "bob@example.com",
+    )
+    assert sid1 in prov_calls[0] and sid2 in prov_calls[0]
+    # Instance triples still flush in their own batched INSERT, provenance-free.
+    instance_calls = [c for c in calls if f"GRAPH <{prov_graph}>" not in c]
+    assert len(instance_calls) == 1
+    assert PROV_NS not in instance_calls[0]
