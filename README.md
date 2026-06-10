@@ -14,6 +14,14 @@ One LLM call infers the schema. All rows are mapped deterministically. Ask quest
 docker compose up -d
 ```
 
+No Docker? Run the pip-only embedded store instead — it serves the same
+endpoints, so nothing else changes:
+
+```bash
+pip install pyoxigraph python-multipart
+python scripts/local_sparql.py --data ./local-graph
+```
+
 ### 2. Install
 
 ```bash
