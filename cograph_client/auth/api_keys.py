@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence, Union
 
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
@@ -18,11 +18,15 @@ class TenantContext:
     api_key: str
 
 
-# A verifier takes a raw API key and returns the tenant_id the key should
-# be routed to, or None if the key is not recognized. Implementations are
-# expected to fail closed (return None) on network/timeout errors rather
-# than raising — raising would turn an auth provider outage into a 500.
-ExternalVerifier = Callable[[str], Optional[str]]
+# A verifier takes a raw API key and returns either:
+#   - a single tenant_id (legacy single-tenant keys), or
+#   - a sequence of tenant_ids the key may access (user-scoped keys: a user
+#     owns N tenants and every key they create works for all of them), or
+#   - None if the key is not recognized.
+# Implementations are expected to fail closed (return None) on network or
+# timeout errors rather than raising — raising would turn an auth provider
+# outage into a 500.
+ExternalVerifier = Callable[[str], Optional[Union[str, Sequence[str]]]]
 
 _external_verifier: Optional[ExternalVerifier] = None
 
@@ -38,14 +42,47 @@ def register_external_verifier(verifier: Optional[ExternalVerifier]) -> None:
     _external_verifier = verifier
 
 
-def get_tenant(api_key: Optional[str] = Security(api_key_header)) -> TenantContext:
+def _resolve_allowed(
+    allowed: Sequence[str], requested: Optional[str], api_key: str
+) -> TenantContext:
+    """Pick the tenant for a key that may access several.
+
+    The requested tenant comes from the route path (/graphs/{tenant}/...).
+    No request → the key's first tenant; a request outside the allowed set
+    is a 403 (the key is valid, the tenant grant is not).
+    """
+    allowed = [t for t in allowed if t]
+    if not allowed:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    if requested is None or requested == "":
+        return TenantContext(tenant_id=allowed[0], api_key=api_key)
+    if requested in allowed:
+        return TenantContext(tenant_id=requested, api_key=api_key)
+    raise HTTPException(
+        status_code=403,
+        detail=f"API key does not grant access to tenant '{requested}'",
+    )
+
+
+def get_tenant(
+    tenant: Optional[str] = None,
+    api_key: Optional[str] = Security(api_key_header),
+) -> TenantContext:
+    """Resolve the tenant for a request.
+
+    `tenant` is injected from the route path (/graphs/{tenant}/...) when
+    present. Single-tenant keys (static map, legacy claims.tenant) keep
+    today's behavior: they route to THEIR tenant regardless of the path.
+    Multi-tenant keys (verifier returned a sequence) are authorized against
+    the requested path tenant.
+    """
     keys_map = settings.get_api_keys_map()
     has_static_keys = bool(keys_map) and keys_map != {"": ""}
     has_external = _external_verifier is not None
 
-    # No auth configured at all — open access, default tenant.
+    # No auth configured at all — open access; honor the requested tenant.
     if not has_static_keys and not has_external:
-        return TenantContext(tenant_id="default", api_key="")
+        return TenantContext(tenant_id=tenant or "default", api_key="")
 
     if not api_key:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -59,11 +96,13 @@ def get_tenant(api_key: Optional[str] = Security(api_key_header)) -> TenantConte
     # Fall back to the external verifier, if one is registered.
     if has_external:
         try:
-            tenant_id = _external_verifier(api_key)  # type: ignore[misc]
+            verdict = _external_verifier(api_key)  # type: ignore[misc]
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("external verifier raised: %s", exc)
-            tenant_id = None
-        if tenant_id is not None:
-            return TenantContext(tenant_id=tenant_id, api_key=api_key)
+            verdict = None
+        if isinstance(verdict, str):
+            return TenantContext(tenant_id=verdict, api_key=api_key)
+        if verdict is not None:
+            return _resolve_allowed(verdict, tenant, api_key)
 
     raise HTTPException(status_code=401, detail="Invalid API key")
