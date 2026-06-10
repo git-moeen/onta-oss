@@ -9,6 +9,12 @@ today's new-type behavior; on, a majority-approved type ALSO lands in the
 Public layer while a rejected one stays tenant-only — and governance
 failures never block ingest.
 
+COG-45: Public-layer subClassOf edges never dangle (missing parent_chain
+ancestors are synthesized with their own records + changelog entries;
+existing ones are linked, not recreated) and re-judging a proposal REPLACES
+its governance record (DELETE WHERE + INSERT DATA in one update) instead of
+accumulating stale vote/reasoning triples.
+
 All mocked — no live Neptune, no LLM, no network. Env is only touched via
 patch.dict (auto-restored), never process-globally.
 """
@@ -219,6 +225,167 @@ async def test_top_level_proposal_writes_no_subclass_edge(mock_neptune):
     decision = GovernanceDecision(target_layer="public", votes=_verdicts(True, True), approved=True)
     await engine.write_governed_type(_proposal(parent_chain=[]), decision, timestamp=FIXED_TS)
     assert "subClassOf" not in _update_sparql(mock_neptune)[0]
+
+
+# ---------------------------------------------------------------------------
+# COG-45 Bug 1 — Public-layer subClassOf edges must never dangle: missing
+# ancestors are synthesized (type + record + changelog each), existing ones
+# are linked without recreation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_public_parent_is_synthesized_with_record_and_changelog(mock_neptune):
+    """Approving a type whose parent is absent from the Public layer writes
+    the ancestor too — its own type triples, provenance record (reasoning
+    marked as ancestor synthesis for the approved child), and changelog
+    entry — so the child's subClassOf edge is never dangling."""
+    mock_neptune.ask.return_value = False  # "Tier" does not exist in Public
+    engine = GovernanceEngine(mock_neptune)
+    decision = GovernanceDecision(
+        target_layer="public", votes=_verdicts(True, True, False), approved=True,
+    )
+
+    pub_uri = await engine.write_governed_type(_proposal(), decision, timestamp=FIXED_TS)
+
+    parent_uri = layer_type_uri(Layer.PUBLIC, "Tier")
+    # Existence was checked against the Public graph before any write.
+    ask_sparql = mock_neptune.ask.call_args.args[0]
+    assert f"<{parent_uri}>" in ask_sparql
+    assert public_graph_uri() in ask_sparql
+
+    calls = _update_sparql(mock_neptune)
+    assert len(calls) == 6  # child trio + synthesized-ancestor trio
+    # Child still links its parent in the Public namespace.
+    assert "subClassOf" in calls[0] and f"<{parent_uri}>" in calls[0]
+    # 4) Ancestor synthesized as a labeled Class in the Public graph...
+    anc_sparql = calls[3]
+    assert f"GRAPH <{public_graph_uri()}>" in anc_sparql
+    assert f"<{parent_uri}>" in anc_sparql
+    assert "#Class>" in anc_sparql and '"Tier"' in anc_sparql
+    # ...with no edge of its own: "Tier" is the chain root, no parent info.
+    assert "subClassOf" not in anc_sparql
+    # 5) Its own governance record, reasoning marked as ancestor synthesis.
+    rec_sparql = calls[4]
+    assert f"GRAPH <{provenance_graph_uri(public_graph_uri())}>" in rec_sparql
+    assert f"<{parent_uri}>" in rec_sparql
+    assert "Ancestor synthesis" in rec_sparql and "LoyaltyTier" in rec_sparql
+    assert '"2/3"' in rec_sparql  # carries the child's panel votes
+    # 6) Its own append-only changelog entry.
+    log_sparql = calls[5]
+    assert f"GRAPH <{changelog_graph_uri()}>" in log_sparql
+    assert '"add_type"' in log_sparql and f"<{parent_uri}>" in log_sparql
+    # The child's own trio is unchanged (indexes 0-2).
+    assert f"<{pub_uri}>" in calls[0] and f"<{pub_uri}>" in calls[1] and f"<{pub_uri}>" in calls[2]
+
+
+@pytest.mark.asyncio
+async def test_full_parent_chain_synthesized_up_to_first_existing_ancestor(mock_neptune):
+    """The walk closes the WHOLE Public lineage: every missing chain entry is
+    synthesized with an edge to the next one, and stops at the first ancestor
+    that already exists (its own lineage was closed when it was written)."""
+    mock_neptune.ask.side_effect = [False, False, True]  # Tier, Category missing; Thing exists
+    engine = GovernanceEngine(mock_neptune)
+    decision = GovernanceDecision(target_layer="public", votes=_verdicts(True, True), approved=True)
+
+    await engine.write_governed_type(
+        _proposal(parent_chain=["Tier", "Category", "Thing"]), decision, timestamp=FIXED_TS,
+    )
+
+    assert mock_neptune.ask.await_count == 3
+    calls = _update_sparql(mock_neptune)
+    assert len(calls) == 9  # child trio + two synthesized-ancestor trios
+    tier_uri = layer_type_uri(Layer.PUBLIC, "Tier")
+    category_uri = layer_type_uri(Layer.PUBLIC, "Category")
+    thing_uri = layer_type_uri(Layer.PUBLIC, "Thing")
+    # Tier synthesized with an edge to Category (calls 3-5)...
+    assert f"<{tier_uri}>" in calls[3] and "subClassOf" in calls[3] and f"<{category_uri}>" in calls[3]
+    # ...then Category with an edge to the EXISTING Thing (calls 6-8).
+    assert f"<{category_uri}>" in calls[6] and "subClassOf" in calls[6] and f"<{thing_uri}>" in calls[6]
+    # Thing itself is never recreated: no call inserts its label.
+    assert all('"Thing"' not in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_existing_public_parent_is_linked_without_recreation(mock_neptune):
+    """Parent already in the Public layer: the child links it and NOTHING is
+    synthesized — exactly the three child writes, no ancestor trio."""
+    mock_neptune.ask.return_value = True  # "Tier" already exists in Public
+    engine = GovernanceEngine(mock_neptune)
+    decision = GovernanceDecision(target_layer="public", votes=_verdicts(True, True), approved=True)
+
+    await engine.write_governed_type(_proposal(), decision, timestamp=FIXED_TS)
+
+    mock_neptune.ask.assert_awaited_once()
+    calls = _update_sparql(mock_neptune)
+    assert len(calls) == 3
+    parent_uri = layer_type_uri(Layer.PUBLIC, "Tier")
+    assert "subClassOf" in calls[0] and f"<{parent_uri}>" in calls[0]
+    # The parent's label literal never appears — it is linked, not recreated.
+    assert all('"Tier"' not in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# COG-45 Bug 2 — re-judging the same proposal REPLACES the governance record
+# (DELETE WHERE + INSERT DATA in one update), never accumulates stale triples.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rejudge_replaces_record_instead_of_accumulating(mock_neptune):
+    """Two writes of the same proposal target the same deterministic record
+    node, and each record update deletes the node's triples before inserting
+    the fresh ones — in ONE SPARQL string — so stale GOV_VOTE/GOV_REASONING
+    triples from the first verdict never survive the second."""
+    mock_neptune.ask.return_value = True
+    engine = GovernanceEngine(mock_neptune)
+    proposal = _proposal()
+
+    first = GovernanceDecision(target_layer="public", votes=_verdicts(True, True, False), approved=True)
+    await engine.write_governed_type(proposal, first, timestamp=FIXED_TS)
+    first_record_sparql = _update_sparql(mock_neptune)[1]
+    mock_neptune.reset_mock()
+
+    second = GovernanceDecision(target_layer="public", votes=_verdicts(True, True, True), approved=True)
+    await engine.write_governed_type(proposal, second, timestamp=FIXED_TS)
+    second_record_sparql = _update_sparql(mock_neptune)[1]
+
+    prov_g = provenance_graph_uri(public_graph_uri())
+    for sparql in (first_record_sparql, second_record_sparql):
+        # One update string: the record node's triples are deleted, THEN the
+        # fresh ones inserted — never a bare append.
+        assert sparql.count("DELETE WHERE") == 1
+        assert sparql.index("DELETE WHERE") < sparql.index("INSERT DATA")
+        assert f"GRAPH <{prov_g}>" in sparql
+        assert f"{GOV_NS}rec/" in sparql
+
+    def record_node(sparql: str) -> str:
+        start = sparql.index(f"{GOV_NS}rec/")
+        return sparql[start:sparql.index(">", start)]
+
+    # Same proposal — same record node both times (sha1-keyed), and the DELETE
+    # targets the very node the INSERT refills.
+    assert record_node(first_record_sparql) == record_node(second_record_sparql)
+    rec = record_node(first_record_sparql)
+    delete_part, insert_part = first_record_sparql.split("INSERT DATA", 1)
+    assert rec in delete_part and rec in insert_part
+    # The second write carries ONLY the fresh verdict's triples.
+    assert '"2/3"' in first_record_sparql
+    assert '"3/3"' in second_record_sparql and '"2/3"' not in second_record_sparql
+
+
+@pytest.mark.asyncio
+async def test_synthesized_ancestor_record_also_replaces(mock_neptune):
+    """The replace-not-append form covers ancestor-synthesis records too."""
+    mock_neptune.ask.return_value = False
+    engine = GovernanceEngine(mock_neptune)
+    decision = GovernanceDecision(target_layer="public", votes=_verdicts(True, True), approved=True)
+
+    await engine.write_governed_type(_proposal(), decision, timestamp=FIXED_TS)
+
+    anc_record_sparql = _update_sparql(mock_neptune)[4]
+    assert anc_record_sparql.count("DELETE WHERE") == 1
+    assert anc_record_sparql.index("DELETE WHERE") < anc_record_sparql.index("INSERT DATA")
 
 
 # ---------------------------------------------------------------------------

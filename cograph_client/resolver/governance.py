@@ -31,7 +31,7 @@ import structlog
 from pydantic import BaseModel, Field
 
 from cograph_client.graph.layers import Layer, layer_type_uri, public_graph_uri
-from cograph_client.graph.ontology_queries import RDF, RDFS, XSD
+from cograph_client.graph.ontology_queries import RDF, RDFS, XSD, entity_exists_query
 from cograph_client.graph.provenance import provenance_graph_uri
 from cograph_client.graph.queries import insert_triples
 
@@ -158,10 +158,46 @@ class LLMJudgePanel:
 
 def _governance_record_uri(type_uri: str, tenant_id: str) -> str:
     """Record node URI: one per (governed type, proposing tenant) — keyed by
-    sha1 like COG-38 statement nodes so re-judging the same proposal rewrites
-    the same node instead of accumulating duplicates."""
+    sha1 like COG-38 statement nodes so re-judging the same proposal targets
+    the same node, which _governance_record_update then rewrites in place."""
     rid = hashlib.sha1(f"{type_uri}|{tenant_id}".encode("utf-8")).hexdigest()
     return f"{GOV_NS}rec/{rid}"
+
+
+def _governance_record_update(
+    subject_uri: str,
+    tenant_id: str,
+    proposer_model: str,
+    reasoning: str,
+    votes: list[JudgeVerdict],
+    ts: str,
+) -> str:
+    """One SPARQL update that REPLACES the governance record for
+    (subject_uri, tenant_id): DELETE WHERE clears the record node's existing
+    triples, then INSERT DATA writes the fresh ones — semicolon-joined so the
+    rewrite is a single atomic update. Plain INSERTs would append, and
+    re-judging the same proposal would accumulate stale GOV_VOTE /
+    GOV_REASONING triples on the deterministic record node (COG-45)."""
+    record = _governance_record_uri(subject_uri, tenant_id)
+    approvals = sum(1 for v in votes if v.approve)
+    triples = [
+        (record, GOV_SUBJECT, subject_uri),
+        (record, GOV_PROPOSER_MODEL, proposer_model),
+        (record, GOV_REASONING, reasoning),
+        (record, GOV_TENANT, tenant_id),
+        (record, GOV_APPROVED, "true"),
+        (record, GOV_VOTES, f"{approvals}/{len(votes)}"),
+        (record, GOV_TIMESTAMP, f"{ts}^^{XSD}#dateTime"),
+    ]
+    for v in votes:
+        triples.append(
+            (record, GOV_VOTE, f"{'approve' if v.approve else 'reject'}: {v.reasoning}"),
+        )
+    prov_g = provenance_graph_uri(public_graph_uri())
+    return (
+        f"DELETE WHERE {{ GRAPH <{prov_g}> {{ <{record}> ?p ?o }} }};\n"
+        + insert_triples(prov_g, triples)
+    )
 
 
 def _changelog_triples(
@@ -222,47 +258,48 @@ class GovernanceEngine:
     ) -> str:
         """Insert the approved type into the Public layer, tagged and reversible.
 
-        Three writes: (1) the type itself in the Public graph — every triple's
-        subject is the public type URI so revoke_type removes exactly what this
-        created; (2) a governance-provenance record (proposer model, reasoning,
-        votes, timestamp) in the Public graph's companion provenance graph,
-        paralleling COG-38; (3) an append-only changelog entry (ADR 0002 §8).
-        Returns the public type URI.
+        Three writes for the approved type: (1) the type itself in the Public
+        graph — every triple's subject is the public type URI so revoke_type
+        removes exactly what this created; (2) a governance-provenance record
+        (proposer model, reasoning, votes, timestamp) in the Public graph's
+        companion provenance graph, paralleling COG-38 — the record node is
+        REPLACED, not appended to, so re-judging never accumulates stale
+        votes; (3) an append-only changelog entry (ADR 0002 §8).
+
+        If the proposal carries a parent_chain, any ancestor missing from the
+        Public layer is synthesized into it as part of the same governed
+        write (mirroring ADR 0001's ancestor synthesis), so the subClassOf
+        edge this emits is never dangling (COG-45). Each synthesized ancestor
+        gets the same trio: type triples, a provenance record whose reasoning
+        marks it as ancestor synthesis for the approved child, and a
+        changelog entry. No parent info — no edge. Returns the public type URI.
         """
         if not decision.approved:
             raise ValueError("write_governed_type requires an approved decision")
         ts = (timestamp or datetime.now(timezone.utc)).isoformat()
         pub_uri = layer_type_uri(Layer.PUBLIC, proposal.type_name)
+        # Find what's missing from the Public lineage BEFORE writing anything,
+        # so the checks never observe this write's own inserts.
+        missing_ancestors = await self._missing_public_ancestors(proposal.parent_chain)
 
         type_triples = [
             (pub_uri, f"{RDF}#type", f"{RDFS}#Class"),
             (pub_uri, f"{RDFS}#label", proposal.type_name),
         ]
         if proposal.parent_chain:
-            # Link only the immediate parent (in the Public namespace). Deeper
-            # lineage synthesis stays with the layer-aware closure work.
+            # Immediate parent in the Public namespace — never dangling: every
+            # missing ancestor in the chain is synthesized below.
             type_triples.append(
                 (pub_uri, f"{RDFS}#subClassOf", layer_type_uri(Layer.PUBLIC, proposal.parent_chain[0])),
             )
         await self._neptune.update(insert_triples(public_graph_uri(), type_triples))
 
-        record = _governance_record_uri(pub_uri, proposal.tenant_id)
         approvals = sum(1 for v in decision.votes if v.approve)
-        gov_triples = [
-            (record, GOV_SUBJECT, pub_uri),
-            (record, GOV_PROPOSER_MODEL, proposal.proposer_model),
-            (record, GOV_REASONING, proposal.reasoning),
-            (record, GOV_TENANT, proposal.tenant_id),
-            (record, GOV_APPROVED, "true"),
-            (record, GOV_VOTES, f"{approvals}/{len(decision.votes)}"),
-            (record, GOV_TIMESTAMP, f"{ts}^^{XSD}#dateTime"),
-        ]
-        for v in decision.votes:
-            gov_triples.append(
-                (record, GOV_VOTE, f"{'approve' if v.approve else 'reject'}: {v.reasoning}"),
-            )
         await self._neptune.update(
-            insert_triples(provenance_graph_uri(public_graph_uri()), gov_triples),
+            _governance_record_update(
+                pub_uri, proposal.tenant_id, proposal.proposer_model,
+                proposal.reasoning, decision.votes, ts,
+            ),
         )
 
         await self._neptune.update(
@@ -271,8 +308,78 @@ class GovernanceEngine:
                 _changelog_triples("add_type", pub_uri, proposal.tenant_id, ts),
             ),
         )
+
+        # missing_ancestors is a prefix of parent_chain, so its indexes are
+        # chain indexes — each synthesized ancestor links the next chain entry.
+        for i in range(len(missing_ancestors)):
+            await self._synthesize_ancestor(proposal, decision, i, ts)
+
         logger.info("governance_type_written", type_uri=pub_uri, votes=f"{approvals}/{len(decision.votes)}")
         return pub_uri
+
+    async def _missing_public_ancestors(self, parent_chain: list[str]) -> list[str]:
+        """The leading run of parent_chain names absent from the Public layer.
+
+        Walks the chain root-ward and stops at the first ancestor that already
+        exists — its own lineage was closed when IT was governed in, so
+        nothing above it can be dangling. Missing names come back in chain
+        order (immediate parent first), i.e. always a prefix of parent_chain.
+        """
+        missing: list[str] = []
+        for name in parent_chain:
+            uri = layer_type_uri(Layer.PUBLIC, name)
+            if await self._neptune.ask(entity_exists_query(public_graph_uri(), uri)):
+                break
+            missing.append(name)
+        return missing
+
+    async def _synthesize_ancestor(
+        self,
+        proposal: TypeProposal,
+        decision: GovernanceDecision,
+        chain_index: int,
+        ts: str,
+    ) -> None:
+        """Synthesize parent_chain[chain_index] into the Public layer.
+
+        Same trio of writes as the approved child: type triples (with a
+        subClassOf edge to the next chain entry's Public URI, when one
+        exists — the root of the chain gets no edge), a provenance record
+        whose reasoning marks the ancestor synthesis, and a changelog entry.
+        The record reuses the child's panel votes: approval of the child is
+        what admits its lineage.
+        """
+        name = proposal.parent_chain[chain_index]
+        anc_uri = layer_type_uri(Layer.PUBLIC, name)
+        anc_triples = [
+            (anc_uri, f"{RDF}#type", f"{RDFS}#Class"),
+            (anc_uri, f"{RDFS}#label", name),
+        ]
+        if chain_index + 1 < len(proposal.parent_chain):
+            anc_triples.append(
+                (anc_uri, f"{RDFS}#subClassOf",
+                 layer_type_uri(Layer.PUBLIC, proposal.parent_chain[chain_index + 1])),
+            )
+        await self._neptune.update(insert_triples(public_graph_uri(), anc_triples))
+
+        await self._neptune.update(
+            _governance_record_update(
+                anc_uri, proposal.tenant_id, proposal.proposer_model,
+                f"Ancestor synthesis: missing Public-layer ancestor of approved type "
+                f"'{proposal.type_name}' (closes the subClassOf lineage, COG-45)",
+                decision.votes, ts,
+            ),
+        )
+
+        await self._neptune.update(
+            insert_triples(
+                changelog_graph_uri(),
+                _changelog_triples("add_type", anc_uri, proposal.tenant_id, ts),
+            ),
+        )
+        logger.info(
+            "governance_ancestor_synthesized", type_uri=anc_uri, child=proposal.type_name,
+        )
 
     async def revoke_type(self, type_uri: str, timestamp: datetime | None = None) -> None:
         """Engine-shaped wrapper around the module-level revoke_type."""
