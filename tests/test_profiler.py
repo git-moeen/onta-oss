@@ -387,25 +387,31 @@ class TestFunctionalDependencies:
 
 class TestToPromptDict:
     def _profile(self) -> TableProfile:
+        # "plain" has 6 distinct over 10 rows (card_ratio 0.6): complete but
+        # neither unique nor dimension-shaped — no flags at all.
+        plain = ["p1", "p2", "p3", "p4", "p5", "p6", "p1", "p2", "p3", "p4"]
         rows = [
-            {"id": f"R{i}", "dim": ["a", "b"][i % 2], "dim_name": ["alpha", "beta"][i % 2], "note": ""}
+            {"id": f"R{i}", "dim": ["a", "b"][i % 2], "dim_name": ["alpha", "beta"][i % 2],
+             "plain": plain[i], "note": ""}
             for i in range(10)
         ]
-        return profile_table(["id", "dim", "dim_name", "note"], rows, total_rows=100)
+        return profile_table(["id", "dim", "dim_name", "plain", "note"], rows, total_rows=100)
 
     def test_structure_and_coverage(self):
         d = self._profile().to_prompt_dict()
         assert d["rows_profiled"] == 10
         assert d["total_rows"] == 100
-        assert set(d["columns"]) == {"id", "dim", "dim_name", "note"}
+        assert set(d["columns"]) == {"id", "dim", "dim_name", "plain", "note"}
         assert "dim <-> dim_name" in d["fd_mutual"]
 
     def test_flags_only_when_set(self):
         d = self._profile().to_prompt_dict()
+        assert d["columns"]["id"]["flags"] == ["complete_unique_key"]
         assert d["columns"]["dim"]["flags"] == ["low_cardinality_repeated"]
-        assert "flags" not in d["columns"].get("id", {}).keys() or d["columns"]["id"]["flags"]
         # 'note' is all-empty → incomplete flag present.
         assert "incomplete" in d["columns"]["note"]["flags"]
+        # No spurious flags on an unremarkable column — key omitted entirely.
+        assert "flags" not in d["columns"]["plain"]
 
     def test_floats_rounded(self):
         rows = [{"c": "a"}, {"c": "b"}, {"c": "a"}]
