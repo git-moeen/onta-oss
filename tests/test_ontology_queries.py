@@ -9,6 +9,7 @@ from cograph_client.graph.ontology_queries import (
     get_type_functions_query,
     get_full_ontology_query,
     mark_core_slot,
+    set_object_property_range,
     type_uri,
     attr_uri,
 )
@@ -120,3 +121,16 @@ def test_get_full_ontology_query():
     assert "Class" in sparql
     assert "domain" in sparql
     assert "attachedTo" in sparql
+
+
+def test_set_object_property_range():
+    # Upgrading a predicate's range to a type URI must delete any existing range
+    # (so the property keeps exactly one) and insert the types/ target.
+    sparql = set_object_property_range(GRAPH, "RetailerSKU", "identifies", "Product")
+    assert "DELETE" in sparql and "INSERT" in sparql
+    assert f"<{GRAPH}>" in sparql
+    assert attr_uri("RetailerSKU", "identifies") in sparql
+    assert type_uri("Product") in sparql
+    assert "range" in sparql
+    # The old range is matched optionally so a predicate with no range yet still upgrades.
+    assert "OPTIONAL" in sparql

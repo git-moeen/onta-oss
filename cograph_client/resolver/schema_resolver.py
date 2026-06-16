@@ -30,6 +30,7 @@ from cograph_client.graph.ontology_queries import (
     insert_subtype,
     insert_type,
     parent_map_query,
+    set_object_property_range,
     type_uri,
     attr_uri,
 )
@@ -494,13 +495,27 @@ class SchemaResolver:
                 target_type = entity_type_map.get(rel.target_id)
                 if source_type and target_type:
                     type_attrs = existing_attrs.get(source_type, {})
-                    if canonical_pred not in type_attrs:
+                    existing = type_attrs.get(canonical_pred)
+                    if existing is None:
                         sparql = insert_attribute(
                             graph_uri, source_type, canonical_pred, "", target_type,
                         )
                         await self._neptune.update(sparql)
                         result.attributes_added.append(f"{source_type}.{canonical_pred}")
                         existing_attrs.setdefault(source_type, {})[canonical_pred] = AttributeSchema(
+                            name=canonical_pred, datatype=target_type,
+                        )
+                    elif existing.datatype in PRIMITIVE_TYPES:
+                        # First seen as a primitive attribute, now carrying an
+                        # entity object: upgrade its ontology range to the target
+                        # type so the schema-only Explorer overview draws the edge
+                        # (the detail view already shows it from instance data).
+                        await self._neptune.update(
+                            set_object_property_range(
+                                graph_uri, source_type, canonical_pred, target_type,
+                            )
+                        )
+                        existing_attrs[source_type][canonical_pred] = AttributeSchema(
                             name=canonical_pred, datatype=target_type,
                         )
 
@@ -629,11 +644,24 @@ class SchemaResolver:
                     target_type = entity_type_map.get(rel.target_id)
                     if source_type and target_type:
                         type_attrs = existing_attrs.get(source_type, {})
-                        if canonical_pred not in type_attrs:
+                        existing = type_attrs.get(canonical_pred)
+                        if existing is None:
                             sparql = insert_attribute(graph_uri, source_type, canonical_pred, "", target_type)
                             await self._neptune.update(sparql)
                             result.attributes_added.append(f"{source_type}.{canonical_pred}")
                             existing_attrs.setdefault(source_type, {})[canonical_pred] = AttributeSchema(
+                                name=canonical_pred, datatype=target_type,
+                            )
+                        elif existing.datatype in PRIMITIVE_TYPES:
+                            # Upgrade a primitive attribute to a relationship range
+                            # so the Explorer overview draws the edge (see entity
+                            # ingest path above for the full rationale).
+                            await self._neptune.update(
+                                set_object_property_range(
+                                    graph_uri, source_type, canonical_pred, target_type,
+                                )
+                            )
+                            existing_attrs[source_type][canonical_pred] = AttributeSchema(
                                 name=canonical_pred, datatype=target_type,
                             )
 

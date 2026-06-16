@@ -265,6 +265,75 @@ async def _read_type_stats(
     return entity_count, records
 
 
+def _dedupe_undirected(pairs: list[tuple[str, str]]) -> list[dict]:
+    """Collapse directed (src, tgt) type pairs into undirected edges.
+
+    The overview graph is undirected, so A→B and B→A are one line. Sorting each
+    pair keys both directions to the same bucket. Weight is constant for now —
+    the overview encodes magnitude via node size, not edge weight.
+    """
+    by_pair: dict[tuple[str, str], dict] = {}
+    for s, t in pairs:
+        if not s or not t or s == t:
+            continue
+        a, c = sorted((s, t))
+        by_pair[(a, c)] = {"source": a, "target": c, "weight": 70}
+    return list(by_pair.values())
+
+
+async def _read_edges_from_stats(
+    client: NeptuneClient, tenant_id: str, kg_name: str
+) -> list[tuple[str, str]] | None:
+    """Type→type edges from the precomputed stats graph, or None if unmaterialized.
+
+    Reads the SAME instance-derived ``targetType`` the per-type summary uses, so
+    the overview and the detail view agree by construction. Returns None (not [])
+    when no stat rows carry a target, so the caller can fall back to a live scan.
+    """
+    stats = _stats_graph_uri(tenant_id, kg_name)
+    q = (
+        f"SELECT DISTINCT ?src ?tgt FROM <{stats}> WHERE {{\n"
+        f"  ?s <{_STAT_FOR_TYPE}> ?src ; <{_STAT_TARGET}> ?tgt .\n"
+        f"}}"
+    )
+    _, rows = parse_sparql_results(await client.query(q))
+    if not rows:
+        return None
+    out: list[tuple[str, str]] = []
+    for r in rows:
+        su, tu = r.get("src", ""), r.get("tgt", "")
+        if su.startswith(TYPE_URI_PREFIX) and tu.startswith(TYPE_URI_PREFIX):
+            out.append((su[len(TYPE_URI_PREFIX):], tu[len(TYPE_URI_PREFIX):]))
+    return out
+
+
+async def _live_edge_scan(client: NeptuneClient, kg_graph: str) -> list[tuple[str, str]]:
+    """Fallback: derive type→type edges straight from instance triples.
+
+    Used when stats aren't materialized yet (KG ingested before stats existed).
+    Target type comes from the object entity URI leaf, matching the summary.
+    """
+    q = (
+        f"SELECT DISTINCT ?type ?o FROM <{kg_graph}> WHERE {{\n"
+        f"  ?e <{RDF_TYPE}> ?type .\n"
+        f"  ?e ?p ?o .\n"
+        f'  FILTER(STRSTARTS(STR(?type), "{TYPE_URI_PREFIX}"))\n'
+        f'  FILTER(STRSTARTS(STR(?o), "{ENTITY_URI_PREFIX}"))\n'
+        f"}}"
+    )
+    _, rows = parse_sparql_results(await client.query(q))
+    out: list[tuple[str, str]] = []
+    for r in rows:
+        tu = r.get("type", "")
+        src = tu[len(TYPE_URI_PREFIX):] if tu.startswith(TYPE_URI_PREFIX) else ""
+        if not src or "/" in src:  # skip nested URIs like .../attrs/x
+            continue
+        tgt = _target_from_entity_uri(r.get("o", ""))
+        if tgt:
+            out.append((src, tgt))
+    return out
+
+
 async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> dict:
     """Recompute the stats graph for a KG in one whole-KG scan.
 
@@ -432,6 +501,28 @@ async def get_type_summary(
     result = _assemble_summary(type_name, onto_row, parent_type, entity_count, pred_records, attr_defs)
     _summary_cache[cache_key] = (time.monotonic(), result)
     return result
+
+
+@router.get("/kgs/{kg_name}/type-edges")
+async def get_type_edges(
+    kg_name: str,
+    tenant: TenantContext = Depends(get_tenant),
+    client: NeptuneClient = Depends(get_neptune_client),
+):
+    """Undirected type→type edges for the Explorer overview graph.
+
+    Derived from instance data (the precomputed stats graph, with a live-scan
+    fallback) rather than the ontology's declared ``rdfs:range``. This keeps the
+    overview consistent with the per-type detail view: a relationship that
+    exists in the data but whose ontology range was never upgraded to a type
+    URI (e.g. a predicate first seen as a primitive attribute) is now drawn in
+    both places. Returns ``[{source, target, weight}]``.
+    """
+    edges = await _read_edges_from_stats(client, tenant.tenant_id, kg_name)
+    if edges is None:
+        kg_graph = kg_graph_uri(tenant.tenant_id, kg_name)
+        edges = await _live_edge_scan(client, kg_graph)
+    return _dedupe_undirected(edges)
 
 
 @router.post("/kgs/{kg_name}/recompute-stats")

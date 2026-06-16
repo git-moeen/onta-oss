@@ -44,6 +44,25 @@ def insert_attribute(graph_uri: str, type_name: str, attr_name: str, description
     return f"INSERT DATA {{\n  GRAPH <{graph_uri}> {{\n{body}\n  }}\n}}"
 
 
+def set_object_property_range(graph_uri: str, type_name: str, attr_name: str, target_type: str) -> str:
+    """Re-point an existing property's ``rdfs:range`` at a type URI.
+
+    Used to UPGRADE a predicate that was first registered as a primitive
+    attribute (range ``xsd:string`` etc.) once it is later seen carrying an
+    entity-valued object — i.e. it is really a relationship to ``target_type``.
+    Without this the schema-only Explorer overview can't see the edge (it keys
+    on ``rdfs:range`` being a ``types/`` URI), even though the instance triple
+    exists. Deletes any existing range first so the property keeps exactly one.
+    """
+    a_uri = attr_uri(type_name, attr_name)
+    rng = type_uri(target_type)
+    return (
+        f"DELETE {{ GRAPH <{graph_uri}> {{ <{a_uri}> <{RDFS}#range> ?old }} }}\n"
+        f"INSERT {{ GRAPH <{graph_uri}> {{ <{a_uri}> <{RDFS}#range> <{rng}> }} }}\n"
+        f"WHERE {{ GRAPH <{graph_uri}> {{ OPTIONAL {{ <{a_uri}> <{RDFS}#range> ?old }} }} }}"
+    )
+
+
 def mark_core_slot(graph_uri: str, type_name: str, slot_name: str) -> str:
     """Mark one of ``type_name``'s declared attributes/relationship slots as
     CONSTITUTIVE (a core slot, ADR 0003 §3 / Pass D).

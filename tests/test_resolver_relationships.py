@@ -244,6 +244,47 @@ class TestRelationshipRegistration:
         assert "Person.lives_in" not in result.attributes_added
 
     @pytest.mark.asyncio
+    async def test_relationship_upgrades_primitive_attribute(self, mock_neptune, mock_cache):
+        """A predicate first seen as a primitive attribute, then carrying an
+        entity object, must have its ontology range UPGRADED to the target type.
+
+        Regression: without the upgrade the predicate keeps its ``xsd:string``
+        range, so the schema-only Explorer overview can't draw the edge even
+        though the per-type detail view shows it from instance data. The two
+        views disagreed (RetailerSKU → Product line missing in the overview).
+        """
+        resolver = SchemaResolver(mock_neptune, "fake-key", mock_cache)
+
+        from cograph_client.resolver.attribute_resolver import AttributeSchema
+
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedEntity(type_name="Person", id="john", attributes=[]),
+                ExtractedEntity(type_name="City", id="sf", attributes=[]),
+            ],
+            relationships=[
+                ExtractedRelationship(source_id="john", predicate="lives_in", target_id="sf"),
+            ],
+        )
+
+        existing_types = {"Person": "", "City": ""}
+        # `lives_in` was previously registered as a primitive (string) attribute.
+        existing_attrs = {
+            "Person": {"lives_in": AttributeSchema("lives_in", "string")},
+            "City": {},
+        }
+
+        with patch.object(resolver, "_extract", return_value=extraction):
+            with patch.object(resolver, "_fetch_ontology", return_value=(existing_types, existing_attrs)):
+                await resolver.ingest("John lives in SF", "test-tenant")
+
+        update_calls = " ".join(str(c) for c in mock_neptune.update.call_args_list)
+        # The range was re-pointed at the City type (delete-then-insert).
+        assert "DELETE" in update_calls and "INSERT" in update_calls
+        assert "Person/attrs/lives_in" in update_calls
+        assert "cograph.tech/types/City" in update_calls
+
+    @pytest.mark.asyncio
     async def test_instance_triple_always_inserted(self, mock_neptune, mock_cache):
         """Instance relationship triples should always be inserted regardless of ontology state."""
         resolver = SchemaResolver(mock_neptune, "fake-key", mock_cache)
