@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, Query
 from cograph_client.api.deps import get_neptune_client
 from cograph_client.auth.api_keys import TenantContext, get_tenant
 from cograph_client.graph.client import NeptuneClient
-from cograph_client.graph.ontology_queries import type_uri
+from cograph_client.graph.ontology_queries import attr_uri, type_uri
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
 from cograph_client.resolver import drift_control
@@ -41,6 +41,10 @@ RDF_PROPERTY = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
 RDFS = "http://www.w3.org/2000/01/rdf-schema"
 TYPE_URI_PREFIX = "https://cograph.tech/types/"
 ENTITY_URI_PREFIX = "https://cograph.tech/entities/"
+# Instance relationship predicates are minted as `…/onto/<predName>` (see
+# nlp/pipeline.py); the matching ontology attr/core-slot marker lives at
+# `attr_uri(<sourceTypeLeaf>, <predName>)`. Strip this prefix to recover predName.
+ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
 SYSTEM_PREDICATES: frozenset[str] = frozenset({
     f"{RDFS}#label",
     "https://cograph.tech/onto/ingested_at",
@@ -411,6 +415,98 @@ async def _live_edge_scan(client: NeptuneClient, kg_graph: str) -> list[tuple[st
     return out
 
 
+async def _live_edge_scan_drift(
+    client: NeptuneClient, kg_graph: str, tenant_id: str
+) -> list[tuple[str, str]]:
+    """ADR 0004 drift-gated variant of :func:`_live_edge_scan`.
+
+    Used (flag ON only) when a KG has NO materialized stats graph — legacy KGs
+    ingested before stats/drift control existed. Without a floor here the
+    ``ManufacturerPartNumber.issuedby -> Retailer`` 6%-coverage drift shape still
+    surfaces in the overview for un-materialized KGs (the production gap this
+    fixes); the flag-OFF path keeps the unfiltered :func:`_live_edge_scan`.
+
+    Derives type→type edges straight from instance triples, but applies the SAME
+    support floor as :func:`_read_edges_from_stats_drift`. Per (source type,
+    predicate, target type) it computes the support (``COUNT(DISTINCT`` source
+    entity), and per source type the entity count; an edge is kept only when
+    ``drift_control.should_declare(support, source_count, is_core)`` is True.
+    ``is_core`` reads the ontology ``onto/coreSlot`` marker, keyed by
+    ``attr_uri(srcLeaf, predLeaf)`` (the instance predicate ``…/onto/<predName>``
+    maps to the ontology attr ``…/types/<srcLeaf>/attrs/<predName>``).
+    """
+    onto = tenant_graph_uri(tenant_id)
+    # (1) Per (source type, predicate, target type) support = distinct source
+    # entities carrying that entity-valued object. Target leaf derived in SPARQL
+    # from the object entity URI (…/entities/<TargetType>/<id>).
+    edge_q = (
+        f"SELECT ?type ?p ?tgt (COUNT(DISTINCT ?e) AS ?support) FROM <{kg_graph}> WHERE {{\n"
+        f"  ?e <{RDF_TYPE}> ?type .\n"
+        f"  ?e ?p ?o .\n"
+        f'  FILTER(STRSTARTS(STR(?type), "{TYPE_URI_PREFIX}"))\n'
+        f'  FILTER(STRSTARTS(STR(?o), "{ENTITY_URI_PREFIX}"))\n'
+        f'  BIND(REPLACE(STR(?o), "^.*/entities/([^/]+)/.*$", "$1") AS ?tgt)\n'
+        f"}} GROUP BY ?type ?p ?tgt"
+    )
+    # (2) Per source type entity count (source_count for the coverage ratio).
+    count_q = (
+        f"SELECT ?type (COUNT(DISTINCT ?e) AS ?ec) FROM <{kg_graph}> WHERE {{\n"
+        f"  ?e <{RDF_TYPE}> ?type .\n"
+        f'  FILTER(STRSTARTS(STR(?type), "{TYPE_URI_PREFIX}"))\n'
+        f"}} GROUP BY ?type"
+    )
+    # (3) Core-slot markers from the ontology graph, keyed by attr URI — SAME
+    # query shape as _read_edges_from_stats_drift.
+    core_q = (
+        f"SELECT DISTINCT ?attr FROM <{onto}> WHERE {{\n"
+        f"  ?attr <{_CORE_SLOT_PRED}> ?v .\n"
+        f"}}"
+    )
+    edge_raw, count_raw, core_raw = await asyncio.gather(
+        client.query(edge_q), client.query(count_q), client.query(core_q)
+    )
+
+    _, count_rows = parse_sparql_results(count_raw)
+    source_counts: dict[str, int] = {}
+    for r in count_rows:
+        tu = r.get("type", "")
+        if not tu.startswith(TYPE_URI_PREFIX):
+            continue
+        try:
+            source_counts[tu] = int(r.get("ec", "0") or "0")
+        except ValueError:
+            source_counts[tu] = 0
+
+    _, core_rows = parse_sparql_results(core_raw)
+    core_slots = {r.get("attr", "") for r in core_rows if r.get("attr")}
+
+    _, edge_rows = parse_sparql_results(edge_raw)
+    out: list[tuple[str, str]] = []
+    for r in edge_rows:
+        tu = r.get("type", "")
+        src = tu[len(TYPE_URI_PREFIX):] if tu.startswith(TYPE_URI_PREFIX) else ""
+        if not src or "/" in src:  # skip nested URIs like .../attrs/x
+            continue
+        tgt = r.get("tgt", "")
+        if not tgt or "/" in tgt:
+            continue
+        try:
+            support = int(r.get("support", "0") or "0")
+        except ValueError:
+            support = 0
+        source_count = source_counts.get(tu, 0)
+        p_uri = r.get("p", "")
+        pred_leaf = (
+            p_uri[len(ONTO_PRED_PREFIX):] if p_uri.startswith(ONTO_PRED_PREFIX)
+            else p_uri.rstrip("/").split("/")[-1]
+        )
+        is_core = attr_uri(src, pred_leaf) in core_slots
+        if not drift_control.should_declare(support, source_count, is_core):
+            continue
+        out.append((src, tgt))
+    return out
+
+
 async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> dict:
     """Recompute the stats graph for a KG in one whole-KG scan.
 
@@ -665,13 +761,20 @@ async def get_type_edges(
     from the overview, while high-coverage and core-slot edges are kept. With
     the flag OFF the read is byte-identical to before (no filtering).
     """
-    if drift_control.drift_control_enabled():
+    drift_on = drift_control.drift_control_enabled()
+    if drift_on:
         edges = await _read_edges_from_stats_drift(client, tenant.tenant_id, kg_name)
     else:
         edges = await _read_edges_from_stats(client, tenant.tenant_id, kg_name)
     if edges is None:
+        # No materialized stats graph (legacy KG). The live scan must honor the
+        # drift floor too when the flag is ON, else below-floor drift edges leak
+        # into the overview for un-materialized KGs. Flag OFF: unchanged scan.
         kg_graph = kg_graph_uri(tenant.tenant_id, kg_name)
-        edges = await _live_edge_scan(client, kg_graph)
+        if drift_on:
+            edges = await _live_edge_scan_drift(client, kg_graph, tenant.tenant_id)
+        else:
+            edges = await _live_edge_scan(client, kg_graph)
     return _dedupe_undirected(edges)
 
 
