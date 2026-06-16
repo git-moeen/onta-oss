@@ -250,6 +250,7 @@ using only these structural failure templates (no domain knowledge):
 4. KEYLESS ENTITY — any entity with no stable key strategy.
 5. DUPLICATE/DEAD ATTR — near-duplicate attribute names, or attributes over an all-empty column.
 6. LOST KEY — a key column not also emitted as an attribute.
+7. SPARSE / MIS-DOMAINED EDGE — a relationship whose coverage on its declared source type is below the support floor (few of that type's rows populate it), OR that reuses a predicate which holds at high coverage on a sibling source type but is attached here at low coverage to a different source type. Either way the edge is not a type-level property of its declared domain.
 List every violation as {template, location, evidence, severity}. Then output a CORRECTED schema JSON in the
 same shape as the input. If nothing is wrong, return violations:[] and echo the schema. JSON only:
 {"violations":[...], "corrected": {...}}"""

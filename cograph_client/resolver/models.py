@@ -225,10 +225,11 @@ class EntityRelationSpec(BaseModel):
 class SchemaViolation(BaseModel):
     """One structural violation found by the adversarial refute pass
     (ADR 0003 Pass C). Templates are domain-free: KEY DROPS ROWS, DIMENSION AS
-    LITERAL, COLUMN-NAMED EDGE, KEYLESS ENTITY, DUPLICATE/DEAD ATTR, LOST KEY.
+    LITERAL, COLUMN-NAMED EDGE, KEYLESS ENTITY, DUPLICATE/DEAD ATTR, LOST KEY,
+    SPARSE / MIS-DOMAINED EDGE (ADR 0004 drift template).
     """
 
-    template: str = Field(description="Which of the six failure templates fired")
+    template: str = Field(description="Which of the structural failure templates fired")
     location: str = Field(
         default="", description="Where in the proposed schema (entity/column/edge)"
     )
