@@ -15,6 +15,7 @@ from cograph_client.graph.client import NeptuneClient
 from cograph_client.resolver.models import CSVRowsRequest, CSVSchemaMapping, CSVSchemaRequest, IngestRequest, IngestResult
 from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
 from cograph_client.nlp.pipeline import NLQueryPipeline
+from cograph_client.resolver.attribute_resolver import AttributeSchema
 from cograph_client.resolver.schema_resolver import SchemaResolver
 from cograph_client.resolver.verdict_cache import JsonVerdictCache
 
@@ -267,9 +268,16 @@ async def ingest_csv_rows(
             if slot_name not in ext_attrs:
                 if slot_kind == "relationship" and slot_target:
                     await client.update(insert_attribute(graph_uri, ext_type, slot_name, slot_why, slot_target))
+                    slot_datatype = slot_target
                 else:
                     await client.update(insert_attribute(graph_uri, ext_type, slot_name, slot_why, "string"))
-                ext_attrs[slot_name] = "core"
+                    slot_datatype = "string"
+                # Store a real AttributeSchema (not a bare marker string): this dict
+                # is existing_attrs[ext_type], which flows into resolve_attribute()
+                # during the insert pass. A str here triggers
+                # `'str' object has no attribute 'datatype'` the moment any ingested
+                # entity of ext_type has an attribute matching this slot name.
+                ext_attrs[slot_name] = AttributeSchema(name=slot_name, datatype=slot_datatype)
             await client.update(mark_core_slot(graph_uri, ext_type, slot_name))
 
     # Judge-panel gating (ADR 0003 §5, COG-56): the tenant-layer writes above

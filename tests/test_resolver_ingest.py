@@ -147,6 +147,44 @@ def test_csv_rows_preregisters_promoted_types_and_core_slots(
 
 
 @patch("cograph_client.api.routes.ingest.SchemaResolver")
+def test_csv_rows_core_slot_preregistration_uses_attribute_schema(
+    mock_resolver_cls, client, auth_headers, mock_neptune,
+):
+    """Regression: pre-registered core slots must land in existing_attrs as
+    AttributeSchema, NOT bare marker strings. A str there crashes the insert
+    pass with `'str' object has no attribute 'datatype'` the moment any ingested
+    entity of the extension type has an attribute matching the slot name."""
+    from cograph_client.resolver.attribute_resolver import AttributeSchema
+    from cograph_client.resolver.models import IngestResult
+
+    mock_instance = AsyncMock()
+    mock_instance._fetch_ontology.return_value = ({}, {})
+    mock_instance._resolve_and_insert.return_value = IngestResult()
+    mock_resolver_cls.return_value = mock_instance
+
+    response = client.post(
+        "/graphs/test-tenant/ingest/csv/rows",
+        json={"mapping": _extension_mapping(),
+              "rows": [{"name": "One", "code": "C-1"}]},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    # existing_attrs is the 4th positional arg handed to _resolve_and_insert.
+    existing_attrs = mock_instance._resolve_and_insert.call_args.args[3]
+    code_slots = existing_attrs.get("Code", {})
+    assert code_slots, "extension type 'Code' core slots were not pre-registered"
+    for slot_name, schema in code_slots.items():
+        assert isinstance(schema, AttributeSchema), (
+            f"core slot {slot_name!r} stored as {type(schema).__name__}, "
+            f"must be AttributeSchema (regression: bare 'core' string)"
+        )
+    # Relationship slots keep their target type as datatype; attribute slots are string.
+    assert code_slots["issued_by"].datatype == "Issuer"
+    assert code_slots["code"].datatype == "string"
+
+
+@patch("cograph_client.api.routes.ingest.SchemaResolver")
 def test_csv_rows_without_extensions_writes_no_core_slots(
     mock_resolver_cls, client, auth_headers, mock_neptune,
 ):
