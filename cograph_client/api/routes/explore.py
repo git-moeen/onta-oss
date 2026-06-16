@@ -482,6 +482,7 @@ async def _live_edge_scan_drift(
 
     _, edge_rows = parse_sparql_results(edge_raw)
     out: list[tuple[str, str]] = []
+    _dbg: list[dict] = []  # TEMP (ADR 0004 in-path trial): per-edge decision trace
     for r in edge_rows:
         tu = r.get("type", "")
         src = tu[len(TYPE_URI_PREFIX):] if tu.startswith(TYPE_URI_PREFIX) else ""
@@ -501,9 +502,14 @@ async def _live_edge_scan_drift(
             else p_uri.rstrip("/").split("/")[-1]
         )
         is_core = attr_uri(src, pred_leaf) in core_slots
-        if not drift_control.should_declare(support, source_count, is_core):
+        keep = drift_control.should_declare(support, source_count, is_core)
+        _dbg.append({"edge": f"{src}.{pred_leaf}->{tgt}", "support": support,
+                     "source_count": source_count, "is_core": is_core, "keep": keep})
+        if not keep:
             continue
         out.append((src, tgt))
+    logger.info("drift_ls_trace", kg_graph=kg_graph,
+                core_slot_count=len(core_slots), decisions=_dbg)
     return out
 
 
