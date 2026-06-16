@@ -169,6 +169,131 @@ def test_flag_on_without_core_marker_excludes_zero_support(client, mock_neptune,
     assert ("Retailer", "RetailerSKU") in pairs     # 100% edge still kept
 
 
+# --- live-scan fallback (legacy KG with NO materialized stats) ----------------
+# Reference: a KG ingested before stats existed. The stats-drift read returns no
+# bindings (=> _read_edges_from_stats_drift returns None), so the endpoint falls
+# back to the live instance scan, which must apply the SAME floor when the flag
+# is ON. Instance predicates are minted as `…/onto/<predName>`; the matching
+# core-slot marker lives at `…/types/<srcLeaf>/attrs/<predName>`.
+ONTO = "https://cograph.tech/onto/"
+MPN_ISSUEDBY_ONTO = ONTO + "issuedby"          # MPN instances: 41/685 -> 6%
+RSKU_ISSUEDBY_ONTO = ONTO + "issuedby"          # RetailerSKU: 600/600 -> 100%
+SKU_ISSUED_BY_ONTO = ONTO + "issued_by"         # SKU core slot, 0/604 -> exempt
+# Core-slot attr URI (what _live_edge_scan_drift joins on): attr_uri(src, pred).
+SKU_ISSUED_BY_ATTR = TYPES + "SKU/attrs/issued_by"
+
+
+def _live_scan_router(*, core_slots=()):
+    """Route the legacy-KG live-scan reads (flag ON, NO stats materialized).
+
+    - The drift stats read (``targetType`` + ``forPred``) returns NO bindings so
+      ``_read_edges_from_stats_drift`` returns None and the endpoint falls back
+      to the live instance scan.
+    - The live-scan edge aggregation groups by ``?type ?p ?tgt`` (``COUNT(DISTINCT``
+      over the KG graph). One LOW edge (MPN.issuedby 41/685 = 6%) and one HIGH
+      edge (RetailerSKU.issuedby 600/600 = 100%), plus a 0-support SKU core slot.
+    - The per-type entity-count query groups by ``?type`` only.
+    - The core-slot lookup is keyed on ``coreSlot``.
+    """
+    def route(sparql, *a, **k):
+        if "coreSlot" in sparql:
+            return _rows(*({"attr": c} for c in core_slots))
+        # Drift stats read — empty so the endpoint falls to the live scan.
+        if "targetType" in sparql:
+            return _rows()
+        # Live-scan edge aggregation: groups by source type, predicate, target.
+        if "GROUP BY ?type ?p ?tgt" in sparql:
+            return _rows(
+                {"type": TYPES + "MPN", "p": MPN_ISSUEDBY_ONTO,
+                 "tgt": "Retailer", "support": "41"},        # 41/685 -> 6%
+                {"type": TYPES + "RetailerSKU", "p": RSKU_ISSUEDBY_ONTO,
+                 "tgt": "Retailer", "support": "600"},        # 600/600 -> 100%
+                {"type": TYPES + "SKU", "p": SKU_ISSUED_BY_ONTO,
+                 "tgt": "Retailer", "support": "0"},          # core slot, exempt
+            )
+        # Per-type entity counts (source_count).
+        if "GROUP BY ?type" in sparql:
+            return _rows(
+                {"type": TYPES + "MPN", "ec": "685"},
+                {"type": TYPES + "RetailerSKU", "ec": "600"},
+                {"type": TYPES + "SKU", "ec": "604"},
+            )
+        return _rows()
+
+    return route
+
+
+def test_flag_on_live_scan_excludes_low_coverage_edge(client, mock_neptune, auth_headers, monkeypatch):
+    """Flag ON, legacy KG (NO stats): the live-scan path applies the floor.
+
+    The stats-drift read returns None, so the endpoint falls back to the live
+    instance scan. The 6% MPN->Retailer edge (41/685) must be EXCLUDED there too
+    — the production gap this fixes — while the 100% RetailerSKU edge (600/600)
+    is kept.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _live_scan_router()
+
+    resp = client.get(f"/graphs/{TENANT}/explore/kgs/{KG}/type-edges", headers=auth_headers)
+    assert resp.status_code == 200
+    pairs = {tuple(sorted((e["source"], e["target"]))) for e in resp.json()}
+
+    assert ("MPN", "Retailer") not in pairs        # 6% drift edge EXCLUDED on live scan
+    assert ("Retailer", "RetailerSKU") in pairs     # 100% edge kept
+
+
+def test_flag_on_live_scan_core_slot_exempt(client, mock_neptune, auth_headers, monkeypatch):
+    """Flag ON, legacy KG: a 0-support core slot is exempt on the live-scan path.
+
+    SKU.issued_by carries 0 support (0/604) but is marked a core slot, so it is
+    declared even on the live scan. Confirms the live scan reads the ontology
+    core-slot marker (keyed by attr_uri) the same way the stats path does.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _live_scan_router(core_slots=(SKU_ISSUED_BY_ATTR,))
+
+    resp = client.get(f"/graphs/{TENANT}/explore/kgs/{KG}/type-edges", headers=auth_headers)
+    assert resp.status_code == 200
+    pairs = {tuple(sorted((e["source"], e["target"]))) for e in resp.json()}
+
+    assert ("MPN", "Retailer") not in pairs        # 6% drift edge still excluded
+    assert ("Retailer", "SKU") in pairs             # core slot exempt -> kept
+    assert ("Retailer", "RetailerSKU") in pairs     # 100% edge kept
+
+
+def test_flag_off_live_scan_keeps_low_coverage_edge(client, mock_neptune, auth_headers, monkeypatch):
+    """Flag OFF, legacy KG: the unfiltered live scan keeps the 6% drift edge.
+
+    With the flag OFF the endpoint must take the original unfiltered
+    ``_live_edge_scan`` (byte-identical to before): the 6% MPN->Retailer edge is
+    still drawn. Routed via the plain instance scan (``?e ?p ?o`` over the KG,
+    no aggregation), which the OFF path uses when stats are absent.
+    """
+    monkeypatch.delenv("OMNIX_DRIFT_CONTROL", raising=False)
+
+    def route(sparql, *a, **k):
+        # Plain stats read (forType + targetType, no forPred) — empty so the
+        # endpoint falls back to the unfiltered live scan.
+        if "targetType" in sparql:
+            return _rows()
+        # Unfiltered live scan: distinct (?type, ?o) instance pairs, no GROUP BY.
+        if "?e ?p ?o" in sparql and "GROUP BY" not in sparql:
+            return _rows(
+                {"type": TYPES + "MPN", "o": ENTITIES + "Retailer/r1"},
+                {"type": TYPES + "RetailerSKU", "o": ENTITIES + "Retailer/r2"},
+            )
+        return _rows()
+
+    mock_neptune.query.side_effect = route
+
+    resp = client.get(f"/graphs/{TENANT}/explore/kgs/{KG}/type-edges", headers=auth_headers)
+    assert resp.status_code == 200
+    pairs = {tuple(sorted((e["source"], e["target"]))) for e in resp.json()}
+
+    assert ("MPN", "Retailer") in pairs            # 6% drift edge kept when OFF
+    assert ("Retailer", "RetailerSKU") in pairs     # 100% edge kept
+
+
 # --- recompute drift report ---------------------------------------------------
 
 def _recompute_router(*, core_slots=()):
