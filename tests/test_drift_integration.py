@@ -151,6 +151,27 @@ def test_flag_on_excludes_low_coverage_edge(client, mock_neptune, auth_headers, 
     assert ("Retailer", "SKU") in pairs             # core slot exempt -> kept
 
 
+def test_observe_only_does_not_filter_overview(client, mock_neptune, auth_headers, monkeypatch):
+    """Flag ON + OBSERVE_ONLY: the overview is NOT filtered (acts like flag OFF).
+
+    Observe-only collects the coverage distribution via the recompute report
+    without acting on the overview — so the 6% MPN->Retailer drift edge must
+    still be drawn, exactly as when the feature is off. This is the de-risking
+    mode: measure before you filter.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    monkeypatch.setenv("OMNIX_DRIFT_OBSERVE_ONLY", "1")
+    mock_neptune.query.side_effect = _edges_router(core_slots=(SKU_ISSUED_BY,))
+
+    resp = client.get(f"/graphs/{TENANT}/explore/kgs/{KG}/type-edges", headers=auth_headers)
+    assert resp.status_code == 200
+    pairs = {tuple(sorted((e["source"], e["target"]))) for e in resp.json()}
+
+    assert ("MPN", "Retailer") in pairs            # 6% drift edge NOT filtered in observe-only
+    assert ("Retailer", "RetailerSKU") in pairs
+    assert ("Retailer", "SKU") in pairs
+
+
 def test_flag_on_without_core_marker_excludes_zero_support(client, mock_neptune, auth_headers, monkeypatch):
     """Flag ON but SKU.issued_by NOT marked core: its 0-support edge is dropped.
 
@@ -352,6 +373,31 @@ async def test_recompute_drift_report_when_flag_on(mock_neptune, monkeypatch):
     assert quarantined_keys == {"MPN.issuedby"}
     assert report["quarantine"][0]["support"] == 41
     assert report["quarantine"][0]["coverage"] == 5.99
+
+
+@pytest.mark.asyncio
+async def test_recompute_drift_report_in_observe_only(mock_neptune, monkeypatch):
+    """Observe-only STILL produces the report + the full coverage distribution.
+
+    The whole point of observe-only is to collect the real spread of
+    relationship coverages, so recompute must compute and return the report (the
+    overview just doesn't act on it). The report carries `coverages` for EVERY
+    relationship (kept + quarantined), the histogram source for setting the floor
+    from real data.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    monkeypatch.setenv("OMNIX_DRIFT_OBSERVE_ONLY", "1")
+    mock_neptune.query.side_effect = _recompute_router()
+
+    out = await explore.recompute_kg_stats(mock_neptune, TENANT, KG)
+    assert "drift" in out                       # report still produced in observe-only
+    report = out["drift"]
+    cov_by_key = {c["key"]: c for c in report["coverages"]}
+    assert set(cov_by_key) == {"MPN.issuedby", "RetailerSKU.issuedby"}  # ALL, not just quarantined
+    assert cov_by_key["MPN.issuedby"]["coverage"] == 5.99
+    assert cov_by_key["MPN.issuedby"]["kept"] is False
+    assert cov_by_key["RetailerSKU.issuedby"]["coverage"] == 100.0
+    assert cov_by_key["RetailerSKU.issuedby"]["kept"] is True
 
 
 # --- core-slot exemption: attr_uri match, not raw predicate URI ---------------

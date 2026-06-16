@@ -107,6 +107,19 @@ def test_drift_control_enabled_flag(monkeypatch):
     assert dc.drift_control_enabled() is True
 
 
+def test_observe_only_flag(monkeypatch):
+    monkeypatch.delenv(dc.ENV_OBSERVE_ONLY, raising=False)
+    assert dc.observe_only() is False
+    monkeypatch.setenv(dc.ENV_OBSERVE_ONLY, "0")
+    assert dc.observe_only() is False
+    monkeypatch.setenv(dc.ENV_OBSERVE_ONLY, "1")
+    assert dc.observe_only() is True
+    # Independent of the feature flag — `act` = enabled AND NOT observe_only is
+    # composed by the caller (explore.get_type_edges), not here.
+    monkeypatch.delenv(dc.ENV_ENABLED, raising=False)
+    assert dc.observe_only() is True
+
+
 # --- reconcile split ----------------------------------------------------------
 def _reference_declarations() -> list[dict]:
     """The measured june-15-test/test retail declarations (ADR 0004 evidence)."""
@@ -148,8 +161,11 @@ def test_reconcile_default_is_core_slot_false():
 
 # --- drift_report shape / counts ----------------------------------------------
 def test_drift_report_shape_and_counts():
-    report = dc.drift_report(_reference_declarations())
-    assert set(report.keys()) == {"floor_cov", "floor_count", "kept", "quarantined", "quarantine"}
+    decls = _reference_declarations()
+    report = dc.drift_report(decls)
+    assert set(report.keys()) == {
+        "floor_cov", "floor_count", "kept", "quarantined", "quarantine", "coverages",
+    }
     assert report["floor_cov"] == 20.0
     assert report["floor_count"] == 5
     assert report["kept"] == 5
@@ -160,6 +176,14 @@ def test_drift_report_shape_and_counts():
     assert held["key"] == "ManufacturerPartNumber.issuedby->Retailer"
     assert held["support"] == 41
     assert held["coverage"] == pytest.approx(5.99, abs=1e-2)
+    # `coverages` is the observe-only distribution: EVERY declaration, with its
+    # kept verdict — the histogram source for setting the floor from real data.
+    assert len(report["coverages"]) == len(decls)
+    by_key = {c["key"]: c for c in report["coverages"]}
+    assert set(by_key["ManufacturerPartNumber.issuedby->Retailer"].keys()) == {
+        "key", "coverage", "support", "source_count", "is_core_slot", "kept",
+    }
+    assert by_key["ManufacturerPartNumber.issuedby->Retailer"]["kept"] is False
 
 
 def test_drift_report_reflects_floor_override():
