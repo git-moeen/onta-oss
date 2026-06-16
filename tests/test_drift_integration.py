@@ -528,3 +528,154 @@ async def test_recompute_sparse_non_core_slot_quarantined(mock_neptune, monkeypa
     assert report["kept"] == 0
     assert report["quarantined"] == 1
     assert {q["key"] for q in report["quarantine"]} == {"MPNcore.issuedby"}
+
+
+# --- COG-57: persist the observe-only distribution to a queryable store --------
+# The recompute drift report was previously only logged (CloudWatch, 30-day
+# retention). COG-57 also APPENDS each report to a per-KG drift-history named
+# graph so the distribution accumulates durably and can be queried back — the
+# data ADR 0004 needs to set the floor from a real histogram, not the hand-tuned
+# 20%. These tests assert the write happens (incl. observe-only, the whole
+# point), is skipped when the flag is off, is best-effort (a write failure does
+# not break the recompute), the graph is dropped with the KG, and the read
+# endpoint reassembles the stored snapshots.
+HIST_GRAPH = "drift-history"
+
+
+def _history_inserts(mock_neptune):
+    """All client.update() bodies that target the drift-history graph."""
+    return [
+        c.args[0]
+        for c in mock_neptune.update.call_args_list
+        if c.args and HIST_GRAPH in c.args[0]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recompute_persists_drift_history_when_flag_on(mock_neptune, monkeypatch):
+    """Flag ON: the recompute appends a snapshot + per-relationship points to the history graph."""
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _recompute_router()
+
+    await explore.recompute_kg_stats(mock_neptune, TENANT, KG)
+
+    inserts = _history_inserts(mock_neptune)
+    assert len(inserts) == 1
+    body = inserts[0]
+    assert body.startswith("INSERT DATA")          # APPEND, never DROP+rewrite
+    assert "DROP" not in body
+    assert "https://cograph.tech/drift/recordedAt" in body   # snapshot node
+    assert "https://cograph.tech/drift/pointOf" in body      # at least one point
+    # Both relationships from the distribution are persisted (kept + quarantined).
+    assert "MPN.issuedby" in body
+    assert "RetailerSKU.issuedby" in body
+
+
+@pytest.mark.asyncio
+async def test_recompute_persists_drift_history_in_observe_only(mock_neptune, monkeypatch):
+    """Observe-only STILL persists the full distribution — that is the whole point.
+
+    Observe-only exists to collect the real coverage spread without acting on the
+    overview, so the durable write must happen here too (it previously only
+    landed in 30-day logs).
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    monkeypatch.setenv("OMNIX_DRIFT_OBSERVE_ONLY", "1")
+    mock_neptune.query.side_effect = _recompute_router()
+
+    await explore.recompute_kg_stats(mock_neptune, TENANT, KG)
+
+    inserts = _history_inserts(mock_neptune)
+    assert len(inserts) == 1
+    assert "MPN.issuedby" in inserts[0]            # the 6% drift point is recorded
+    assert "RetailerSKU.issuedby" in inserts[0]    # the 100% point too (full spread)
+
+
+@pytest.mark.asyncio
+async def test_recompute_no_drift_history_when_flag_off(mock_neptune, monkeypatch):
+    """Flag OFF: no drift report is built, so nothing is written to the history graph."""
+    monkeypatch.delenv("OMNIX_DRIFT_CONTROL", raising=False)
+    mock_neptune.query.side_effect = _recompute_router()
+
+    await explore.recompute_kg_stats(mock_neptune, TENANT, KG)
+
+    assert _history_inserts(mock_neptune) == []
+
+
+@pytest.mark.asyncio
+async def test_drift_history_persist_failure_does_not_break_recompute(mock_neptune, monkeypatch):
+    """A history-write failure is swallowed — the recompute still returns its report.
+
+    Persistence is observability, not correctness; a Neptune hiccup on the
+    drift-history INSERT must never fail an ingest/recompute.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _recompute_router()
+
+    def update_router(sparql, *a, **k):
+        if HIST_GRAPH in sparql:
+            raise RuntimeError("neptune down")
+        return None
+
+    mock_neptune.update.side_effect = update_router
+
+    out = await explore.recompute_kg_stats(mock_neptune, TENANT, KG)
+    assert "drift" in out                  # recompute succeeded despite the failed write
+    assert out["drift"]["quarantined"] == 1
+
+
+@pytest.mark.asyncio
+async def test_drop_kg_stats_drops_drift_history_graph(mock_neptune):
+    """Dropping a KG also drops its drift-history graph (URI derived from KG name)."""
+    await explore.drop_kg_stats(mock_neptune, TENANT, KG)
+    dropped = " ".join(c.args[0] for c in mock_neptune.update.call_args_list if c.args)
+    assert HIST_GRAPH in dropped
+    assert "DROP SILENT GRAPH" in dropped
+
+
+def test_get_drift_history_reassembles_snapshots(client, mock_neptune, auth_headers):
+    """The read endpoint groups flat (snapshot × point) rows back into nested snapshots."""
+    snap = "https://cograph.tech/drift/snap/abc"
+
+    def route(sparql, *a, **k):
+        if HIST_GRAPH in sparql:
+            return _rows(
+                {"snap": snap, "recordedAt": "2026-06-16T20:00:00+00:00",
+                 "floorCov": "20.0", "floorCount": "5", "kept": "1", "quarantined": "1",
+                 "key": "MPN.issuedby", "coverage": "5.99", "support": "41",
+                 "sourceCount": "685", "isCore": "false", "pointKept": "false"},
+                {"snap": snap, "recordedAt": "2026-06-16T20:00:00+00:00",
+                 "floorCov": "20.0", "floorCount": "5", "kept": "1", "quarantined": "1",
+                 "key": "RetailerSKU.issuedby", "coverage": "100.0", "support": "604",
+                 "sourceCount": "604", "isCore": "false", "pointKept": "true"},
+            )
+        return _rows()
+
+    mock_neptune.query.side_effect = route
+
+    resp = client.get(
+        f"/graphs/{TENANT}/explore/kgs/{KG}/drift-history", headers=auth_headers
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kg"] == KG
+    assert len(body["snapshots"]) == 1
+    s = body["snapshots"][0]
+    assert s["floor_cov"] == 20.0
+    assert s["floor_count"] == 5
+    assert s["kept"] == 1 and s["quarantined"] == 1
+    cov = {c["key"]: c for c in s["coverages"]}
+    assert set(cov) == {"MPN.issuedby", "RetailerSKU.issuedby"}
+    assert cov["MPN.issuedby"]["coverage"] == 5.99
+    assert cov["MPN.issuedby"]["kept"] is False
+    assert cov["RetailerSKU.issuedby"]["kept"] is True
+
+
+def test_get_drift_history_empty_when_no_data(client, mock_neptune, auth_headers):
+    """No persisted history yet → an empty snapshots list, not an error."""
+    mock_neptune.query.side_effect = lambda *a, **k: _rows()
+    resp = client.get(
+        f"/graphs/{TENANT}/explore/kgs/{KG}/drift-history", headers=auth_headers
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"kg": KG, "snapshots": []}

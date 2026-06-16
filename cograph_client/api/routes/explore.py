@@ -14,6 +14,8 @@ to a live scan so it always returns correct data.
 import asyncio
 import hashlib
 import time
+import uuid
+from datetime import datetime, timezone
 
 import structlog
 from fastapi import APIRouter, Depends, Query
@@ -67,6 +69,36 @@ _STAT_REL = _STATS_NS + "rel"
 _STAT_TARGET = _STATS_NS + "targetType"
 _STAT_ENTITY_COUNT = _STATS_NS + "entityCount"
 
+# --- Drift history graph (COG-57) ---------------------------------------------
+# The observe-only mode (ADR 0004 §7) computes the per-relationship coverage
+# distribution on every recompute but only *logs* it (CloudWatch, 30-day
+# retention) — so "collect enough data to set the floor from real data" was just
+# log-scraping that ages out. COG-57 persists each recompute's distribution to a
+# per-KG **drift-history named graph** instead: a durable, SPARQL-queryable store
+# the floor can later be calibrated from (and the histogram built over).
+#
+# The graph is APPEND-only (one snapshot per recompute), never DROP+rewritten
+# like the stats graph — the whole value is the distribution accumulating over
+# time. Each snapshot node carries the run's effective floors + kept/quarantined
+# totals; each relationship in the distribution is a point node linked back to
+# its snapshot. Integers/decimals/booleans are typed literals so a downstream
+# query can aggregate them numerically without parsing.
+_DRIFT_NS = "https://cograph.tech/drift/"
+_DRIFT_RECORDED_AT = _DRIFT_NS + "recordedAt"      # xsd:dateTime
+_DRIFT_KG = _DRIFT_NS + "kg"                        # kg name (provenance)
+_DRIFT_FLOOR_COV = _DRIFT_NS + "floorCov"          # xsd:decimal
+_DRIFT_FLOOR_COUNT = _DRIFT_NS + "floorCount"      # xsd:integer
+_DRIFT_KEPT = _DRIFT_NS + "kept"                   # xsd:integer (count)
+_DRIFT_QUARANTINED = _DRIFT_NS + "quarantined"     # xsd:integer (count)
+_DRIFT_POINT_OF = _DRIFT_NS + "pointOf"            # point -> snapshot node
+_DRIFT_KEY = _DRIFT_NS + "key"                     # "<TypeLeaf>.<predLeaf>"
+_DRIFT_COVERAGE = _DRIFT_NS + "coverage"           # xsd:decimal (percent)
+_DRIFT_SUPPORT = _DRIFT_NS + "support"             # xsd:integer
+_DRIFT_SOURCE_COUNT = _DRIFT_NS + "sourceCount"    # xsd:integer
+_DRIFT_IS_CORE = _DRIFT_NS + "isCoreSlot"          # xsd:boolean
+_DRIFT_POINT_KEPT = _DRIFT_NS + "pointKept"        # xsd:boolean (per-relationship)
+_XSD = "http://www.w3.org/2001/XMLSchema#"
+
 # --- Primary-type attribution (COG-35, follow-up to ADR 0001 multi-typing) ----
 # With multi-typing an instance can carry more than one asserted rdf:type (its
 # `also_types` co-classifications, e.g. an entity asserted as both Employee and
@@ -116,6 +148,11 @@ def _target_from_entity_uri(obj: str) -> str | None:
 
 def _stats_graph_uri(tenant_id: str, kg_name: str) -> str:
     return kg_graph_uri(tenant_id, kg_name) + "/stats"
+
+
+def _drift_history_graph_uri(tenant_id: str, kg_name: str) -> str:
+    """Per-KG append-only graph holding the observe-only drift distribution (COG-57)."""
+    return kg_graph_uri(tenant_id, kg_name) + "/drift-history"
 
 
 def _stat_node(type_uri_str: str, pred_uri: str) -> str:
@@ -651,7 +688,62 @@ async def _build_drift_report(
         # the floor should ultimately be set from (not the hand-tuned 20%).
         coverages=report["coverages"],
     )
+    # COG-57: also persist the distribution to a durable, queryable store so it
+    # survives past CloudWatch's 30-day log retention. Best-effort — a history
+    # write must never fail a recompute (it is observability, not correctness).
+    await _persist_drift_history(client, tenant_id, kg_name, report)
     return report
+
+
+def _typed(value: object, xsd_type: str) -> str:
+    """Render a typed literal: ``"<value>"^^<xsd:...>``."""
+    return f'"{value}"^^<{_XSD}{xsd_type}>'
+
+
+async def _persist_drift_history(
+    client: NeptuneClient, tenant_id: str, kg_name: str, report: dict
+) -> None:
+    """Append one drift-report snapshot to the per-KG drift-history graph (COG-57).
+
+    Writes the run's effective floors + kept/quarantined totals as a snapshot
+    node, plus one point node per relationship in ``report["coverages"]`` (the
+    full distribution, kept and quarantined alike). APPEND-only — never DROPs the
+    graph — so the distribution accumulates across recomputes and tenants/KGs,
+    which is the data ADR 0004 needs to set ``OMNIX_DRIFT_FLOOR_COV`` from a real
+    histogram instead of the hand-calibrated 20%.
+
+    Wrapped in try/except: persistence is observability, so a Neptune write
+    failure here is logged and swallowed rather than failing the recompute.
+    """
+    hist = _drift_history_graph_uri(tenant_id, kg_name)
+    snap = f"{_DRIFT_NS}snap/{uuid.uuid4().hex}"
+    recorded_at = datetime.now(timezone.utc).isoformat()
+
+    triples = [
+        f"<{snap}> <{_DRIFT_RECORDED_AT}> {_typed(recorded_at, 'dateTime')} ; "
+        f'<{_DRIFT_KG}> "{_esc(kg_name)}" ; '
+        f"<{_DRIFT_FLOOR_COV}> {_typed(report['floor_cov'], 'decimal')} ; "
+        f"<{_DRIFT_FLOOR_COUNT}> {_typed(report['floor_count'], 'integer')} ; "
+        f"<{_DRIFT_KEPT}> {_typed(report['kept'], 'integer')} ; "
+        f"<{_DRIFT_QUARANTINED}> {_typed(report['quarantined'], 'integer')} ."
+    ]
+    for c in report.get("coverages", []):
+        pt = f"{snap}/p/{hashlib.md5(c['key'].encode()).hexdigest()}"
+        triples.append(
+            f"<{pt}> <{_DRIFT_POINT_OF}> <{snap}> ; "
+            f'<{_DRIFT_KEY}> "{_esc(c["key"])}" ; '
+            f"<{_DRIFT_COVERAGE}> {_typed(c['coverage'], 'decimal')} ; "
+            f"<{_DRIFT_SUPPORT}> {_typed(c['support'], 'integer')} ; "
+            f"<{_DRIFT_SOURCE_COUNT}> {_typed(c['source_count'], 'integer')} ; "
+            f"<{_DRIFT_IS_CORE}> {_typed(str(bool(c['is_core_slot'])).lower(), 'boolean')} ; "
+            f"<{_DRIFT_POINT_KEPT}> {_typed(str(bool(c['kept'])).lower(), 'boolean')} ."
+        )
+
+    body = "\n".join(triples)
+    try:
+        await client.update(f"INSERT DATA {{ GRAPH <{hist}> {{\n{body}\n}} }}")
+    except Exception:
+        logger.warning("drift_history_persist_failed", tenant=tenant_id, kg=kg_name, exc_info=True)
 
 
 async def drop_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> None:
@@ -662,7 +754,11 @@ async def drop_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> 
     the deleted graph's stale counts until the next recompute lands.
     """
     stats = _stats_graph_uri(tenant_id, kg_name)
-    await client.update(f"DROP SILENT GRAPH <{stats}>")
+    hist = _drift_history_graph_uri(tenant_id, kg_name)
+    # Drop the drift-history graph too (COG-57): its URI is derived from the KG
+    # name, so a KG recreated under the same name would otherwise inherit the
+    # deleted KG's distribution. Matches the stats-graph cleanup rationale above.
+    await client.update(f"DROP SILENT GRAPH <{stats}> ; DROP SILENT GRAPH <{hist}>")
     for key in [k for k in _summary_cache if k[0] == tenant_id and k[1] == kg_name]:
         _summary_cache.pop(key, None)
 
@@ -809,6 +905,93 @@ async def recompute_stats(
     """
     schedule_recompute(client, tenant.tenant_id, kg_name)
     return {"status": "scheduled", "kg": kg_name}
+
+
+@router.get("/kgs/{kg_name}/drift-history")
+async def get_drift_history(
+    kg_name: str,
+    limit: int = Query(100, ge=1, le=1000),
+    tenant: TenantContext = Depends(get_tenant),
+    client: NeptuneClient = Depends(get_neptune_client),
+):
+    """Read the accumulated observe-only drift distribution for a KG (COG-57).
+
+    Returns the persisted recompute snapshots (newest first), each with the run's
+    effective floors, kept/quarantined totals, and the full per-relationship
+    coverage distribution. This is the durable, queryable replacement for
+    log-scraping CloudWatch — the data ADR 0004 sets ``OMNIX_DRIFT_FLOOR_COV``
+    from. Raw distribution access only; histogram/floor analysis is done offline.
+    """
+    hist = _drift_history_graph_uri(tenant.tenant_id, kg_name)
+    q = (
+        f"SELECT ?snap ?recordedAt ?floorCov ?floorCount ?kept ?quarantined "
+        f"?key ?coverage ?support ?sourceCount ?isCore ?pointKept\n"
+        f"FROM <{hist}> WHERE {{\n"
+        f"  ?snap <{_DRIFT_RECORDED_AT}> ?recordedAt ;\n"
+        f"        <{_DRIFT_FLOOR_COV}> ?floorCov ;\n"
+        f"        <{_DRIFT_FLOOR_COUNT}> ?floorCount ;\n"
+        f"        <{_DRIFT_KEPT}> ?kept ;\n"
+        f"        <{_DRIFT_QUARANTINED}> ?quarantined .\n"
+        f"  OPTIONAL {{\n"
+        f"    ?pt <{_DRIFT_POINT_OF}> ?snap ;\n"
+        f"        <{_DRIFT_KEY}> ?key ;\n"
+        f"        <{_DRIFT_COVERAGE}> ?coverage ;\n"
+        f"        <{_DRIFT_SUPPORT}> ?support ;\n"
+        f"        <{_DRIFT_SOURCE_COUNT}> ?sourceCount ;\n"
+        f"        <{_DRIFT_IS_CORE}> ?isCore ;\n"
+        f"        <{_DRIFT_POINT_KEPT}> ?pointKept .\n"
+        f"  }}\n"
+        f"}} ORDER BY DESC(?recordedAt)"
+    )
+    try:
+        _, rows = parse_sparql_results(await client.query(q))
+    except Exception:
+        logger.warning("drift_history_read_failed", tenant=tenant.tenant_id, kg=kg_name, exc_info=True)
+        return {"kg": kg_name, "snapshots": []}
+
+    # Reassemble flat (snapshot × point) rows into nested snapshots, preserving
+    # the recordedAt-desc order. A snapshot with no points (empty distribution)
+    # still appears, with coverages == [].
+    snapshots: dict[str, dict] = {}
+    for r in rows:
+        sid = r.get("snap", "")
+        if not sid:
+            continue
+        snap = snapshots.get(sid)
+        if snap is None:
+            snap = {
+                "recorded_at": r.get("recordedAt", ""),
+                "floor_cov": _to_float(r.get("floorCov")),
+                "floor_count": _to_int(r.get("floorCount")),
+                "kept": _to_int(r.get("kept")),
+                "quarantined": _to_int(r.get("quarantined")),
+                "coverages": [],
+            }
+            snapshots[sid] = snap
+        if r.get("key"):
+            snap["coverages"].append({
+                "key": r["key"],
+                "coverage": _to_float(r.get("coverage")),
+                "support": _to_int(r.get("support")),
+                "source_count": _to_int(r.get("sourceCount")),
+                "is_core_slot": r.get("isCore") == "true",
+                "kept": r.get("pointKept") == "true",
+            })
+    return {"kg": kg_name, "snapshots": list(snapshots.values())[:limit]}
+
+
+def _to_int(v: str | None) -> int:
+    try:
+        return int(v) if v not in (None, "") else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _to_float(v: str | None) -> float:
+    try:
+        return float(v) if v not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @router.post("/kgs/{kg_name}/er-rebuild")
