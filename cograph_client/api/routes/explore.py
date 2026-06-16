@@ -641,11 +641,15 @@ async def _build_drift_report(
         "drift_report",
         tenant=tenant_id,
         kg=kg_name,
+        observe_only=drift_control.observe_only(),
         floor_cov=report["floor_cov"],
         floor_count=report["floor_count"],
         kept=report["kept"],
         quarantined=report["quarantined"],
         quarantine=report["quarantine"],
+        # Full per-relationship coverage distribution — the observe-only signal
+        # the floor should ultimately be set from (not the hand-tuned 20%).
+        coverages=report["coverages"],
     )
     return report
 
@@ -772,15 +776,18 @@ async def get_type_edges(
     from the overview, while high-coverage and core-slot edges are kept. With
     the flag OFF the read is byte-identical to before (no filtering).
     """
-    drift_on = drift_control.drift_control_enabled()
+    # ACT only when enabled AND not observe-only. Observe-only collects the
+    # coverage distribution (via the recompute drift report) without touching the
+    # overview, so the floor can be set from real data before it filters anything.
+    drift_on = drift_control.drift_control_enabled() and not drift_control.observe_only()
     if drift_on:
         edges = await _read_edges_from_stats_drift(client, tenant.tenant_id, kg_name)
     else:
         edges = await _read_edges_from_stats(client, tenant.tenant_id, kg_name)
     if edges is None:
         # No materialized stats graph (legacy KG). The live scan must honor the
-        # drift floor too when the flag is ON, else below-floor drift edges leak
-        # into the overview for un-materialized KGs. Flag OFF: unchanged scan.
+        # drift floor too when ACTING, else below-floor drift edges leak into the
+        # overview for un-materialized KGs. Observe-only / flag OFF: unchanged scan.
         kg_graph = kg_graph_uri(tenant.tenant_id, kg_name)
         if drift_on:
             edges = await _live_edge_scan_drift(client, kg_graph, tenant.tenant_id)

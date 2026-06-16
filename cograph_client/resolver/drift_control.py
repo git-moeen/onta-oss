@@ -48,6 +48,7 @@ DEFAULT_FLOOR_COUNT: int = 5
 
 # Env var names (single source of truth so callers/tests don't hardcode strings).
 ENV_ENABLED = "OMNIX_DRIFT_CONTROL"
+ENV_OBSERVE_ONLY = "OMNIX_DRIFT_OBSERVE_ONLY"
 ENV_FLOOR_COV = "OMNIX_DRIFT_FLOOR_COV"
 ENV_FLOOR_COUNT = "OMNIX_DRIFT_FLOOR_COUNT"
 
@@ -62,6 +63,21 @@ def drift_control_enabled() -> bool:
     test can flip it with ``monkeypatch.setenv`` mid-process.
     """
     return os.environ.get(ENV_ENABLED, "0") == "1"
+
+
+def observe_only() -> bool:
+    """True iff drift control should OBSERVE the distribution but NOT act.
+
+    When ON (with the feature enabled), the drift report is still computed and
+    logged on recompute — so the real per-relationship coverage distribution can
+    be collected in production — but the overview ``type-edges`` read is NOT
+    filtered, so there is zero user-visible behavior change. This is the
+    de-risking mode (ADR 0004): set the floor from a measured distribution across
+    many KGs instead of trusting the hand-calibrated 20%. ``act`` =
+    ``drift_control_enabled() and not observe_only()``. Only meaningful when
+    ``OMNIX_DRIFT_CONTROL=1``; default OFF.
+    """
+    return os.environ.get(ENV_OBSERVE_ONLY, "0") == "1"
 
 
 def env_floor_cov() -> float:
@@ -201,10 +217,29 @@ def drift_report(
         }
         for d in split.quarantine
     ]
+    # Full per-declaration coverage distribution — the observe-only payload. The
+    # whole point of the de-risking mode is to set the floor from the REAL spread
+    # of relationship coverages across many KGs, so the report carries EVERY
+    # declaration (kept + quarantined), not only the below-floor ones.
+    coverages = [
+        {
+            "key": d["key"],
+            "coverage": round(coverage(int(d["support"]), int(d["source_count"])), 2),
+            "support": int(d["support"]),
+            "source_count": int(d["source_count"]),
+            "is_core_slot": _is_core(d),
+            "kept": should_declare(
+                int(d["support"]), int(d["source_count"]), _is_core(d),
+                floor_cov=cov, floor_count=count,
+            ),
+        }
+        for d in declarations
+    ]
     return {
         "floor_cov": cov,
         "floor_count": count,
         "kept": len(split.keep),
         "quarantined": len(split.quarantine),
         "quarantine": quarantine,
+        "coverages": coverages,
     }
