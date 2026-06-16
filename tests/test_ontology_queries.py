@@ -9,6 +9,7 @@ from cograph_client.graph.ontology_queries import (
     get_type_functions_query,
     get_full_ontology_query,
     mark_core_slot,
+    retract_object_property,
     set_object_property_range,
     type_uri,
     attr_uri,
@@ -133,4 +134,17 @@ def test_set_object_property_range():
     assert type_uri("Product") in sparql
     assert "range" in sparql
     # The old range is matched optionally so a predicate with no range yet still upgrades.
+    assert "OPTIONAL" in sparql
+
+
+def test_retract_object_property():
+    # ADR 0004 §4 reconciliation: a quarantined relationship must stop being a
+    # declared type-level edge, so its rdfs:range AND rdfs:domain are deleted.
+    sparql = retract_object_property(GRAPH, "ManufacturerPartNumber", "issuedby")
+    assert "DELETE" in sparql
+    assert f"<{GRAPH}>" in sparql
+    assert attr_uri("ManufacturerPartNumber", "issuedby") in sparql
+    assert "range" in sparql
+    assert "domain" in sparql
+    # OPTIONAL match makes the retraction no-op-safe (missing range/domain is fine).
     assert "OPTIONAL" in sparql

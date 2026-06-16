@@ -939,11 +939,28 @@ class TestInferSchemaV2Retry:
 
 
 class TestV2RefuteTemplates:
-    """Conversion of corrected schemas for each of the six refutation
+    """Conversion of corrected schemas for each of the refutation
     templates (ADR 0003 Pass C). The mocked refute output mirrors the repair
     each template demands; the converter must honor it. Template 1's
     synthetic-key repair is covered by the Grainger-shape test above — the
     composite repair is covered here."""
+
+    def test_refute_prompt_lists_all_seven_templates(self):
+        """The REFUTE system prompt enumerates the original six structural
+        templates plus the ADR 0004 drift template (#7)."""
+        for name in (
+            "KEY DROPS ROWS",
+            "DIMENSION AS LITERAL",
+            "COLUMN-NAMED EDGE",
+            "KEYLESS ENTITY",
+            "DUPLICATE/DEAD ATTR",
+            "LOST KEY",
+            "SPARSE / MIS-DOMAINED EDGE",
+        ):
+            assert name in REFUTE_SYSTEM
+        # The drift template is numbered 7 and stays domain-free (structural
+        # wording: coverage / source type / predicate — no domain nouns).
+        assert "7. SPARSE / MIS-DOMAINED EDGE" in REFUTE_SYSTEM
 
     @pytest.mark.asyncio
     async def test_t1_key_drops_rows_corrected_to_composite(self, monkeypatch):

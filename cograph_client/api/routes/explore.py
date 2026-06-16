@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import time
 
+import structlog
 from fastapi import APIRouter, Depends, Query
 
 from cograph_client.api.deps import get_neptune_client
@@ -23,8 +24,17 @@ from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.ontology_queries import type_uri
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
+from cograph_client.resolver import drift_control
+
+logger = structlog.stdlib.get_logger("cograph.explore")
 
 router = APIRouter(prefix="/graphs/{tenant}/explore")
+
+# Ontology core-slot marker (ADR 0003 §3 / Pass D) — written by
+# ontology_queries.mark_core_slot as `<attr_uri> <onto/coreSlot> "true"`. A core
+# slot is EXEMPT from the ADR 0004 drift floor (always declared), so the edge
+# filter must know whether the upgraded predicate carries this marker.
+_CORE_SLOT_PRED = "https://cograph.tech/onto/coreSlot"
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 RDF_PROPERTY = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
@@ -307,6 +317,73 @@ async def _read_edges_from_stats(
     return out
 
 
+async def _read_edges_from_stats_drift(
+    client: NeptuneClient, tenant_id: str, kg_name: str
+) -> list[tuple[str, str]] | None:
+    """ADR 0004 drift-gated variant of :func:`_read_edges_from_stats`.
+
+    Same instance-derived ``targetType`` edges, but each is additionally tagged
+    with its **support** (the ``_STAT_REL`` entity-valued-object total), the
+    **source type's entity count** (``entityCount``), and whether the upgraded
+    predicate is a **core slot** (the ``onto/coreSlot`` marker that
+    ``mark_core_slot`` writes in the ontology graph, keyed by the predicate URI).
+
+    An edge is kept only when ``drift_control.should_declare(support,
+    source_count, is_core_slot)`` is True — i.e. it clears the coverage+count
+    floor, or is a core slot (exempt). Below-floor edges (the
+    ``ManufacturerPartNumber.issuedby -> Retailer`` 6%-coverage shape) are
+    excluded from the overview. Returns None when no stat rows carry a target,
+    so the caller can fall back to a live scan (which is unfiltered — a fresh KG
+    without materialized stats predates drift control and must not regress).
+
+    Only invoked when the ``OMNIX_DRIFT_CONTROL`` flag is ON; with the flag OFF
+    the caller takes the unchanged :func:`_read_edges_from_stats` path.
+    """
+    stats = _stats_graph_uri(tenant_id, kg_name)
+    onto = tenant_graph_uri(tenant_id)
+    # Per targeted edge: source type, target type, support (rel), and the
+    # predicate URI (so we can join the ontology core-slot marker). entityCount
+    # for the source type lives on a separate stat triple, joined in by URI.
+    q = (
+        f"SELECT DISTINCT ?src ?tgt ?pred ?rel ?ec FROM <{stats}> WHERE {{\n"
+        f"  ?s <{_STAT_FOR_TYPE}> ?src ; <{_STAT_TARGET}> ?tgt ; <{_STAT_FOR_PRED}> ?pred .\n"
+        f"  OPTIONAL {{ ?s <{_STAT_REL}> ?rel }}\n"
+        f"  OPTIONAL {{ ?src <{_STAT_ENTITY_COUNT}> ?ec }}\n"
+        f"}}"
+    )
+    # Core-slot markers from the ontology graph, keyed by predicate (attr) URI.
+    core_q = (
+        f"SELECT DISTINCT ?attr FROM <{onto}> WHERE {{\n"
+        f"  ?attr <{_CORE_SLOT_PRED}> ?v .\n"
+        f"}}"
+    )
+    rows_raw, core_raw = await asyncio.gather(client.query(q), client.query(core_q))
+    _, rows = parse_sparql_results(rows_raw)
+    if not rows:
+        return None
+    _, core_rows = parse_sparql_results(core_raw)
+    core_slots = {r.get("attr", "") for r in core_rows if r.get("attr")}
+
+    out: list[tuple[str, str]] = []
+    for r in rows:
+        su, tu = r.get("src", ""), r.get("tgt", "")
+        if not (su.startswith(TYPE_URI_PREFIX) and tu.startswith(TYPE_URI_PREFIX)):
+            continue
+        try:
+            support = int(r.get("rel", "0") or "0")
+        except ValueError:
+            support = 0
+        try:
+            source_count = int(r.get("ec", "0") or "0")
+        except ValueError:
+            source_count = 0
+        is_core = r.get("pred", "") in core_slots
+        if not drift_control.should_declare(support, source_count, is_core):
+            continue
+        out.append((su[len(TYPE_URI_PREFIX):], tu[len(TYPE_URI_PREFIX):]))
+    return out
+
+
 async def _live_edge_scan(client: NeptuneClient, kg_graph: str) -> list[tuple[str, str]]:
     """Fallback: derive type→type edges straight from instance triples.
 
@@ -356,6 +433,12 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
 
     entity_counts: dict[str, int] = {}
     triples: list[str] = []
+    # ADR 0004: raw type-level relationship declarations (type_uri, pred_uri,
+    # support). Source counts are resolved AFTER the loop, once entity_counts is
+    # fully populated (rows are grouped by type+pred, so a type's rdf:type count
+    # row may come after its predicate rows). Only collected when the flag is ON.
+    drift_enabled = drift_control.drift_control_enabled()
+    rel_decls: list[tuple[str, str, int]] = []
     for r in rows:
         type_uri_str = r.get("type", "")
         leaf = type_uri_str[len(TYPE_URI_PREFIX):] if type_uri_str.startswith(TYPE_URI_PREFIX) else ""
@@ -383,6 +466,10 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
         if target:
             stat += f" ; <{_STAT_TARGET}> <{TYPE_URI_PREFIX}{target}>"
         triples.append(stat + " .")
+        # A type-level relationship is a predicate carrying entity-valued
+        # objects (rel > 0). Those are the declarations the drift floor gates.
+        if drift_enabled and rel > 0:
+            rel_decls.append((type_uri_str, p_uri, rel))
     for type_uri_str, n in entity_counts.items():
         triples.append(f"<{type_uri_str}> <{_STAT_ENTITY_COUNT}> {n} .")
 
@@ -399,7 +486,61 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
     for key in [k for k in _summary_cache if k[0] == tenant_id and k[1] == kg_name]:
         _summary_cache.pop(key, None)
 
-    return {"types": len(entity_counts), "predicate_rows": len(triples) - len(entity_counts)}
+    result = {"types": len(entity_counts), "predicate_rows": len(triples) - len(entity_counts)}
+    if drift_enabled:
+        result["drift"] = await _build_drift_report(
+            client, tenant_id, kg_name, rel_decls, entity_counts
+        )
+    return result
+
+
+async def _build_drift_report(
+    client: NeptuneClient,
+    tenant_id: str,
+    kg_name: str,
+    rel_decls: list[tuple[str, str, int]],
+    entity_counts: dict[str, int],
+) -> dict:
+    """Build + log the ADR 0004 drift report for a recompute pass (flag ON only).
+
+    Resolves each raw relationship declaration into the ``{key, support,
+    source_count, is_core_slot}`` shape ``drift_control.drift_report`` consumes:
+    source_count is the source type's entity count; ``is_core_slot`` reads the
+    ``onto/coreSlot`` marker (keyed by predicate URI) from the ontology graph.
+    The report (effective floors + kept/quarantined split) is returned and
+    logged so the drift dashboard / tenant changelog can read it.
+    """
+    onto = tenant_graph_uri(tenant_id)
+    core_q = (
+        f"SELECT DISTINCT ?attr FROM <{onto}> WHERE {{\n"
+        f"  ?attr <{_CORE_SLOT_PRED}> ?v .\n"
+        f"}}"
+    )
+    _, core_rows = parse_sparql_results(await client.query(core_q))
+    core_slots = {r.get("attr", "") for r in core_rows if r.get("attr")}
+
+    declarations: list[dict] = []
+    for type_uri_str, pred_uri, support in rel_decls:
+        type_leaf = type_uri_str[len(TYPE_URI_PREFIX):] if type_uri_str.startswith(TYPE_URI_PREFIX) else type_uri_str
+        pred_leaf = pred_uri.rstrip("/").split("/")[-1]
+        declarations.append({
+            "key": f"{type_leaf}.{pred_leaf}",
+            "support": support,
+            "source_count": entity_counts.get(type_uri_str, 0),
+            "is_core_slot": pred_uri in core_slots,
+        })
+    report = drift_control.drift_report(declarations)
+    logger.info(
+        "drift_report",
+        tenant=tenant_id,
+        kg=kg_name,
+        floor_cov=report["floor_cov"],
+        floor_count=report["floor_count"],
+        kept=report["kept"],
+        quarantined=report["quarantined"],
+        quarantine=report["quarantine"],
+    )
+    return report
 
 
 async def drop_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> None:
@@ -517,8 +658,17 @@ async def get_type_edges(
     exists in the data but whose ontology range was never upgraded to a type
     URI (e.g. a predicate first seen as a primitive attribute) is now drawn in
     both places. Returns ``[{source, target, weight}]``.
+
+    ADR 0004 (flag ``OMNIX_DRIFT_CONTROL``): when ON, the stats read also
+    respects the support floor — a low-support drift edge (e.g.
+    ``ManufacturerPartNumber.issuedby -> Retailer`` at 6% coverage) is excluded
+    from the overview, while high-coverage and core-slot edges are kept. With
+    the flag OFF the read is byte-identical to before (no filtering).
     """
-    edges = await _read_edges_from_stats(client, tenant.tenant_id, kg_name)
+    if drift_control.drift_control_enabled():
+        edges = await _read_edges_from_stats_drift(client, tenant.tenant_id, kg_name)
+    else:
+        edges = await _read_edges_from_stats(client, tenant.tenant_id, kg_name)
     if edges is None:
         kg_graph = kg_graph_uri(tenant.tenant_id, kg_name)
         edges = await _live_edge_scan(client, kg_graph)

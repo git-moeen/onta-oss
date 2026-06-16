@@ -63,6 +63,38 @@ def set_object_property_range(graph_uri: str, type_name: str, attr_name: str, ta
     )
 
 
+def retract_object_property(graph_uri: str, type_name: str, attr_name: str) -> str:
+    """Retract a type-level object-property declaration to QUARANTINE (ADR 0004 §4).
+
+    The inverse of :func:`set_object_property_range`: when reconciliation finds a
+    non-core relationship whose live support has fallen below the drift floor, it
+    must stop being a *declared* type-level edge. The schema-only Explorer
+    overview keys an edge on the property having an ``rdfs:range`` that points at
+    a ``types/`` URI and an ``rdfs:domain`` on the source type; deleting BOTH
+    triples removes the edge from the overview while leaving the underlying
+    instance triples untouched (row conservation, ADR 0003 §2 — only the schema
+    *declaration* is withheld, the data still ingests).
+
+    Quarantine-not-delete (ADR 0004 §2) is the *caller's* responsibility — it
+    records support/source/timestamp in the quarantine store before issuing this
+    retraction. This builder is the deterministic SPARQL half: it removes exactly
+    the range and domain triples for ``attr_name`` and nothing else. The
+    ``OPTIONAL`` wrappers make it a no-op-safe retraction (a property already
+    missing its range or domain still retracts cleanly, no error).
+    """
+    a_uri = attr_uri(type_name, attr_name)
+    return (
+        f"DELETE {{ GRAPH <{graph_uri}> {{\n"
+        f"  <{a_uri}> <{RDFS}#range> ?range .\n"
+        f"  <{a_uri}> <{RDFS}#domain> ?domain .\n"
+        f"}} }}\n"
+        f"WHERE {{ GRAPH <{graph_uri}> {{\n"
+        f"  OPTIONAL {{ <{a_uri}> <{RDFS}#range> ?range }}\n"
+        f"  OPTIONAL {{ <{a_uri}> <{RDFS}#domain> ?domain }}\n"
+        f"}} }}"
+    )
+
+
 def mark_core_slot(graph_uri: str, type_name: str, slot_name: str) -> str:
     """Mark one of ``type_name``'s declared attributes/relationship slots as
     CONSTITUTIVE (a core slot, ADR 0003 §3 / Pass D).
