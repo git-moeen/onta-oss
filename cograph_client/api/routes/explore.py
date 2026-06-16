@@ -381,7 +381,16 @@ async def _read_edges_from_stats_drift(
             source_count = int(r.get("ec", "0") or "0")
         except ValueError:
             source_count = 0
-        is_core = r.get("pred", "") in core_slots
+        # ?pred is the INSTANCE predicate URI (…/onto/<pred>), not an attr URI.
+        # core_slots holds ontology attr URIs, so derive the matching attr URI
+        # from the source-type leaf + predicate leaf (same join the live scan does).
+        src_leaf = su[len(TYPE_URI_PREFIX):]
+        p_uri = r.get("pred", "")
+        pred_leaf = (
+            p_uri[len(ONTO_PRED_PREFIX):] if p_uri.startswith(ONTO_PRED_PREFIX)
+            else p_uri.rstrip("/").split("/")[-1]
+        )
+        is_core = attr_uri(src_leaf, pred_leaf) in core_slots
         if not drift_control.should_declare(support, source_count, is_core):
             continue
         out.append((su[len(TYPE_URI_PREFIX):], tu[len(TYPE_URI_PREFIX):]))
@@ -482,7 +491,6 @@ async def _live_edge_scan_drift(
 
     _, edge_rows = parse_sparql_results(edge_raw)
     out: list[tuple[str, str]] = []
-    _dbg: list[dict] = []  # TEMP (ADR 0004 in-path trial): per-edge decision trace
     for r in edge_rows:
         tu = r.get("type", "")
         src = tu[len(TYPE_URI_PREFIX):] if tu.startswith(TYPE_URI_PREFIX) else ""
@@ -502,14 +510,9 @@ async def _live_edge_scan_drift(
             else p_uri.rstrip("/").split("/")[-1]
         )
         is_core = attr_uri(src, pred_leaf) in core_slots
-        keep = drift_control.should_declare(support, source_count, is_core)
-        _dbg.append({"edge": f"{src}.{pred_leaf}->{tgt}", "support": support,
-                     "source_count": source_count, "is_core": is_core, "keep": keep})
-        if not keep:
+        if not drift_control.should_declare(support, source_count, is_core):
             continue
         out.append((src, tgt))
-    logger.info("drift_ls_trace", kg_graph=kg_graph,
-                core_slot_count=len(core_slots), decisions=_dbg)
     return out
 
 
@@ -629,7 +632,9 @@ async def _build_drift_report(
             "key": f"{type_leaf}.{pred_leaf}",
             "support": support,
             "source_count": entity_counts.get(type_uri_str, 0),
-            "is_core_slot": pred_uri in core_slots,
+            # pred_uri is …/onto/<pred>; core_slots holds ontology attr URIs, so
+            # match on attr_uri(type_leaf, pred_leaf), not the raw predicate URI.
+            "is_core_slot": attr_uri(type_leaf, pred_leaf) in core_slots,
         })
     report = drift_control.drift_report(declarations)
     logger.info(

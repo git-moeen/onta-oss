@@ -352,3 +352,133 @@ async def test_recompute_drift_report_when_flag_on(mock_neptune, monkeypatch):
     assert quarantined_keys == {"MPN.issuedby"}
     assert report["quarantine"][0]["support"] == 41
     assert report["quarantine"][0]["coverage"] == 5.99
+
+
+# --- core-slot exemption: attr_uri match, not raw predicate URI ---------------
+# These prove the bug fix in BOTH the stats-drift read and _build_drift_report:
+# ?pred/pred_uri there is the INSTANCE predicate URI (…/onto/<pred>), while the
+# core-slot query returns ontology ATTR URIs (…/types/<Type>/attrs/<pred>). The
+# old `pred in core_slots` comparison could NEVER match, so a sparse core slot
+# was wrongly quarantined. The fix joins on attr_uri(<srcLeaf>, <predLeaf>).
+#
+# A sparse edge: MPNcore.issuedby at 41/685 (6%) — below the 20% floor, so it is
+# kept ONLY if its core-slot marker is honored. The core marker lives at the
+# attr URI; the stats/recompute rows carry the …/onto/ instance predicate.
+MPNCORE_ISSUEDBY_ONTO = ONTO + "issuedby"                  # instance predicate URI
+MPNCORE_ISSUEDBY_ATTR = TYPES + "MPNcore/attrs/issuedby"   # ontology attr URI (core marker)
+
+
+def _edges_drift_core_router(*, core_slots=()):
+    """Drift-aware stats read (flag ON) with a SPARSE edge on an …/onto/ predicate.
+
+    The single edge MPNcore->Retailer is sparse (41/685 = 6%, below floor). Its
+    ``?pred`` is the INSTANCE predicate URI (…/onto/issuedby) exactly as the real
+    stats graph stores it — so the old ``pred in core_slots`` comparison (which
+    expects an attr URI) can never match it, and the fix's attr_uri join is what
+    exercises the core-slot exemption.
+    """
+    def route(sparql, *a, **k):
+        if "coreSlot" in sparql:
+            return _rows(*({"attr": c} for c in core_slots))
+        if "targetType" in sparql and "forPred" in sparql:
+            return _rows(
+                {"src": TYPES + "MPNcore", "tgt": TYPES + "Retailer",
+                 "pred": MPNCORE_ISSUEDBY_ONTO, "rel": "41", "ec": "685"},
+            )
+        return _rows()
+
+    return route
+
+
+def test_flag_on_stats_sparse_core_slot_kept_via_attr_uri(client, mock_neptune, auth_headers, monkeypatch):
+    """Flag ON, stats materialized: a sparse edge on a CORE slot is KEPT (exempt).
+
+    MPNcore.issuedby at 41/685 (6%) is below the 20% floor, but its attr URI is
+    marked a core slot, so it must survive. ?pred in the stats read is the
+    instance URI (…/onto/issuedby), so this only passes with the attr_uri join —
+    the old ``pred in core_slots`` comparison would wrongly drop it.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _edges_drift_core_router(core_slots=(MPNCORE_ISSUEDBY_ATTR,))
+
+    resp = client.get(f"/graphs/{TENANT}/explore/kgs/{KG}/type-edges", headers=auth_headers)
+    assert resp.status_code == 200
+    pairs = {tuple(sorted((e["source"], e["target"]))) for e in resp.json()}
+
+    assert ("MPNcore", "Retailer") in pairs   # sparse but core-slot exempt -> kept
+
+
+def test_flag_on_stats_sparse_non_core_slot_excluded(client, mock_neptune, auth_headers, monkeypatch):
+    """Flag ON, stats materialized: the SAME sparse edge WITHOUT a core marker is dropped.
+
+    The companion to the test above — confirms 6% coverage is genuinely below the
+    floor, so the core-slot exemption (not some pass-through) is what saved it.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _edges_drift_core_router(core_slots=())  # nothing marked core
+
+    resp = client.get(f"/graphs/{TENANT}/explore/kgs/{KG}/type-edges", headers=auth_headers)
+    assert resp.status_code == 200
+    pairs = {tuple(sorted((e["source"], e["target"]))) for e in resp.json()}
+
+    assert ("MPNcore", "Retailer") not in pairs   # sparse, no core marker -> excluded
+
+
+def _recompute_core_router(*, core_slots=()):
+    """Whole-KG recompute scan where the sparse predicate is an …/onto/ instance URI.
+
+    MPNcore has 685 instances and a sparse issuedby relationship (41/685 = 6%).
+    The scan's ``?p`` is the INSTANCE predicate URI (…/onto/issuedby), as the real
+    recompute scan reads it — so _build_drift_report's old ``pred_uri in
+    core_slots`` (attr URIs) never matched, wrongly quarantining the core slot.
+    The fix joins on attr_uri(type_leaf, pred_leaf).
+    """
+    def route(sparql, *a, **k):
+        if "coreSlot" in sparql:
+            return _rows(*({"attr": c} for c in core_slots))
+        if "?e ?p ?o" in sparql and "GROUP BY" in sparql:
+            return _rows(
+                {"type": TYPES + "MPNcore", "p": RDF_TYPE, "cnt": "685", "rel": "0"},
+                {"type": TYPES + "MPNcore", "p": MPNCORE_ISSUEDBY_ONTO,
+                 "cnt": "41", "rel": "41", "sample": ENTITIES + "Retailer/r1"},
+            )
+        return _rows()
+
+    return route
+
+
+@pytest.mark.asyncio
+async def test_recompute_sparse_core_slot_kept_not_quarantined(mock_neptune, monkeypatch):
+    """Flag ON recompute: a sparse CORE-slot relationship is reported as KEPT.
+
+    MPNcore.issuedby (41/685, 6%) is below the floor but is a core slot, so it
+    must NOT be quarantined. The recompute scan's predicate is the …/onto/
+    instance URI, so this passes only with the attr_uri join in
+    _build_drift_report — the old ``pred_uri in core_slots`` would quarantine it.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _recompute_core_router(core_slots=(MPNCORE_ISSUEDBY_ATTR,))
+
+    out = await explore.recompute_kg_stats(mock_neptune, TENANT, KG)
+    report = out["drift"]
+    assert report["kept"] == 1          # MPNcore.issuedby exempt -> kept
+    assert report["quarantined"] == 0   # core slot must NOT be quarantined
+    assert report["quarantine"] == []
+
+
+@pytest.mark.asyncio
+async def test_recompute_sparse_non_core_slot_quarantined(mock_neptune, monkeypatch):
+    """Flag ON recompute: the SAME sparse relationship WITHOUT a core marker quarantines.
+
+    Companion to the test above: 41/685 (6%) is genuinely below the floor, so
+    without the core marker it is held for review — proving the exemption (not a
+    pass-through) is what kept the core case.
+    """
+    monkeypatch.setenv("OMNIX_DRIFT_CONTROL", "1")
+    mock_neptune.query.side_effect = _recompute_core_router(core_slots=())  # nothing marked core
+
+    out = await explore.recompute_kg_stats(mock_neptune, TENANT, KG)
+    report = out["drift"]
+    assert report["kept"] == 0
+    assert report["quarantined"] == 1
+    assert {q["key"] for q in report["quarantine"]} == {"MPNcore.issuedby"}
