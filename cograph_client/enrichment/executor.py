@@ -177,6 +177,11 @@ class EnrichmentExecutor:
 
             # Load ontology-driven strategy. Always returns a TypeStrategy.
             strategy = await load_strategy(self._neptune, tenant_id, job.type_name)
+            # Cache-key version for this strategy. A change here auto-invalidates
+            # the cache (different key -> clean miss). TODO(ADR-0005 §2): the ADR
+            # wants a real strategy_version field on TypeStrategy/AttributeStrategy;
+            # derive a stable string until that lands.
+            strategy_version = str(getattr(strategy, "version", "v1"))
             # Track which adapter names were missing so we warn once per job.
             missing_adapter_names: set[str] = set()
 
@@ -239,6 +244,7 @@ class EnrichmentExecutor:
                             job,
                             missing_adapter_names,
                             effective_confidence,
+                            strategy_version,
                         )
                         best = self._pick_best(verdicts, effective_confidence)
 
@@ -324,16 +330,25 @@ class EnrichmentExecutor:
                 pass
 
     async def _lookup(
-        self, entity_label: str, attribute: str, job: EnrichJob, cache_hit_inc: bool
+        self,
+        entity_label: str,
+        attribute: str,
+        job: EnrichJob,
+        cache_hit_inc: bool,
+        strategy_version: str = "v1",
     ) -> list[Verdict]:
         source = self._wikidata.name
-        cached = await self._cache.get(entity_label, attribute, source)
+        cached = await self._cache.get(
+            entity_label, attribute, source, job.type_name, strategy_version
+        )
         if cached is not None:
             if cache_hit_inc:
                 job.progress.cache_hits += 1
             return cached
         verdicts = await self._wikidata.lookup(entity_label, attribute, {})
-        await self._cache.put(entity_label, attribute, source, verdicts)
+        await self._cache.put(
+            entity_label, attribute, source, verdicts, job.type_name, strategy_version
+        )
         return verdicts
 
     async def _lookup_chain(
@@ -344,6 +359,7 @@ class EnrichmentExecutor:
         job: EnrichJob,
         missing: set[str],
         confidence_min: float,
+        strategy_version: str = "v1",
     ) -> list[Verdict]:
         """Walk an adapter chain, returning verdicts from the first adapter
         that yields one with confidence >= confidence_min.
@@ -369,7 +385,9 @@ class EnrichmentExecutor:
                         tier=job.tier.value if hasattr(job.tier, "value") else str(job.tier),
                     )
                 continue
-            cached = await self._cache.get(entity_label, attribute, adapter.name)
+            cached = await self._cache.get(
+                entity_label, attribute, adapter.name, job.type_name, strategy_version
+            )
             if cached is not None:
                 if not cache_hit_counted:
                     job.progress.cache_hits += 1
@@ -386,7 +404,14 @@ class EnrichmentExecutor:
                         error=str(exc),
                     )
                     verdicts = []
-                await self._cache.put(entity_label, attribute, adapter.name, verdicts)
+                await self._cache.put(
+                    entity_label,
+                    attribute,
+                    adapter.name,
+                    verdicts,
+                    job.type_name,
+                    strategy_version,
+                )
             # Stop at first sufficient-confidence verdict.
             if any(v.confidence >= confidence_min for v in verdicts):
                 return verdicts

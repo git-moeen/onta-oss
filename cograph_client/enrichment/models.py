@@ -43,11 +43,35 @@ class EnrichRequest(BaseModel):
 
 
 class Verdict(BaseModel):
+    """A single enrichment candidate value with provenance (ADR-0005 §5).
+
+    Two distinct confidence signals are intentionally kept separate:
+
+    - ``confidence`` is the CALIBRATED score. It is the only value the
+      tier-chain threshold (e.g. ``confidence_min``) compares against. A
+      calibrated score is meant to approximate the probability that the
+      value is correct.
+    - ``raw_confidence`` is an untrusted, relevance-ish signal straight from
+      a source (e.g. an Exa neural relevance score). It is NEVER compared to
+      a threshold; it exists only for diagnostics/debugging and as input to a
+      calibration step that produces ``confidence``.
+
+    All provenance fields are optional with a ``None`` default so legacy
+    construction ``Verdict(value=..., confidence=..., source=...)`` keeps
+    working unchanged.
+    """
+
     value: str
     confidence: float
     source: str
     source_url: Optional[str] = None
     reasoning: Optional[str] = None
+    raw_confidence: Optional[float] = None
+    retrieved_at: Optional[datetime] = None
+    source_published_at: Optional[datetime] = None
+    grounding_score: Optional[float] = None
+    extraction_method: Optional[str] = None
+    calibration_method: Optional[str] = None
 
 
 RowAction = Literal["filled", "verified", "conflict", "skipped", "no_match"]

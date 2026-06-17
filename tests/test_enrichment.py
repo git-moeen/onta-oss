@@ -131,6 +131,49 @@ def test_cache_get_put():
     asyncio.run(run())
 
 
+def test_cache_key_normalizes_label_and_versions(monkeypatch):
+    """ADR-0005 §2 cache keying:
+
+    (a) "City", "city", and "  City  " produce the SAME key (normalized label).
+    (b) Changing strategy_version produces a DIFFERENT key (clean miss).
+    """
+    from cograph_client.enrichment import cache as cache_mod
+
+    # (a) Normalized-label equivalence at the key level.
+    k1 = cache_mod._key("Place", "City", "name", "v1", "wikidata")
+    k2 = cache_mod._key("Place", "city", "name", "v1", "wikidata")
+    k3 = cache_mod._key("Place", "  City  ", "name", "v1", "wikidata")
+    assert k1 == k2 == k3
+    assert cache_mod._normalize_label("  City  ") == "city"
+    # Internal whitespace runs collapse to a single space.
+    assert cache_mod._normalize_label("New   York") == "new york"
+
+    async def run():
+        cache = EnrichmentCache()
+        v = Verdict(value="Springfield", confidence=0.95, source="wikidata")
+
+        # Put under one strategy_version, then read back with label variants.
+        await cache.put(
+            "City", "name", "wikidata", [v],
+            entity_type="Place", strategy_version="v1",
+        )
+        for variant in ("City", "city", "  City  "):
+            hit = await cache.get(
+                variant, "name", "wikidata",
+                entity_type="Place", strategy_version="v1",
+            )
+            assert hit is not None and hit[0].value == "Springfield"
+
+        # (b) A different strategy_version is a cache miss (auto-invalidation).
+        miss = await cache.get(
+            "City", "name", "wikidata",
+            entity_type="Place", strategy_version="v2",
+        )
+        assert miss is None
+
+    asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # Wikidata adapter
 # ---------------------------------------------------------------------------
@@ -999,3 +1042,48 @@ def test_enrichment_plugin_invalid_format_logged(monkeypatch):
     monkeypatch.setattr(settings, "enrichment_plugin", "no_colon_here")
     # Must not raise.
     app_module.create_app()
+
+
+# ---------------------------------------------------------------------------
+# Verdict provenance contract (ADR-0005 §5)
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_backcompat_and_provenance():
+    # (1) Legacy construction still works; new fields default to None.
+    legacy = Verdict(value="Bosch GmbH", confidence=0.95, source="wikidata")
+    assert legacy.value == "Bosch GmbH"
+    assert legacy.confidence == 0.95
+    assert legacy.source == "wikidata"
+    assert legacy.raw_confidence is None
+    assert legacy.retrieved_at is None
+    assert legacy.source_published_at is None
+    assert legacy.grounding_score is None
+    assert legacy.extraction_method is None
+    assert legacy.calibration_method is None
+
+    # (2) A fully-populated verdict round-trips through model_dump/model_validate.
+    retrieved = datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc)
+    published = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    full = Verdict(
+        value="Robert Bosch GmbH",
+        confidence=0.91,
+        source="exa",
+        source_url="https://example.com/bosch",
+        reasoning="matched on company registry",
+        raw_confidence=0.42,
+        retrieved_at=retrieved,
+        source_published_at=published,
+        grounding_score=0.88,
+        extraction_method="llm-extract",
+        calibration_method="isotonic",
+    )
+    dumped = full.model_dump()
+    restored = Verdict.model_validate(dumped)
+    assert restored == full
+    assert restored.raw_confidence == 0.42
+    assert restored.retrieved_at == retrieved
+    assert restored.source_published_at == published
+    assert restored.grounding_score == 0.88
+    assert restored.extraction_method == "llm-extract"
+    assert restored.calibration_method == "isotonic"
