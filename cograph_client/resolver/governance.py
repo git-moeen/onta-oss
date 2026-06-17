@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from collections import deque
 from datetime import datetime, timezone
 from typing import Literal, Protocol
@@ -125,11 +126,17 @@ Return JSON:
 }}"""
 
 
+# OSS governance judge model — env-overridable; default preserves prior
+# behavior. The premium ShapeJudgePanel uses COGRAPH_GOV_JUDGE_MODEL (no default)
+# and overrides this panel entirely when registered.
+DEFAULT_GOV_JUDGE_MODEL = os.environ.get("OMNIX_GOV_JUDGE_MODEL", "claude-sonnet-4-6")
+
+
 class LLMJudgePanel:
     """Default panel: N independent LLM judges, mirroring the type-matcher's
     3-judge fan-out (temperature 0.7 for diversity, asyncio.gather)."""
 
-    def __init__(self, client, n_judges: int = 3, model: str = "claude-sonnet-4-6"):
+    def __init__(self, client, n_judges: int = 3, model: str = DEFAULT_GOV_JUDGE_MODEL):
         self._client = client
         self._n_judges = n_judges
         self._model = model

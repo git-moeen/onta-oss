@@ -144,6 +144,8 @@ class SchemaResolver:
     # Extraction model config — smart model, latency doesn't matter
     EXTRACT_MODEL = os.environ.get("OMNIX_EXTRACT_MODEL", "deepseek/deepseek-v3.2")
     EXTRACT_PROVIDER = os.environ.get("OMNIX_EXTRACT_PROVIDER", "openrouter")
+    # Anthropic extraction path — env-overridable; default preserves prior behavior.
+    INFER_MODEL = os.environ.get("OMNIX_INFER_MODEL", "claude-sonnet-4-6")
     ONTOLOGY_REFRESH_INTERVAL = int(os.environ.get("OMNIX_ONTOLOGY_REFRESH_INTERVAL", "50"))
 
     def __init__(
@@ -713,7 +715,7 @@ class SchemaResolver:
             text = await self._extract_via_openrouter(user_content)
         else:
             msg = await self._anthropic.messages.create(
-                model="claude-sonnet-4-6",
+                model=self.INFER_MODEL,
                 max_tokens=4096,
                 system=EXTRACTION_SYSTEM,
                 messages=[{"role": "user", "content": user_content}],

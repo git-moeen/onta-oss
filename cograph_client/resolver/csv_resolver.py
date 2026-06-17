@@ -470,6 +470,9 @@ columns JSON now."""
 class CSVResolver:
     EXTRACT_MODEL = os.environ.get("OMNIX_EXTRACT_MODEL", "deepseek/deepseek-v3.2")
     EXTRACT_PROVIDER = os.environ.get("OMNIX_EXTRACT_PROVIDER", "openrouter")
+    # Anthropic inference path for the v2 schema passes — env-overridable;
+    # default preserves prior behavior.
+    INFER_MODEL = os.environ.get("OMNIX_INFER_MODEL", "claude-sonnet-4-6")
 
     def __init__(self, client: anthropic.AsyncAnthropic, openrouter_key: str = ""):
         self._client = client
@@ -1142,7 +1145,7 @@ class CSVResolver:
         """Anthropic fallback for the v2 passes: free-form JSON (the pass
         output shapes differ, so no fixed output_config schema here)."""
         msg = await self._client.messages.create(
-            model="claude-sonnet-4-6",
+            model=self.INFER_MODEL,
             max_tokens=max_tokens,
             temperature=temperature,
             system=system,
@@ -1152,7 +1155,7 @@ class CSVResolver:
 
     async def _infer_via_anthropic(self, user_content: str, temperature: float = 0.0) -> dict:
         msg = await self._client.messages.create(
-            model="claude-sonnet-4-6",
+            model=self.INFER_MODEL,
             max_tokens=2048,
             temperature=temperature,
             system=CSV_SCHEMA_SYSTEM,
