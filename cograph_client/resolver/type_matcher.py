@@ -12,6 +12,8 @@ Cascade architecture (fast → slow):
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 import anthropic
@@ -21,6 +23,10 @@ from cograph_client.resolver.models import MatchVerdict, TypeMatch
 from cograph_client.resolver.verdict_cache import JsonVerdictCache, VerdictEntry
 
 logger = structlog.stdlib.get_logger("cograph.resolver.type_matcher")
+
+# Type-matching decision model (reuse-vs-expand verdict + ambiguous judge
+# fan-out) — env-overridable; default preserves prior behavior.
+MATCH_MODEL = os.environ.get("OMNIX_MATCH_MODEL", "claude-sonnet-4-6")
 
 # Embedding similarity thresholds
 EMBEDDING_SAME_THRESHOLD = 0.92
@@ -377,7 +383,7 @@ class TypeMatcher:
         desc_line = f'Description: "{proposed_description}"' if proposed_description else ""
 
         msg = await self._client.messages.create(
-            model="claude-sonnet-4-6",
+            model=MATCH_MODEL,
             max_tokens=256,
             system=MATCH_SYSTEM_PROMPT,
             messages=[{
@@ -416,7 +422,7 @@ class TypeMatcher:
 
         async def single_judge() -> dict:
             msg = await self._client.messages.create(
-                model="claude-sonnet-4-6",
+                model=MATCH_MODEL,
                 max_tokens=256,
                 temperature=0.7,  # diversity between judges
                 system=JUDGE_SYSTEM_PROMPT,

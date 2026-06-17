@@ -547,7 +547,10 @@ running container, causing 500 errors on in-flight requests.
 Additional env vars (not in Settings):
 - `OMNIX_QUERY_MODEL` — default `llama3.1-8b`
 - `OMNIX_QUERY_PROVIDER` — default `cerebras`
-- `OMNIX_EXTRACT_MODEL` — default `deepseek/deepseek-v3.2`
+- `OMNIX_EXTRACT_MODEL` — default `deepseek/deepseek-v3.2` (schema/entity extraction — the "propose" stage)
+- `OMNIX_INFER_MODEL` — default `claude-sonnet-4-6` (Anthropic inference/extraction path for the v2 schema passes)
+- `OMNIX_MATCH_MODEL` — default `claude-sonnet-4-6` (type matching: reuse-vs-expand verdict + ambiguous judge fan-out)
+- `OMNIX_GOV_JUDGE_MODEL` — default `claude-sonnet-4-6` (OSS governance judge panel; premium `ShapeJudgePanel` uses `COGRAPH_GOV_JUDGE_MODEL`)
 - `OMNIX_EVAL_MODEL` — default `deepseek/deepseek-v3.2`
 
 ## API Endpoints
