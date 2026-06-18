@@ -88,6 +88,10 @@ class ResolutionResult(BaseModel):
     applied: list[ResolvedChange] = Field(default_factory=list)
     proposals: list[ResolvedChange] = Field(default_factory=list)
     summary: str = ""
+    dry_run: bool = Field(
+        default=False,
+        description="True when the caller requested plan-only mode: nothing was written and every change is surfaced under `proposals`.",
+    )
 
 
 class ResolveRequest(BaseModel):
@@ -101,3 +105,13 @@ class ResolveRequest(BaseModel):
 
     ask: str = Field(min_length=1, description="Natural-language ontology-evolution request")
     knowledge_graph: str | None = Field(default=None, description="Optional KG scope hint")
+    dry_run: bool = Field(
+        default=False,
+        description=(
+            "Plan-only mode. When false (default, the MCP/agent path) the route "
+            "auto-applies the resolver's high-confidence changes and returns the "
+            "rest as proposals. When true (the interactive Explorer path) nothing "
+            "is written: every change — what would have auto-applied plus the "
+            "proposals — is returned under `proposals`, `applied` is empty."
+        ),
+    )

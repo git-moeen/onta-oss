@@ -93,6 +93,37 @@ def _load_governance_plugin() -> None:
         logger.error("governance_plugin_load_failed", plugin=spec, error=str(exc))
 
 
+def _load_router_plugins(app: FastAPI) -> None:
+    """Import and invoke the configured router plugins, if any.
+
+    Format: comma-separated "module.path:callable" entries. Each callable is
+    invoked with the FastAPI app instance and is expected to mount additional
+    routers via app.include_router(...). Failures are logged per-entry but do
+    not prevent the app from starting — the app simply runs with only the OSS
+    routers. This is a generic plugin protocol (no proprietary coupling): it
+    lets downstream deployments attach external routers (e.g. the premium
+    ontology recommender).
+    """
+    spec = settings.router_plugins.strip()
+    if not spec:
+        return
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            logger.warning("router_plugin_invalid_format", spec=entry)
+            continue
+        module_name, attr = entry.split(":", 1)
+        try:
+            module = importlib.import_module(module_name)
+            fn = getattr(module, attr)
+            fn(app)
+            logger.info("router_plugin_loaded", plugin=entry)
+        except Exception as exc:
+            logger.error("router_plugin_load_failed", plugin=entry, error=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging(settings.log_level)
@@ -128,6 +159,7 @@ def create_app() -> FastAPI:
     app.include_router(enrich.router, tags=["enrich"])
     app.include_router(explore.router, tags=["explore"])
     app.include_router(tenants.router, tags=["tenants"])
+    _load_router_plugins(app)
     return app
 
 

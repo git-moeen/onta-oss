@@ -75,6 +75,82 @@ def test_resolve_with_only_proposals_writes_nothing(client, auth_headers, mock_n
     assert mock_neptune.update.call_count == 0
 
 
+def test_resolve_dry_run_returns_everything_as_proposals_and_writes_nothing(
+    client, auth_headers, mock_neptune, monkeypatch
+):
+    """dry_run=True: the would-be-applied change AND the proposals all come back
+    under `proposals`, `applied` is empty, `dry_run` is echoed, and ZERO writes
+    hit Neptune."""
+    applied = ResolvedChange(
+        kind="attribute",
+        subject_type="Person",
+        name="age",
+        datatype_or_target="integer",
+        action="extend",
+        confidence=0.95,
+        reason="clear extend on existing Person",
+    )
+    proposal = ResolvedChange(
+        kind="relationship",
+        subject_type="Person",
+        name="works_at",
+        datatype_or_target="Company",
+        action="create",
+        confidence=0.4,
+        reason="new target type Company",
+    )
+    _patch_resolver(
+        monkeypatch,
+        ResolutionResult(applied=[applied], proposals=[proposal], summary="1 applied, 1 proposal"),
+    )
+
+    resp = client.post(
+        "/graphs/test-tenant/ontology/resolve",
+        headers=auth_headers,
+        json={"ask": "track a person's age and employer", "dry_run": True},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    # Plan-only: applied is empty, everything folded into proposals.
+    assert data["applied"] == []
+    assert data["dry_run"] is True
+    names = {p["name"] for p in data["proposals"]}
+    assert names == {"age", "works_at"}
+    # Nothing was written to Neptune (zero update calls).
+    assert mock_neptune.update.call_count == 0
+
+
+def test_resolve_default_omits_dry_run_and_still_auto_applies(
+    client, auth_headers, mock_neptune, monkeypatch
+):
+    """Default (dry_run unset) is byte-for-byte the prior behavior: the confident
+    change auto-applies and `dry_run` defaults to False in the response."""
+    applied = ResolvedChange(
+        kind="attribute",
+        subject_type="Person",
+        name="age",
+        datatype_or_target="integer",
+        action="extend",
+        confidence=0.95,
+        reason="clear extend on existing Person",
+    )
+    _patch_resolver(monkeypatch, ResolutionResult(applied=[applied], proposals=[], summary="1 applied"))
+
+    resp = client.post(
+        "/graphs/test-tenant/ontology/resolve",
+        headers=auth_headers,
+        json={"ask": "track how old a person is"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["applied"]) == 1
+    assert data["dry_run"] is False
+    # The confident change is still auto-applied (one upsert write).
+    assert mock_neptune.update.call_count == 1
+
+
 def test_apply_create_relationship_mints_target_and_property(client, auth_headers, mock_neptune):
     proposal = {
         "kind": "relationship",

@@ -39,6 +39,15 @@ class Settings(BaseSettings):
     # it, mapping-shape proposals are recorded pending (tenant-layer-only).
     governance_plugin: str = ""
 
+    # Optional router plugins: a comma-separated list of dotted
+    # "module.path:callable" entries imported at app startup. Each callable is
+    # invoked with the FastAPI app instance so it can mount additional routers
+    # via app.include_router(...). Keeps cograph-oss vendor-neutral while
+    # letting downstream deployments attach proprietary endpoints (e.g. the
+    # premium ontology recommender). Without it, only the OSS routers are
+    # mounted.
+    router_plugins: str = ""
+
     def get_api_keys_map(self) -> dict[str, str]:
         return json.loads(self.api_keys)
 

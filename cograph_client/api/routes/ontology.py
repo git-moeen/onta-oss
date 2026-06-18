@@ -252,10 +252,25 @@ async def resolve_ontology(
 ) -> ResolutionResult:
     """Resolve a fuzzy NL ask into ontology changes; auto-apply the confident
     ones, return ambiguous/new-type ones as proposals for the caller to confirm
-    via `POST .../ontology/apply`."""
+    via `POST .../ontology/apply`.
+
+    `dry_run=True` (the interactive Explorer path) is plan-only: the resolver
+    runs exactly as below but NOTHING is written to Neptune — every change (what
+    would have auto-applied plus the proposals) is returned under `proposals`,
+    with `applied` empty, so the UI can render one uniform reviewable list."""
     graph_uri = tenant_graph_uri(tenant.tenant_id)
     resolver = _build_resolver(graph_uri)
     result = await resolver.resolve(body.ask, graph_uri, client)
+
+    if body.dry_run:
+        # Plan-only: write nothing, fold the would-be-applied changes into the
+        # proposals list so the caller reviews everything uniformly.
+        return ResolutionResult(
+            applied=[],
+            proposals=result.applied + result.proposals,
+            summary=result.summary,
+            dry_run=True,
+        )
 
     for change in result.applied:
         await _apply_change(change, graph_uri, client)
