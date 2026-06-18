@@ -48,9 +48,10 @@ class FakeTypeMatcher:
         )
 
 
-def _make_resolver(verdicts, intents):
+def _make_resolver(verdicts, intents, backbone_links=None):
     """Build a resolver whose intent-parse returns ``intents`` and whose type
-    matcher returns the canned ``verdicts``."""
+    matcher returns the canned ``verdicts``. The backbone-scaffold call is
+    stubbed too (default: no links) so resolving stays offline."""
     resolver = OntologyResolver(
         openrouter_key="test-key",
         type_matcher=FakeTypeMatcher(verdicts),
@@ -59,7 +60,11 @@ def _make_resolver(verdicts, intents):
     async def fake_intent_llm(_user_content):
         return {"intents": intents}
 
+    async def fake_backbone_llm(_user_content):
+        return {"links": backbone_links or []}
+
     resolver._call_intent_llm = fake_intent_llm  # type: ignore[method-assign]
+    resolver._call_backbone_llm = fake_backbone_llm  # type: ignore[method-assign]
     return resolver
 
 
@@ -353,6 +358,43 @@ def test_build_inventory_separates_attributes_and_relationships():
     assert inv["Person"].relationship_predicates() == {"works_for"}
     schemas = inv["Person"].attribute_schemas()
     assert schemas["name"].datatype == "string"
+
+
+@pytest.mark.asyncio
+async def test_backbone_scaffolds_new_type_into_existing_types():
+    """Introducing a NEW entity type also proposes wiring it into the existing
+    ontology backbone (new Neighborhood → existing ZipCode / City), so the graph
+    stays connected. The backbone links come back as 'create' proposals."""
+    inventory = {
+        "PropertyListing": TypeInventory(name="PropertyListing", description="A listing"),
+        "ZipCode": TypeInventory(name="ZipCode"),
+        "City": TypeInventory(name="City"),
+    }
+    resolver = _make_resolver(
+        verdicts={"property listing": ("PropertyListing", MatchVerdict.SAME, 0.95)},
+        intents=[{
+            "subject_phrase": "property listing", "kind": "relationship",
+            "name_phrase": "located in neighborhood", "target_phrase": "neighborhood",
+        }],
+        backbone_links=[
+            {"subject_type": "neighborhood", "predicate": "in zip code", "target_type": "ZipCode"},
+            {"subject_type": "neighborhood", "predicate": "in city", "target_type": "City"},
+            # hallucinated target must be dropped
+            {"subject_type": "neighborhood", "predicate": "in state", "target_type": "State"},
+        ],
+    )
+
+    result = await resolver.resolve_with_inventory(
+        "I wanna know which neighborhood each property listing is at", "g", inventory
+    )
+
+    rels = {(c.subject_type, c.datatype_or_target) for c in result.proposals}
+    assert ("PropertyListing", "neighborhood") in rels      # the asked relationship
+    assert ("neighborhood", "ZipCode") in rels              # backbone link
+    assert ("neighborhood", "City") in rels                 # backbone link
+    assert ("neighborhood", "State") not in rels            # hallucinated target dropped
+    backbone = [c for c in result.proposals if c.subject_type == "neighborhood"]
+    assert all(c.action == "create" for c in backbone)
 
 
 def test_resolved_change_is_json_serializable():

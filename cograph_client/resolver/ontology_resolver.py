@@ -110,6 +110,44 @@ Ask: "{ask}"
 Decompose the ask into change intents and return the JSON now."""
 
 
+# When the resolver introduces a NEW entity type, this second (optional) LLM call
+# wires it into the EXISTING ontology backbone — the structural relationships the
+# new thing should have to types that already exist (a new Neighborhood belongs to
+# an existing City and ZipCode). Keeps expansion clean: new entities JOIN the
+# graph (and reach the rest of it transitively) instead of dangling.
+BACKBONE_SYSTEM_PROMPT = """\
+A knowledge-graph ontology is gaining one or more NEW entity types. Connect each
+new type into the EXISTING ontology so the graph stays well-linked.
+
+For each new type, propose the obvious STRUCTURAL real-world relationships it
+should have TO TYPES THAT ALREADY EXIST — especially containment / hierarchy (a
+neighborhood is in a city and belongs to a zip code; a department is in a
+company). This is what lets other entities reach the new one transitively (a
+listing already links to a zip code, so linking neighborhood→zip code ties every
+listing to its neighborhood).
+
+Hard rules:
+- target_type MUST be one of the EXISTING types listed, verbatim. Never target
+  another new type and never invent a type.
+- Prefer 1–3 high-confidence links per new type. Omit a new type entirely if
+  nothing obvious connects it.
+- "predicate" is a short relationship verb (e.g. "in_city", "in_zip_code",
+  "belongs_to").
+
+Respond with valid JSON only, no markdown:
+{"links": [{"subject_type": "<new type>", "predicate": "<verb>",
+"target_type": "<existing type>"}]}"""
+
+BACKBONE_USER_TEMPLATE = """\
+New entity types being added:
+{new_types}
+
+Existing types already in the ontology (the ONLY valid link targets):
+{existing_types}
+
+Propose how each new type connects into the existing types and return the JSON now."""
+
+
 class OntologyResolver:
     """Resolves a fuzzy ask into a structured ontology-change plan.
 
@@ -178,6 +216,12 @@ class OntologyResolver:
             else:  # "create"
                 proposals.append(change)
 
+        # Backbone scaffold: any NEW entity type this ask introduces gets wired
+        # into the existing ontology (e.g. a new Neighborhood → existing ZipCode /
+        # City), so the graph stays connected and other entities reach it
+        # transitively. Best-effort; emits 'create' proposals.
+        proposals.extend(await self._scaffold_backbone(applied + proposals, inventory))
+
         summary = _summarize(ask, applied, proposals)
         logger.info(
             "ontology_resolved",
@@ -212,13 +256,21 @@ class OntologyResolver:
         return [i for i in intents if isinstance(i, dict) and i.get("subject_phrase")]
 
     async def _call_intent_llm(self, user_content: str) -> dict:
-        """The single intent-parse LLM call. OpenRouter primary→fallback when a
-        key is configured (same as CSVResolver); Anthropic offline fallback
-        otherwise. Tests monkeypatch this."""
+        """The single intent-parse LLM call. Tests monkeypatch this."""
+        return await self._chat_json(INTENT_SYSTEM_PROMPT, user_content)
+
+    async def _call_backbone_llm(self, user_content: str) -> dict:
+        """The optional backbone-scaffold call (new types → existing types).
+        Tests monkeypatch this."""
+        return await self._chat_json(BACKBONE_SYSTEM_PROMPT, user_content)
+
+    async def _chat_json(self, system: str, user_content: str) -> dict:
+        """One JSON LLM call. OpenRouter primary→fallback when a key is configured
+        (same as CSVResolver); Anthropic offline fallback otherwise."""
         if self.EXTRACT_PROVIDER == "openrouter" and self._openrouter_key:
             text = await openrouter_chat(
                 self._openrouter_key,
-                INTENT_SYSTEM_PROMPT,
+                system,
                 user_content,
                 model=self.EXTRACT_MODEL,
                 temperature=0.0,
@@ -226,15 +278,96 @@ class OntologyResolver:
             )
             return json.loads(_strip_code_fences(text))
         if self._anthropic is None:
-            raise RuntimeError("no LLM provider configured for intent parse")
+            raise RuntimeError("no LLM provider configured")
         msg = await self._anthropic.messages.create(
             model=self.INFER_MODEL,
             max_tokens=1024,
             temperature=0.0,
-            system=INTENT_SYSTEM_PROMPT,
+            system=system,
             messages=[{"role": "user", "content": user_content}],
         )
         return json.loads(_strip_code_fences(msg.content[0].text))
+
+    # ── Backbone scaffold: wire new types into the existing ontology ──────
+
+    async def _scaffold_backbone(
+        self,
+        changes: list[ResolvedChange],
+        inventory: dict[str, "TypeInventory"],
+    ) -> list[ResolvedChange]:
+        """Wire each NEW entity type introduced by ``changes`` into the existing
+        ontology backbone via one extra LLM call (new types → existing types).
+        Returns extra 'create' relationship changes (so they surface as
+        proposals). Fails soft — any error yields no backbone links."""
+        existing = {name: inv.description for name, inv in inventory.items()}
+        existing_lower = {n.lower(): n for n in existing}
+
+        # New types = any type named by a 'create' change that isn't already in
+        # the ontology (a new relationship target or a new subject).
+        new_types: list[str] = []
+        seen: set[str] = set()
+        for c in changes:
+            if c.action != "create":
+                continue
+            cands = [c.subject_type]
+            if c.kind == "relationship":
+                cands.append(c.datatype_or_target)
+            for t in cands:
+                t = (t or "").strip()
+                if t and t.lower() not in existing_lower and t.lower() not in seen:
+                    seen.add(t.lower())
+                    new_types.append(t)
+        if not new_types or not existing:
+            return []
+
+        new_text = "\n".join(f'- "{t}"' for t in new_types)
+        existing_text = "\n".join(f'- "{n}"' for n in existing)
+        user = BACKBONE_USER_TEMPLATE.format(new_types=new_text, existing_types=existing_text)
+        try:
+            raw = await self._call_backbone_llm(user)
+        except Exception as exc:  # noqa: BLE001 — best-effort; never break the plan
+            logger.warning("backbone_scaffold_failed", error=str(exc))
+            return []
+
+        links = raw.get("links") if isinstance(raw, dict) else None
+        if not isinstance(links, list):
+            return []
+
+        new_lower = {t.lower() for t in new_types}
+        out: list[ResolvedChange] = []
+        emitted: set[tuple[str, str]] = set()
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            subj = str(link.get("subject_type", "")).strip()
+            target_raw = str(link.get("target_type", "")).strip()
+            verb = str(link.get("predicate", "")).strip()
+            if not (subj and target_raw and verb):
+                continue
+            if subj.lower() not in new_lower:
+                continue  # subject must be one of the new types
+            target = existing_lower.get(target_raw.lower())
+            if target is None:
+                continue  # target must already exist — drop hallucinations
+            predicate = normalize_predicate(verb, set())
+            key = (subj.lower(), predicate)
+            if key in emitted:
+                continue
+            emitted.add(key)
+            out.append(
+                ResolvedChange(
+                    kind="relationship",
+                    subject_type=subj,
+                    name=predicate,
+                    datatype_or_target=target,
+                    action="create",
+                    confidence=0.85,
+                    reason=f"wire new type '{subj}' into the ontology backbone: {subj} → {target}",
+                )
+            )
+        if out:
+            logger.info("backbone_scaffold", new_types=new_types, links=len(out))
+        return out
 
     # ── Steps 2–5: resolve one intent into a ResolvedChange ───────────────
 
