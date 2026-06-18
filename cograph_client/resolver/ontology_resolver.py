@@ -117,26 +117,38 @@ Decompose the ask into change intents and return the JSON now."""
 # graph (and reach the rest of it transitively) instead of dangling.
 BACKBONE_SYSTEM_PROMPT = """\
 A knowledge-graph ontology is gaining one or more NEW entity types. Connect each
-new type into the EXISTING ontology so the graph stays well-linked.
+new type into the EXISTING ontology so the graph stays well-linked — but model
+each link HONESTLY by reasoning about the real-world relationship. Do not copy a
+template: derive the direction and verb from how the two things actually relate.
 
-For each new type, propose the obvious STRUCTURAL real-world relationships it
-should have TO TYPES THAT ALREADY EXIST — especially containment / hierarchy (a
-neighborhood is in a city and belongs to a zip code; a department is in a
-company). This is what lets other entities reach the new one transitively (a
-listing already links to a zip code, so linking neighborhood→zip code ties every
-listing to its neighborhood).
+For each candidate link between a new type and an existing type, reason in two steps:
+
+1. CLASSIFY the relationship:
+   - "containment": a strict part-of hierarchy where each instance of one side
+     belongs to exactly ONE instance of the other (one-to-many) — the contained
+     side sits wholly inside its single parent.
+   - "association": the two relate but NEITHER strictly contains the other — an
+     instance of one maps to many of the other and vice versa (many-to-many),
+     including overlapping spatial or categorical units that cross-cut each other.
+
+2. DERIVE direction + verb from that classification and the real cardinality:
+   - containment → the predicate points from the CHILD to its single parent and
+     names the containment (e.g. "in_<parent>" / "part_of").
+   - association → use a NEUTRAL, non-hierarchical verb (e.g. "associated_with",
+     "covers", "overlaps"). Do NOT use "in_/belongs_to" for a many-to-many link —
+     it falsely asserts a single parent.
+   When unsure whether one side truly contains the other, treat it as association.
 
 Hard rules:
 - target_type MUST be one of the EXISTING types listed, verbatim. Never target
   another new type and never invent a type.
-- Prefer 1–3 high-confidence links per new type. Omit a new type entirely if
-  nothing obvious connects it.
-- "predicate" is a short relationship verb (e.g. "in_city", "in_zip_code",
-  "belongs_to").
+- Propose only links that genuinely hold; prefer the clearest 1–3. Omit a new
+  type entirely if nothing connects it.
 
 Respond with valid JSON only, no markdown:
 {"links": [{"subject_type": "<new type>", "predicate": "<verb>",
-"target_type": "<existing type>"}]}"""
+"target_type": "<existing type>", "relation": "containment"|"association",
+"cardinality": "one-to-many"|"many-to-many", "rationale": "<one line>"}]}"""
 
 BACKBONE_USER_TEMPLATE = """\
 New entity types being added:
@@ -354,6 +366,21 @@ class OntologyResolver:
             if key in emitted:
                 continue
             emitted.add(key)
+            # Surface the model's own classification so the proposed direction is
+            # auditable (an "association / many-to-many" tells the reviewer the
+            # arrow is nominal, not a true parent).
+            tag = ", ".join(
+                p for p in (
+                    str(link.get("relation", "")).strip().lower(),
+                    str(link.get("cardinality", "")).strip().lower(),
+                ) if p
+            )
+            note = str(link.get("rationale", "")).strip()
+            reason = f"wire new type '{subj}' into the ontology: {subj} → {target}"
+            if tag:
+                reason += f" ({tag})"
+            if note:
+                reason += f" — {note}"
             out.append(
                 ResolvedChange(
                     kind="relationship",
@@ -362,7 +389,7 @@ class OntologyResolver:
                     datatype_or_target=target,
                     action="create",
                     confidence=0.85,
-                    reason=f"wire new type '{subj}' into the ontology backbone: {subj} → {target}",
+                    reason=reason,
                 )
             )
         if out:
