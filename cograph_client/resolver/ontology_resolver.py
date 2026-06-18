@@ -72,8 +72,9 @@ ONE relationship to ONE subject type.
 
 For each intent return:
 - "subject_phrase": the entity/type the change is ABOUT (e.g. "person", "company").
-- "kind": "attribute" for a literal property (a date, number, name, status, text),
-  "relationship" when the value is ANOTHER entity/type the subject links to.
+- "kind": "attribute" for an intrinsic literal of the subject (a date, number,
+  price, measurement, flag, code, or free text), "relationship" when the value IS
+  another entity/type the subject links to.
 - "name_phrase": a short name for the property or the relationship verb
   (e.g. "birth date", "works for", "headquartered in").
 - "target_phrase": for a relationship ONLY — the type the relationship points at
@@ -81,11 +82,19 @@ For each intent return:
 - "datatype_hint": for an attribute ONLY — one of string, integer, float,
   boolean, datetime, uri. Omit for relationships.
 
-Rules:
-- If the value is another real-world entity (a company, a place, a person), the
-  kind is "relationship" and you MUST set target_phrase.
-- If the value is a primitive (a date, a count, a name string, a flag), the kind
-  is "attribute" and you SHOULD set datatype_hint.
+Rules — PREFER ENTITIES OVER LABELS (reification):
+- If the value NAMES a real-world thing that has its own identity — a place
+  (neighborhood, city, region, zip code), an organization, a category, a person —
+  make it a "relationship" and set target_phrase to that thing. This holds EVEN
+  when the ask says "name of …": the name lives ON that entity, so link to the
+  entity instead of copying its label onto the subject. (e.g. "the neighborhood
+  name each property is in" → relationship, target_phrase "neighborhood" — NOT a
+  "neighborhood_name" string.)
+- Especially prefer a relationship when an existing type below already represents
+  the thing (or something it clearly connects to) — reuse the ontology backbone.
+- Use "attribute" (with datatype_hint) ONLY for intrinsic literals of the subject
+  itself: dates, counts, prices, measurements, flags, codes, free text, and the
+  subject's OWN proper name.
 - One ask may imply several intents — return all of them.
 
 Respond with valid JSON only, no markdown:
