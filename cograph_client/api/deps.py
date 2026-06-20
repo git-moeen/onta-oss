@@ -2,7 +2,7 @@ from fastapi import Request
 
 from cograph_client.enrichment.cache import get_enrichment_cache
 from cograph_client.enrichment.executor import EnrichmentExecutor
-from cograph_client.enrichment.job_store import get_job_store
+from cograph_client.enrichment.job_store import make_job_store
 from cograph_client.enrichment.sources.wikidata import WikidataAdapter
 from cograph_client.graph.client import NeptuneClient
 
@@ -13,7 +13,7 @@ def get_neptune_client(request: Request) -> NeptuneClient:
 
 def _ensure_enrichment_state(state) -> None:
     if getattr(state, "enrichment_job_store", None) is None:
-        state.enrichment_job_store = get_job_store()
+        state.enrichment_job_store = make_job_store()
     if getattr(state, "enrichment_cache", None) is None:
         state.enrichment_cache = get_enrichment_cache()
     if getattr(state, "enrichment_wikidata", None) is None:

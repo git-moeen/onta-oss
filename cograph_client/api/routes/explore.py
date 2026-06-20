@@ -16,9 +16,11 @@ import hashlib
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any, Optional
 
 import structlog
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 
 from cograph_client.api.deps import get_neptune_client
 from cograph_client.auth.api_keys import TenantContext, get_tenant
@@ -136,6 +138,46 @@ _PRIMARY_TYPE_GUARD = (
     f"&& STR(?type2) < STR(?type))\n"
     f"  }}\n"
 )
+
+
+# --- Paged per-type records (COG-100) -----------------------------------------
+# The Explorer "Data" table renders instances of a type as rows with one column
+# per attribute (name, gtin, mpn, brand, price, weight, …). Default page size and
+# the hard ceiling that protects Neptune from an unbounded scan.
+_RECORDS_DEFAULT_LIMIT = 50
+_RECORDS_MAX_LIMIT = 200
+
+
+class TypeRecordsResponse(BaseModel):
+    """One page of entity instances of a type, shaped for a table view.
+
+    ``columns`` lists the column keys present in ``rows`` in display order:
+    always ``uri`` and ``label`` first, then the type's attribute local-names.
+    Each row is a dict keyed by those columns. ``total`` is the full instance
+    count (for "X of Y records"); ``has_more``/``next_cursor`` drive "Load more".
+    """
+
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    total: int
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+
+
+def _parse_cursor(cursor: Optional[str]) -> int:
+    """Decode the opaque pagination cursor to a non-negative SPARQL OFFSET.
+
+    The cursor is just a stringified integer offset. Anything unparseable or
+    negative is treated as the start of the result set (offset 0) rather than
+    erroring, so a malformed cursor degrades gracefully.
+    """
+    if not cursor:
+        return 0
+    try:
+        offset = int(cursor)
+    except (TypeError, ValueError):
+        return 0
+    return offset if offset > 0 else 0
 
 
 def _target_from_entity_uri(obj: str) -> str | None:
@@ -855,6 +897,141 @@ async def get_type_summary(
     result = _assemble_summary(type_name, onto_row, parent_type, entity_count, pred_records, attr_defs)
     _summary_cache[cache_key] = (time.monotonic(), result)
     return result
+
+
+@router.get("/kgs/{kg_name}/types/{type_name}/records", response_model=TypeRecordsResponse)
+async def get_type_records(
+    kg_name: str,
+    type_name: str,
+    limit: int = Query(_RECORDS_DEFAULT_LIMIT, ge=1, le=_RECORDS_MAX_LIMIT),
+    cursor: Optional[str] = Query(None),
+    tenant: TenantContext = Depends(get_tenant),
+    client: NeptuneClient = Depends(get_neptune_client),
+):
+    """One page of entity instances of a type, as table rows with attribute columns.
+
+    Powers the Explorer "Data" table so it doesn't hand-roll SPARQL in the
+    browser. Returns ``uri`` + ``label`` columns followed by one column per
+    attribute local-name (e.g. name/gtin/mpn/brand/price/weight), plus the total
+    instance count for "X of Y records" and a ``next_cursor`` / ``has_more`` pair
+    for the "Load more" button.
+
+    Pagination: ``limit`` defaults to 50 and is clamped to 200; ``cursor`` is an
+    opaque stringified SPARQL OFFSET (default 0, parsed defensively). Rows are
+    ordered by entity URI for stable paging. We over-fetch one row (``LIMIT
+    {limit+1}``) to decide ``has_more`` without a second count query.
+
+    Multi-valued attributes are collapsed to a **sorted list** of distinct values
+    (via SPARQL ``GROUP_CONCAT`` with a unit-separator delimiter, then split back
+    in Python). Single-valued attributes therefore arrive as a one-element list;
+    a missing attribute is omitted from the row dict entirely. ``label`` and
+    ``uri`` are always scalars.
+    """
+    kg_graph = kg_graph_uri(tenant.tenant_id, kg_name)
+    t_uri = type_uri(type_name)
+    offset = _parse_cursor(cursor)
+
+    # 1) Total instance count (for "X of Y") and 2) the discovered attribute
+    # predicates for this type — both small, run concurrently. Attribute columns
+    # come from the predicates actually attached to instances of the type, minus
+    # rdf:type and system predicates; literal-valued only (entity-valued objects
+    # are relationships, not table columns).
+    count_sparql = (
+        f"SELECT (COUNT(DISTINCT ?e) AS ?n) FROM <{kg_graph}> WHERE {{\n"
+        f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
+        f"}}"
+    )
+    pred_sparql = (
+        f"SELECT DISTINCT ?p FROM <{kg_graph}> WHERE {{\n"
+        f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
+        f"  ?e ?p ?o .\n"
+        f"  FILTER(isLiteral(?o))\n"
+        f'  FILTER(?p != <{RDF_TYPE}>)\n'
+        f"}} ORDER BY ?p"
+    )
+    count_raw, pred_raw = await asyncio.gather(
+        client.query(count_sparql),
+        client.query(pred_sparql),
+    )
+
+    _, count_rows = parse_sparql_results(count_raw)
+    try:
+        total = int(count_rows[0].get("n", "0")) if count_rows else 0
+    except (ValueError, TypeError):
+        total = 0
+
+    _, pred_rows = parse_sparql_results(pred_raw)
+    # Preserve discovery order (URI-sorted) while building column local-names.
+    # rdfs:label is surfaced as the dedicated `label` column, not an attribute.
+    attr_preds: list[tuple[str, str]] = []  # (predicate_uri, local_name)
+    seen_names: set[str] = set()
+    for r in pred_rows:
+        p_uri = r.get("p", "")
+        if not p_uri or p_uri == RDF_TYPE or p_uri in SYSTEM_PREDICATES:
+            continue
+        local = p_uri.rstrip("/").split("/")[-1].split("#")[-1]
+        if not local or local in seen_names:
+            continue
+        seen_names.add(local)
+        attr_preds.append((p_uri, local))
+
+    columns = ["uri", "label"] + [name for _, name in attr_preds]
+
+    # 3) The page itself. One OPTIONAL per attribute, each aggregated with
+    # GROUP_CONCAT(DISTINCT) so multi-valued attrs collapse to a delimited string
+    # we split back in Python. Group by ?e and order by ?e for stable paging.
+    # Over-fetch one row to compute has_more without another round-trip.
+    _DELIM = ""  # ASCII unit separator — safe vs. real attribute text
+    select_vars = ["?e", "(SAMPLE(?lbl) AS ?label)"]
+    where_parts = [
+        f"  ?e <{RDF_TYPE}> <{t_uri}> .",
+        f"  OPTIONAL {{ ?e <{RDFS}#label> ?lbl }}",
+    ]
+    for i, (p_uri, _name) in enumerate(attr_preds):
+        var = f"?a{i}"
+        select_vars.append(
+            f'(GROUP_CONCAT(DISTINCT {var}; SEPARATOR="{_DELIM}") AS ?v{i})'
+        )
+        where_parts.append(f"  OPTIONAL {{ ?e <{p_uri}> {var} . FILTER(isLiteral({var})) }}")
+
+    rows_sparql = (
+        f"SELECT {' '.join(select_vars)} FROM <{kg_graph}> WHERE {{\n"
+        + "\n".join(where_parts)
+        + f"\n}} GROUP BY ?e ORDER BY ?e LIMIT {limit + 1} OFFSET {offset}"
+    )
+    _, page_rows = parse_sparql_results(await client.query(rows_sparql))
+
+    has_more = len(page_rows) > limit
+    page_rows = page_rows[:limit]
+
+    rows: list[dict[str, Any]] = []
+    for r in page_rows:
+        uri = r.get("e", "")
+        if not uri:
+            continue
+        row: dict[str, Any] = {"uri": uri}
+        label = r.get("label", "")
+        if label:
+            row["label"] = label
+        for i, (_p_uri, name) in enumerate(attr_preds):
+            concat = r.get(f"v{i}", "")
+            if not concat:
+                continue
+            # GROUP_CONCAT yields a delimited string; split + sort distinct values
+            # so a single-valued attr is a one-element list and order is stable.
+            values = sorted({v for v in concat.split(_DELIM) if v != ""})
+            if values:
+                row[name] = values
+        rows.append(row)
+
+    next_cursor = str(offset + limit) if has_more else None
+    return TypeRecordsResponse(
+        columns=columns,
+        rows=rows,
+        total=total,
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
 
 
 @router.get("/kgs/{kg_name}/type-edges")

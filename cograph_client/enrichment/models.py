@@ -25,6 +25,31 @@ class JobStatus(str, Enum):
     failed = "failed"
 
 
+class JobCategory(str, Enum):
+    """The kind of work a job performs.
+
+    The unified Jobs page lists jobs across all three categories. Existing
+    enrichment jobs default to ``enrichment`` for backward compatibility.
+    """
+
+    dedupe = "dedupe"
+    enrichment = "enrichment"
+    reconciliation = "reconciliation"
+
+
+class JobTrigger(str, Enum):
+    """How a job was kicked off.
+
+    Today everything is ``manual`` (a user clicked an action). ``scheduled``
+    and ``webhook`` are reserved for future automation — populated by callers,
+    no scheduling logic lives here yet (TODO).
+    """
+
+    manual = "manual"
+    scheduled = "scheduled"
+    webhook = "webhook"
+
+
 class ConflictPolicy(str, Enum):
     skip = "skip"
     verify = "verify"
@@ -112,6 +137,14 @@ class EnrichJob(BaseModel):
     error: Optional[str] = None
     limit: Optional[int] = None
     results: list[RowResult] = Field(default_factory=list)
+    # COG-101: unified-jobs fields. All optional with safe defaults so existing
+    # enrichment-job construction keeps working unchanged.
+    category: JobCategory = JobCategory.enrichment
+    trigger: JobTrigger = JobTrigger.manual
+    last_run: Optional[datetime] = None
+    next_run: Optional[datetime] = None
+    cost: Optional[float] = None
+    cost_note: Optional[str] = None
 
 
 class JobSummary(BaseModel):
@@ -129,6 +162,15 @@ class JobSummary(BaseModel):
     conflict_policy: ConflictPolicy
     confidence_min: float = 0.85
     error: Optional[str] = None
+    # COG-101: unified-jobs fields.
+    category: JobCategory = JobCategory.enrichment
+    trigger: JobTrigger = JobTrigger.manual
+    last_run: Optional[datetime] = None
+    next_run: Optional[datetime] = None
+    cost: Optional[float] = None
+    cost_note: Optional[str] = None
+    # Derived 0-100 completion percentage from progress.processed/total.
+    progress_pct: int = 0
 
 
 ReviewDecision = Literal["accept", "reject", "skip"]
@@ -140,6 +182,18 @@ class ConflictReview(BaseModel):
     existing_value: str
     proposed: Verdict
     decision: Optional[ReviewDecision] = None
+
+
+def _progress_pct(progress: JobProgress) -> int:
+    """Derive a 0-100 completion percentage from processed/total.
+
+    Returns 0 when total is unknown (0) to avoid division-by-zero; clamps to
+    [0, 100] so a stray over-count can never report >100.
+    """
+    if not progress.total:
+        return 0
+    pct = round(progress.processed / progress.total * 100)
+    return max(0, min(100, pct))
 
 
 def job_to_summary(job: EnrichJob) -> JobSummary:
@@ -158,4 +212,11 @@ def job_to_summary(job: EnrichJob) -> JobSummary:
         conflict_policy=job.conflict_policy,
         confidence_min=job.confidence_min,
         error=job.error,
+        category=job.category,
+        trigger=job.trigger,
+        last_run=job.last_run,
+        next_run=job.next_run,
+        cost=job.cost,
+        cost_note=job.cost_note,
+        progress_pct=_progress_pct(job.progress),
     )

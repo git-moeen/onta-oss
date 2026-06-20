@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     embeddings_s3_prefix: str = "omnix/embeddings"
     embeddings_top_k: int = 15
 
+    # Optional Postgres DSN (env OMNIX_DATABASE_URL). When set, the durable
+    # PostgresJobStore is used for tracked jobs; when empty, jobs are kept in
+    # process memory. This is a GENERIC DSN — any Postgres (local, Aurora, Neon,
+    # Supabase, ...) — and intentionally carries no cloud-provider identifiers.
+    database_url: str = ""
+
     # Optional auth plugin: a dotted "module.path:callable" that will be
     # imported at app startup. The callable is invoked with no arguments
     # and is expected to register an external API key verifier via
