@@ -1000,6 +1000,195 @@ def _to_float(v: str | None) -> float:
         return 0.0
 
 
+@router.get("/kgs/{kg_name}/types/{type_name}/records")
+async def get_type_records(
+    kg_name: str,
+    type_name: str,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: str | None = Query(None),
+    tenant: TenantContext = Depends(get_tenant),
+    client: NeptuneClient = Depends(get_neptune_client),
+):
+    """Paged entity instances for the Explorer Data table (COG-100).
+
+    Returns one page of instances of ``type_name``, ordered deterministically
+    by entity URI (``ORDER BY ?e``) with keyset pagination via ``cursor`` (the
+    last entity URI from the previous page).  For each entity the endpoint
+    fetches all attribute values, excluding ``rdf:type`` and
+    ``SYSTEM_PREDICATES``.  Attribute predicates are resolved to display names
+    via the ontology (same ``attr_def`` query shape as ``get_type_summary``).
+    The row ``name`` is ``rdfs:label`` when present, else the entity-URI leaf.
+
+    Response shape::
+
+        {
+            "columns": ["name", "<attr1>", ...],
+            "rows": [{"id": "<uri>", "name": "...", "<attr1>": "...", ...}],
+            "total": <int>,
+            "next_cursor": "<uri>" | null,
+        }
+
+    Never errors on an empty/missing type; returns the empty sentinel instead.
+    """
+    _EMPTY = {"columns": ["name"], "rows": [], "total": 0, "next_cursor": None}
+
+    onto_graph = tenant_graph_uri(tenant.tenant_id)
+    kg_graph = kg_graph_uri(tenant.tenant_id, kg_name)
+    t_uri = type_uri(type_name)
+
+    # --- (1) attribute display-name map from ontology (same as get_type_summary) ---
+    attr_def_sparql = (
+        f"SELECT ?attr ?attrLabel ?range FROM <{onto_graph}> WHERE {{\n"
+        f"  ?attr <{RDF_TYPE}> <{RDF_PROPERTY}> .\n"
+        f"  ?attr <{RDFS}#domain> <{t_uri}> .\n"
+        f"  ?attr <{RDFS}#label> ?attrLabel .\n"
+        f"  OPTIONAL {{ ?attr <{RDFS}#range> ?range }}\n"
+        f"}}"
+    )
+
+    # --- (2) entity page: keyset pagination ordered by ?e URI ---
+    cursor_filter = f'  FILTER(STR(?e) > "{_esc(cursor)}")\n' if cursor else ""
+    entities_sparql = (
+        f"SELECT DISTINCT ?e FROM <{kg_graph}> WHERE {{\n"
+        f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
+        f"{_PRIMARY_TYPE_GUARD}"
+        f"{cursor_filter}"
+        f"}} ORDER BY ?e LIMIT {limit}"
+    )
+
+    # --- (3) total count: try stats graph first, fall back to COUNT query ---
+    stats_graph = _stats_graph_uri(tenant.tenant_id, kg_name)
+    total_sparql = (
+        f"SELECT ?ec FROM <{stats_graph}> WHERE {{\n"
+        f"  <{t_uri}> <{_STAT_ENTITY_COUNT}> ?ec\n"
+        f"}}"
+    )
+
+    attr_def_raw, entity_raw, total_raw = await asyncio.gather(
+        client.query(attr_def_sparql),
+        client.query(entities_sparql),
+        client.query(total_sparql),
+    )
+
+    _, attr_def_rows = parse_sparql_results(attr_def_raw)
+    # predicate URI → display name  (cap at 12 attributes for column stability)
+    _MAX_COLS = 12
+    # Map ONTO pred URI → label.  We also need the instance predicate URI which
+    # is `…/onto/<predLeaf>`.  Build both directions.
+    attr_label_by_onto: dict[str, str] = {}  # onto attr URI → label
+    attr_label_by_pred: dict[str, str] = {}  # onto pred URI → label (instance triples)
+    for r in attr_def_rows:
+        a_uri = r.get("attr", "")
+        label = r.get("attrLabel") or a_uri.rstrip("/").split("/")[-1]
+        if not a_uri:
+            continue
+        attr_label_by_onto[a_uri] = label
+        # instance predicate URI: …/onto/<leaf>  where leaf is the last segment of
+        # the attr URI (attrs/<leaf> → <leaf>)
+        pred_leaf = a_uri.rstrip("/").split("/")[-1]
+        inst_pred = ONTO_PRED_PREFIX + pred_leaf
+        attr_label_by_pred[inst_pred] = label
+
+    _, entity_rows = parse_sparql_results(entity_raw)
+    entity_uris = [r.get("e", "") for r in entity_rows if r.get("e")]
+    if not entity_uris:
+        # No instances on this page — still need a total
+        _, total_rows = parse_sparql_results(total_raw)
+        total = _to_int(total_rows[0].get("ec") if total_rows else None)
+        if not total:
+            # Fall back to a COUNT query if stats absent
+            count_sparql = (
+                f"SELECT (COUNT(DISTINCT ?e) AS ?n) FROM <{kg_graph}> WHERE {{\n"
+                f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
+                f"{_PRIMARY_TYPE_GUARD}"
+                f"}}"
+            )
+            _, cnt_rows = parse_sparql_results(await client.query(count_sparql))
+            total = _to_int(cnt_rows[0].get("n") if cnt_rows else None)
+        return {**_EMPTY, "total": total}
+
+    # --- (4) fetch attribute values for the page entities ---
+    uri_values = " ".join(f"<{u}>" for u in entity_uris)
+    values_sparql = (
+        f"SELECT ?e ?p ?o FROM <{kg_graph}> WHERE {{\n"
+        f"  VALUES ?e {{ {uri_values} }}\n"
+        f"  ?e ?p ?o .\n"
+        f'  FILTER(?p != <{RDF_TYPE}>)\n'
+        f"}}"
+    )
+
+    # Total count and attribute values fetched concurrently
+    values_raw, total_raw2 = await asyncio.gather(
+        client.query(values_sparql),
+        client.query(total_sparql),
+    )
+
+    _, values_rows = parse_sparql_results(values_raw)
+
+    # Determine total
+    _, total_rows2 = parse_sparql_results(total_raw2)
+    total = _to_int(total_rows2[0].get("ec") if total_rows2 else None)
+    if not total:
+        count_sparql = (
+            f"SELECT (COUNT(DISTINCT ?e) AS ?n) FROM <{kg_graph}> WHERE {{\n"
+            f"  ?e <{RDF_TYPE}> <{t_uri}> .\n"
+            f"{_PRIMARY_TYPE_GUARD}"
+            f"}}"
+        )
+        _, cnt_rows = parse_sparql_results(await client.query(count_sparql))
+        total = _to_int(cnt_rows[0].get("n") if cnt_rows else None)
+
+    # --- (5) assemble rows ---
+    # Collect per-entity: label + attribute values keyed by display name
+    LABEL_PRED = f"{RDFS}#label"
+    entity_data: dict[str, dict] = {u: {"_label": None, "_attrs": {}} for u in entity_uris}
+    # Track which display-name columns appear across the page (for stable ordering)
+    seen_col_display: list[str] = []
+    seen_col_set: set[str] = set()
+
+    for r in values_rows:
+        e_uri = r.get("e", "")
+        p_uri = r.get("p", "")
+        o_val = r.get("o", "")
+        if not e_uri or e_uri not in entity_data:
+            continue
+        if p_uri == LABEL_PRED:
+            entity_data[e_uri]["_label"] = o_val
+            continue
+        if p_uri in SYSTEM_PREDICATES:
+            continue
+        # Resolve display name: check attr_label_by_pred (instance pred) first,
+        # then attr_label_by_onto (onto attr URI), then fall back to the URI leaf.
+        display = (
+            attr_label_by_pred.get(p_uri)
+            or attr_label_by_onto.get(p_uri)
+            or p_uri.rstrip("/").split("/")[-1]
+        )
+        if display not in seen_col_set and len(seen_col_set) < _MAX_COLS:
+            seen_col_set.add(display)
+            seen_col_display.append(display)
+        entity_data[e_uri]["_attrs"][display] = o_val
+
+    columns = ["name"] + seen_col_display
+    rows = []
+    for u in entity_uris:
+        d = entity_data[u]
+        label = d["_label"] or u.rstrip("/").split("/")[-1]
+        row: dict = {"id": u, "name": label}
+        for col in seen_col_display:
+            row[col] = d["_attrs"].get(col, "")
+        rows.append(row)
+
+    next_cursor = entity_uris[-1] if len(entity_uris) == limit else None
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "total": total,
+        "next_cursor": next_cursor,
+    }
+
+
 @router.post("/kgs/{kg_name}/er-rebuild")
 async def er_rebuild(
     kg_name: str,
