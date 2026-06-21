@@ -112,6 +112,19 @@ def _safe_iri(uri: str) -> bool:
     return isinstance(uri, str) and bool(_IRI_RE.match(uri))
 
 
+def _pred_path(iris: list[str]) -> str:
+    """A SPARQL property-path term that matches any of ``iris`` with the
+    predicate BOUND (so Neptune uses the POS index).
+
+    A single IRI → ``<iri>``; multiple IRIs → an alternation ``(<a>|<b>|…)``.
+    Bound-predicate paths are predicate-indexed, unlike a variable predicate +
+    ``FILTER(?p IN (…))`` which on Neptune does NOT use the predicate index and
+    degrades to a scan (the second COG-112 perf bug)."""
+    if len(iris) == 1:
+        return f"<{iris[0]}>"
+    return "(" + "|".join(f"<{u}>" for u in iris) + ")"
+
+
 def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> str:
     """SPARQL graph pattern restricting ``?e`` (already typed) to a value-scope.
 
@@ -119,12 +132,18 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
     ``hasLevel``, ``property_type``). It has already been resolved (case-
     insensitively) against the type's ontology-declared predicates to a list of
     **concrete instance predicate IRIs** (``pred_iris``) by
-    :func:`_resolve_scope_predicate_iris`. Matching a bounded set of concrete
-    IRIs — ``?e <pred-iri> ?sv`` — lets Neptune use its predicate index instead
-    of scanning every triple of every entity (the COG-112 perf fix: the old
-    ``?e ?p ?sv`` + ``FILTER(LCASE(REPLACE(STR(?p), …)))`` form was an
-    O(entities × predicates) scan that timed out at create time on a 13.5k-entity
-    type).
+    :func:`_resolve_scope_predicate_iris`. Those IRIs are matched as a
+    **bound-predicate property-path alternation** — ``?e (<a>|<b>) ?sv`` — so
+    Neptune uses its POS (predicate-object) index instead of scanning.
+
+    COG-112 two-layer perf history:
+      1. The original form ``?e ?p ?sv . FILTER(LCASE(REPLACE(STR(?p), …)))``
+         was an O(entities × predicates) local-name scan that timed out.
+      2. The first fix resolved the predicate to concrete IRIs but still matched
+         with a VARIABLE predicate + ``FILTER(?p IN (<a>,<b>))``. On Neptune a
+         variable predicate + FILTER does NOT use the predicate index, so it
+         still scanned. This version binds the predicate via a property path so
+         the POS index is used.
 
     Injection safety is preserved: ``scope.predicate`` was validated as a safe
     local-name AND resolved to an ontology-known IRI, so each interpolated
@@ -140,8 +159,9 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
       - **relationship to a node** — the object is an IRI; match the target
         node's display label/name case-insensitively over a BOUNDED set of
         concrete label/name predicates (``rdfs:label`` + the
-        ``name``/``title``/``headline`` attribute predicates), OR the target
-        IRI's local-name as a fallback.
+        ``name``/``title``/``headline`` attribute predicates), matched as a
+        bound-predicate property path too, OR the target IRI's local-name as a
+        fallback.
 
     If ``pred_iris`` is empty (predicate not declared on the type) the block
     emits ``FILTER(false)`` so the scope matches NOTHING fast — never the old
@@ -153,24 +173,21 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
         return "  FILTER(false)"
 
     v_lower = _esc_lit(scope.value.lower())
-    pred_in = ", ".join(f"<{u}>" for u in safe_iris)
-    label_preds = ", ".join(
-        f"<{p}>"
-        for p in [RDFS_LABEL] + [_attr_uri(type_name, a) for a in NAME_FALLBACK_ATTRS]
-    )
+    pred_path = _pred_path(safe_iris)
+    label_iris = [RDFS_LABEL] + [_attr_uri(type_name, a) for a in NAME_FALLBACK_ATTRS]
+    label_path = _pred_path(label_iris)
     return (
         f"  FILTER EXISTS {{\n"
-        # Match the predicate by CONCRETE IRI(s) (predicate-indexed, no scan).
-        f"    ?e ?p ?sv .\n"
-        f"    FILTER(?p IN ({pred_in}))\n"
+        # Match the predicate by a BOUND property path (POS-indexed, no scan).
+        f"    ?e {pred_path} ?sv .\n"
         f"    {{\n"
         # Literal-attribute arm.
         f"      FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
         f"    }} UNION {{\n"
         # Relationship arm: match the target node's label / name over a bounded
-        # set of concrete label predicates (not an open ?sv ?slp ?stl scan).
-        f"      ?sv ?slp ?stl .\n"
-        f"      FILTER(?slp IN ({label_preds}))\n"
+        # set of concrete label predicates, bound as a property path (not an open
+        # ?sv ?slp ?stl scan).
+        f"      ?sv {label_path} ?stl .\n"
         f"      FILTER(LCASE(STR(?stl)) = \"{v_lower}\")\n"
         f"    }} UNION {{\n"
         # … or the target IRI's local-name as a fallback.
@@ -402,15 +419,20 @@ class EnrichmentExecutor:
         """Count entities the job will enrich.
 
         Whole-type by default; honors the same subset semantics as the
-        entity-selection query (COG-112) so the create-job response can report
-        "this will enrich N" before the run starts. ``entity_uris`` wins over
-        ``scope`` (matching :func:`_build_select_query`).
+        entity-selection query (COG-112). ``entity_uris`` wins over ``scope``
+        (matching :func:`_build_select_query`).
+
+        NOTE (COG-112 non-blocking): create-job no longer calls this in the
+        request path — the executor's background SELECT resolves the matched
+        subset and sets ``progress.total``. This method remains as a standalone
+        utility (e.g. a future "preview count" endpoint) and is exercised by the
+        tests; it shares the same index-efficient SPARQL as the SELECT.
 
         For a ``scope`` the predicate is resolved to a concrete instance IRI
-        first (cheap, ontology-bounded), so the COUNT matches on a
-        predicate-indexed term instead of scanning every predicate of every
-        entity — the COG-112 perf fix that kept this query (run synchronously at
-        create time) from timing out on a 13.5k-entity type.
+        first (cheap, ontology-bounded), and the COUNT matches it via a
+        BOUND-predicate property path (POS-indexed) instead of a variable
+        predicate + ``FILTER`` (which Neptune does NOT predicate-index) or a
+        per-triple scan — the two-layer COG-112 perf fix.
         """
         graph_uri = kg_graph_uri(tenant_id, kg_name)
         if entity_uris:

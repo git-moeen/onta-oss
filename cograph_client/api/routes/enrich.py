@@ -25,7 +25,6 @@ router = APIRouter(prefix="/graphs/{tenant}/enrich")
 
 
 CONFLICT_RESULT_TRUNCATE = 100
-LITE_COST_PER_ENTITY = 0.0001
 
 
 class ApplyRequest(BaseModel):
@@ -39,18 +38,13 @@ async def create_job(
     executor: EnrichmentExecutor = Depends(get_executor),
     job_store: InMemoryJobStore = Depends(get_enrichment_job_store),
 ):
-    # Matched count honors the scope / entity_uris subset (COG-112) so the UI can
-    # show "this will enrich N" up front; entity_uris wins over scope.
-    total_entities = await executor.count_entities(
-        tenant.tenant_id,
-        body.kg_name,
-        body.type_name,
-        scope=body.scope,
-        entity_uris=body.entity_uris,
-    )
-    if body.limit is not None:
-        total_entities = min(total_entities, body.limit)
-
+    # NON-BLOCKING create (COG-112): we deliberately do NOT count_entities() in
+    # the request path. A scoped COUNT over a large type (e.g. ~13.5k Mentors)
+    # can be slow and was timing out the create (~55s → 504). The executor's
+    # background SELECT already resolves the scope, selects only the matched
+    # subset, and sets `progress.total` to that count — so the matched count
+    # surfaces via the job's progress, not at create time. This decouples create
+    # latency from type size so it can NEVER time out again.
     job = EnrichJob(
         id=str(uuid.uuid4()),
         tenant_id=tenant.tenant_id,
@@ -73,10 +67,10 @@ async def create_job(
     return {
         "job_id": job.id,
         "status": job.status.value,
-        "estimated_cost_usd": round(total_entities * LITE_COST_PER_ENTITY, 6),
-        "total_entities": total_entities,
-        # Alias of total_entities; the scoped "this will enrich N" count.
-        "matched_entities": total_entities,
+        # Matched count is resolved by the background executor (progress.total),
+        # not at create time — so create never blocks on a scoped COUNT. The web
+        # dialog reads job_id + status; matched_entities is optional in the UI.
+        "matched_entities": None,
     }
 
 

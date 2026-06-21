@@ -444,10 +444,12 @@ def test_build_select_query_no_scope_is_unchanged():
     assert "VALUES ?e" not in q
 
 
-def test_build_select_query_scope_matches_concrete_predicate_iri():
-    """A scope predicate is matched by a CONCRETE instance predicate IRI (the
-    COG-112 perf fix) — never an unbounded ``?e ?p ?sv`` predicate scan — and the
-    value is matched case-insensitively against a literal OR the target label."""
+def test_build_select_query_scope_matches_bound_predicate_path():
+    """A scope predicate is matched by a BOUND-predicate property-path alternation
+    (the COG-112 fix #2) — never a variable predicate + ``FILTER(?p IN (...))``
+    (which Neptune does NOT predicate-index) and never an unbounded ``?e ?p ?sv``
+    scan — and the value is matched case-insensitively against a literal OR the
+    target label."""
     scope = EnrichScope(predicate="haslevel", value="Manager")
     # The resolved instance IRI(s) for the predicate (attr_uri + onto/<leaf>).
     pred_iris = [
@@ -461,18 +463,25 @@ def test_build_select_query_scope_matches_concrete_predicate_iri():
     # Still typed to Mentor and the scope is an EXISTS constraint on ?e.
     assert "?e a <https://cograph.tech/types/Mentor> ." in q
     assert "FILTER EXISTS" in q
-    # The predicate is matched by CONCRETE IRI(s) in a FILTER(?p IN (...)) — the
-    # predicate index is usable; there is NO unbounded local-name predicate scan.
+    # The predicate is matched by a BOUND property-path alternation — Neptune
+    # uses the POS index. The scope must NOT use a variable predicate (?e ?p ?sv
+    # + FILTER(?p IN ...)). (The attribute-value OPTIONAL legitimately uses a
+    # bounded FILTER(?p IN ...) for which attrs to GROUP_CONCAT — that is not the
+    # scope predicate, so we assert specifically on the scope's ?sv object var.)
     assert (
-        "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
-        "<https://cograph.tech/onto/haslevel>))" in q
+        "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+        "<https://cograph.tech/onto/haslevel>) ?sv ." in q
     )
+    assert "?e ?p ?sv" not in q
     assert 'REPLACE(STR(?p)' not in q
     # Literal-attribute arm: case-insensitive literal match (value lower-cased).
     assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "manager"' in q
-    # Relationship arm: match the target node's label / name predicates.
+    # Relationship arm: match the target node's label / name predicates, bound
+    # as a property path (no ?sv ?slp ?stl scan).
     assert "<http://www.w3.org/2000/01/rdf-schema#label>" in q
     assert "<https://cograph.tech/types/Mentor/attrs/name>" in q
+    assert "?sv (<http://www.w3.org/2000/01/rdf-schema#label>|" in q
+    assert "?sv ?slp ?stl" not in q
     assert 'LCASE(STR(?stl)) = "manager"' in q
     # IRI local-name fallback for the relationship target.
     assert 'isIRI(?sv)' in q
@@ -501,6 +510,18 @@ def test_build_select_query_scope_escapes_value():
     )
     # The injected value is lower-cased AND quote-escaped.
     assert 'sr \\"eng\\"' in q
+
+
+def test_build_select_query_scope_single_iri_no_alternation():
+    """A single resolved IRI is emitted as a bare bound predicate (no parens),
+    not an alternation — still POS-indexed, never a variable predicate."""
+    scope = EnrichScope(predicate="title", value="Director")
+    pred_iris = ["https://cograph.tech/types/Mentor/attrs/title"]
+    q = _build_select_query(
+        "https://g/x", "Mentor", ["bio"], None, scope=scope, scope_pred_iris=pred_iris
+    )
+    assert "?e <https://cograph.tech/types/Mentor/attrs/title> ?sv ." in q
+    assert "?e ?p ?sv" not in q
 
 
 def test_build_select_query_entity_uris_uses_values_block():
@@ -541,10 +562,31 @@ def test_scope_block_is_pure_helper():
         ["https://cograph.tech/onto/haslevel"],
     )
     assert block.lstrip().startswith("FILTER EXISTS")
-    # Predicate matched by concrete IRI in a bounded FILTER(?p IN (...)) — no scan.
-    assert "?e ?p ?sv ." in block
-    assert "FILTER(?p IN (<https://cograph.tech/onto/haslevel>))" in block
+    # Predicate matched by a BOUND property path (single IRI → bare term) — no
+    # variable predicate, no scan.
+    assert "?e <https://cograph.tech/onto/haslevel> ?sv ." in block
+    assert "FILTER(?p IN (" not in block
+    assert "?e ?p ?sv" not in block
     assert "REPLACE(STR(?p)" not in block
+
+
+def test_scope_block_multiple_iris_emit_alternation():
+    """Multiple resolved IRIs are matched as a property-path alternation
+    ``(<a>|<b>)`` with the predicate BOUND — POS-indexed, never a scan."""
+    block = _scope_block(
+        "Mentor",
+        EnrichScope(predicate="haslevel", value="Manager"),
+        [
+            "https://cograph.tech/types/Mentor/attrs/haslevel",
+            "https://cograph.tech/onto/haslevel",
+        ],
+    )
+    assert (
+        "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+        "<https://cograph.tech/onto/haslevel>) ?sv ." in block
+    )
+    assert "FILTER(?p IN (" not in block
+    assert "?e ?p ?sv" not in block
 
 
 def test_scope_block_empty_pred_iris_matches_nothing():
@@ -914,13 +956,15 @@ def test_executor_scope_relationship_selects_only_scoped_entities():
         await executor.run(job, "test-tenant")
 
         # (a) The scope constraint is present in the entity-selection SPARQL and
-        # matches the CONCRETE predicate IRI(s) — no unbounded ?e ?p ?sv scan.
+        # matches via a BOUND-predicate property path — no variable predicate +
+        # FILTER, no unbounded ?e ?p ?sv scan.
         sel = captured["select"]
         assert "FILTER EXISTS" in sel
         assert (
-            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
-            "<https://cograph.tech/onto/haslevel>))" in sel
+            "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+            "<https://cograph.tech/onto/haslevel>) ?sv ." in sel
         )
+        assert "?e ?p ?sv" not in sel
         assert "REPLACE(STR(?p)" not in sel
         assert 'LCASE(STR(?stl)) = "manager"' in sel
 
@@ -963,12 +1007,14 @@ def test_executor_scope_predicate_casing_matches_via_lcase():
 
         sel = captured["select"]
         # The mixed-case `hasLevel` request resolves (case-insensitively) to the
-        # stored `haslevel` predicate's concrete IRI(s); the mixed-case form
-        # never leaks verbatim and there is no per-predicate scan.
+        # stored `haslevel` predicate's concrete IRI(s), matched as a bound
+        # property path; the mixed-case form never leaks verbatim and there is no
+        # variable-predicate scan.
         assert (
-            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
-            "<https://cograph.tech/onto/haslevel>))" in sel
+            "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+            "<https://cograph.tech/onto/haslevel>) ?sv ." in sel
         )
+        assert "?e ?p ?sv" not in sel
         assert "hasLevel" not in sel
         assert "REPLACE(STR(?p)" not in sel
 
@@ -1042,11 +1088,13 @@ def test_executor_scope_literal_attribute_constraint_in_sparql():
 
         sel = captured["select"]
         assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "director"' in sel
-        # Predicate matched by the concrete IRI(s) it resolved to — no scan.
+        # Predicate matched by the concrete IRI(s) it resolved to, bound as a
+        # property-path alternation — no variable predicate, no scan.
         assert (
-            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/title>, "
-            "<https://cograph.tech/onto/title>))" in sel
+            "?e (<https://cograph.tech/types/Mentor/attrs/title>|"
+            "<https://cograph.tech/onto/title>) ?sv ." in sel
         )
+        assert "?e ?p ?sv" not in sel
         assert "REPLACE(STR(?p)" not in sel
 
         final = await store.get(job.id)
@@ -1147,9 +1195,11 @@ def test_count_entities_honors_scope_and_entity_uris():
         assert n == 7
         assert "FILTER EXISTS" in captured["q"]
         assert (
-            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
-            "<https://cograph.tech/onto/haslevel>))" in captured["q"]
+            "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+            "<https://cograph.tech/onto/haslevel>) ?sv ." in captured["q"]
         )
+        assert "FILTER(?p IN (" not in captured["q"]
+        assert "?e ?p ?sv" not in captured["q"]
         assert "REPLACE(STR(?p)" not in captured["q"]
 
         # entity_uris path (wins over scope).
@@ -1441,8 +1491,8 @@ def _reset_singletons():
 
 
 def test_post_jobs_returns_job_id(client, auth_headers, mock_neptune):
-    # count_entities query returns 0 entities, plus the executor's run loop
-    # query once started. We don't care about the run loop's outcome here.
+    # The executor's background run loop may issue queries once spawned; we don't
+    # care about its outcome here (create itself no longer counts entities).
     mock_neptune.query.return_value = _count_response(0)
 
     response = client.post(
@@ -1459,22 +1509,22 @@ def test_post_jobs_returns_job_id(client, auth_headers, mock_neptune):
     data = response.json()
     assert "job_id" in data
     assert data["status"] == "queued"
-    assert data["total_entities"] == 0
-    assert data["estimated_cost_usd"] == 0
+    # Non-blocking create (COG-112): matched count is resolved by the background
+    # executor (job.progress.total), not at create time, so it is None here.
+    assert data["matched_entities"] is None
 
 
-def test_post_jobs_with_scope_threads_and_reports_matched(
+def test_post_jobs_with_scope_threads_scope_without_blocking(
     client, auth_headers, mock_neptune
 ):
-    """A scoped create-job (COG-112): count_entities resolves the scope predicate
-    to a concrete IRI then applies the scope (mocked Neptune returns 2), the
-    response carries matched_entities, and the stored job persists the scope so
-    the executor uses it."""
+    """A scoped create-job (COG-112): create is NON-BLOCKING — it does NOT call
+    count_entities in the request path — so it can never time out on a slow
+    scoped COUNT. The stored job persists the scope so the background executor
+    resolves it and surfaces the matched count via progress.total."""
 
     async def _query(sparql, *args, **kwargs):
-        # Scope-predicate resolution (ontology graph) returns the Mentor preds so
-        # `haslevel` resolves to a concrete IRI; everything else (COUNT + the
-        # executor's entity SELECT after the job spawns) returns the count shape.
+        # The executor's background run may issue queries once spawned; create
+        # itself must not. Return a harmless shape for any background query.
         if "#domain>" in sparql and "#Property>" in sparql:
             return _ontology_predicates_response(_MENTOR_ONTO_PREDS)
         return _count_response(2)
@@ -1494,10 +1544,12 @@ def test_post_jobs_with_scope_threads_and_reports_matched(
     )
     assert response.status_code == 202
     data = response.json()
-    assert data["total_entities"] == 2
-    assert data["matched_entities"] == 2
+    assert "job_id" in data
+    assert data["status"] == "queued"
+    # Matched count is resolved by the background executor, not at create time.
+    assert data["matched_entities"] is None
 
-    # The stored job retains the scope (full-job view).
+    # The stored job retains the scope (full-job view) so the executor uses it.
     job = client.get(
         f"/graphs/test-tenant/enrich/jobs/{data['job_id']}", headers=auth_headers
     ).json()
@@ -1505,8 +1557,43 @@ def test_post_jobs_with_scope_threads_and_reports_matched(
     assert job["entity_uris"] is None
 
 
+def test_post_jobs_does_not_block_on_count_entities(
+    client, auth_headers, mock_neptune, monkeypatch
+):
+    """The create path must NOT await count_entities (COG-112 non-blocking
+    guarantee): even if count_entities hangs/raises, create still returns a job
+    id promptly. We monkeypatch the executor's count_entities to blow up if
+    called and assert create succeeds without invoking it."""
+    from cograph_client.enrichment import executor as executor_mod
+
+    async def _boom(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("count_entities must not be called in create path")
+
+    monkeypatch.setattr(
+        executor_mod.EnrichmentExecutor, "count_entities", _boom
+    )
+    mock_neptune.query.return_value = _count_response(0)
+
+    response = client.post(
+        "/graphs/test-tenant/enrich/jobs",
+        headers=auth_headers,
+        json={
+            "type_name": "Mentor",
+            "attributes": ["bio"],
+            "kg_name": "kg",
+            "scope": {"predicate": "haslevel", "value": "Manager"},
+        },
+    )
+    assert response.status_code == 202
+    data = response.json()
+    assert "job_id" in data
+    assert data["status"] == "queued"
+
+
 def test_post_jobs_with_entity_uris_subset(client, auth_headers, mock_neptune):
-    """entity_uris on create-job persists and counts the explicit subset."""
+    """entity_uris on create-job persists the explicit subset; create is
+    non-blocking so it does not count the subset up front (matched_entities is
+    resolved later by the executor)."""
     mock_neptune.query.return_value = _count_response(1)
     uris = ["https://cograph.tech/entities/Mentor/m1"]
     response = client.post(
@@ -1521,7 +1608,7 @@ def test_post_jobs_with_entity_uris_subset(client, auth_headers, mock_neptune):
     )
     assert response.status_code == 202
     data = response.json()
-    assert data["matched_entities"] == 1
+    assert data["matched_entities"] is None
     job = client.get(
         f"/graphs/test-tenant/enrich/jobs/{data['job_id']}", headers=auth_headers
     ).json()
