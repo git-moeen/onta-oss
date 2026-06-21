@@ -281,7 +281,14 @@ def _resolve_pred_iris_from_bindings(
     """Case-insensitively resolve ``predicate`` against the type's declared
     predicates (from :func:`_resolve_scope_predicate_query` bindings) to the
     concrete instance predicate IRIs to match. Returns ``[]`` when the predicate
-    is not declared on the type (caller treats as matched-0)."""
+    is not declared as an ATTRIBUTE on the type.
+
+    This is the ONTOLOGY arm of resolution: it gives case-normalisation (a
+    request ``hasLevel`` → the stored ``haslevel`` leaf) and covers literal
+    attributes. RELATIONSHIPS are NOT declared this way (they live under
+    ``…/onto/<pred>``), so they return ``[]`` HERE — the caller
+    (:meth:`EnrichmentExecutor._resolve_scope_predicate_iris`) UNIONS this with a
+    direct build from the input predicate so relationships still resolve."""
     want = predicate.strip().lower()
     iris: list[str] = []
     seen: set[str] = set()
@@ -330,9 +337,11 @@ def _build_select_query(
         applied INSIDE the sub-select so it caps the SELECTED entities before the
         attribute OPTIONALs hydrate them. ``scope_pred_iris`` are the concrete
         instance predicate IRI(s) the scope predicate resolved to (see
-        :func:`_resolve_scope_predicate_iris`); an empty list means the predicate
-        is not declared on the type, so the scope matches nothing (fast,
-        ``FILTER(false)``, no per-entity scan — COG-112 perf fix).
+        :func:`_resolve_scope_predicate_iris`, which UNIONS the ontology-declared
+        resolution with a direct build so relationships under ``…/onto/<pred>``
+        resolve too). A valid predicate therefore always yields candidates; an
+        empty list only arises for an empty/invalid predicate, in which case the
+        scope matches nothing (fast, ``FILTER(false)``, no per-entity scan).
     """
     type_uri = _type_uri(type_name)
     attr_uris = [_attr_uri(type_name, a) for a in attributes]
@@ -451,21 +460,51 @@ class EnrichmentExecutor:
         self, tenant_id: str, type_name: str, scope: EnrichScope
     ) -> list[str]:
         """Resolve ``scope.predicate`` (a local-name) to the concrete instance
-        predicate IRI(s) to match, case-insensitively, from the type's
-        ontology-declared predicates.
+        predicate IRI(s) to match.
 
-        Returns ``[]`` when the predicate is not declared on the type — the
-        caller then builds a "matches nothing" scope (fast, honest matched-0)
-        rather than the old unbounded per-entity predicate scan (COG-112 fix).
+        The candidate IRIs are the **union** of two sources:
 
-        On a Neptune error this also returns ``[]`` (matched-0) so create stays
-        fast and never 500s; reads degrade to an honest zero rather than a hang.
+          1. **Ontology-declared resolution** — match ``scope.predicate``
+             case-insensitively against the type's ``rdf:Property``/
+             ``rdfs:domain``/``rdfs:label`` declarations (see
+             :func:`_resolve_pred_iris_from_bindings`). This gives
+             case-normalisation: a request ``hasLevel`` resolves to the stored
+             ``haslevel`` leaf. Attributes are always declared this way.
+          2. **Direct build from the (validated) input predicate** —
+             :func:`_instance_pred_iris_for_leaf` → ``…/types/<Type>/attrs/<pred>``
+             and ``…/onto/<pred>``. **Relationships (object properties) like
+             ``haslevel`` are stored under ``…/onto/<pred>`` and are NOT declared
+             as an attribute** (``rdf:Property ; rdfs:domain <Type> ;
+             rdfs:label``), so the ontology arm alone returns ``[]`` for them
+             (COG-112 root cause). The direct build always yields
+             ``…/onto/<pred>`` (and the attr IRI), so a relationship scope
+             matches the instance edges. The UI dropdown sends the exact stored
+             local-name, so casing is correct for the direct build.
+
+        The predicate has already been validated as a safe local-name by the
+        Pydantic model validator, so building IRIs from it is injection-safe;
+        each candidate is still re-checked with :func:`_safe_iri`. The direct
+        build LOWER-CASES the predicate so it agrees with the ontology arm's
+        normalised leaf and the live instance data (predicates are minted
+        lower-cased — e.g. ``…/onto/haslevel``, ``…/attrs/name``): a mixed-case
+        request like ``hasLevel`` never leaks verbatim into the candidate IRIs.
+        A syntactically valid predicate therefore ALWAYS yields candidates —
+        only an empty/invalid predicate (or one whose direct-build IRIs all fail
+        ``_safe_iri``) yields ``[]``.
+
+        On a Neptune error during the ontology query we skip the ontology arm
+        but still return the direct build (so create stays fast, never 500s, and
+        a relationship scope still resolves even if the ontology read fails).
         """
         onto_graph = tenant_graph_uri(tenant_id)
         query = _resolve_scope_predicate_query(onto_graph, type_name)
+        ontology_iris: list[str] = []
         try:
             raw = await self._neptune.query(query)
             _, bindings = parse_sparql_results(raw)
+            ontology_iris = _resolve_pred_iris_from_bindings(
+                type_name, scope.predicate, bindings
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "scope_predicate_resolve_failed",
@@ -474,8 +513,21 @@ class EnrichmentExecutor:
                 predicate=scope.predicate,
                 error=str(exc),
             )
-            return []
-        return _resolve_pred_iris_from_bindings(type_name, scope.predicate, bindings)
+        # Union the ontology-declared resolution (case-normalised attributes)
+        # with the direct build (covers relationships under …/onto/<pred>).
+        # Lower-case the predicate for the direct build so it agrees with the
+        # ontology leaf and the lower-cased instance predicates (no mixed-case
+        # leak). Dedup, preserve order, keep each IRI passing _safe_iri.
+        direct_iris = _instance_pred_iris_for_leaf(
+            type_name, scope.predicate.strip().lower()
+        )
+        iris: list[str] = []
+        seen: set[str] = set()
+        for iri in [*ontology_iris, *direct_iris]:
+            if iri not in seen and _safe_iri(iri):
+                seen.add(iri)
+                iris.append(iri)
+        return iris
 
     async def count_entities(
         self,
@@ -516,8 +568,11 @@ class EnrichmentExecutor:
             pred_iris = await self._resolve_scope_predicate_iris(
                 tenant_id, type_name, scope
             )
-            # Unresolved predicate → scope matches nothing; short-circuit to 0
-            # without even issuing the COUNT (honest matched-0, fast).
+            # A valid predicate always resolves to candidate IRIs now (the direct
+            # build covers relationships under …/onto/<pred>); only an
+            # empty/invalid predicate yields []. In that degenerate case the
+            # scope matches nothing → short-circuit to 0 without issuing the
+            # COUNT (honest matched-0, fast).
             if not pred_iris:
                 return 0
             # Count over the SAME bounded DISTINCT sub-select the SELECT uses: the
@@ -565,8 +620,10 @@ class EnrichmentExecutor:
             # Resolve a scope predicate to concrete instance IRI(s) so the
             # entity-selection SELECT matches a predicate-indexed term, not an
             # unbounded per-entity scan (COG-112 perf fix). entity_uris path
-            # never needs this. An unresolved predicate yields [] → the scope
-            # block matches nothing (consistent with count_entities → matched 0).
+            # never needs this. A valid predicate always resolves to candidate
+            # IRIs (the direct build covers relationships under …/onto/<pred>);
+            # only an empty/invalid predicate yields [] → the scope block matches
+            # nothing (consistent with count_entities → matched 0).
             scope_pred_iris: Optional[list[str]] = None
             if job.scope is not None and not job.entity_uris:
                 scope_pred_iris = await self._resolve_scope_predicate_iris(

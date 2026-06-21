@@ -1108,18 +1108,21 @@ def test_executor_scope_predicate_casing_matches_via_lcase():
     asyncio.run(run())
 
 
-def test_executor_scope_unknown_predicate_matches_nothing():
-    """A scope predicate not declared on the type resolves to no concrete IRIs,
-    so the SELECT matches nothing fast (FILTER(false)) — never the old unbounded
-    per-entity predicate scan (COG-112 fix #3)."""
+def test_executor_scope_relationship_not_in_ontology_attrs_still_matches():
+    """COG-112 root-cause fix: a RELATIONSHIP-style predicate (`haslevel`) that is
+    NOT declared as an ontology ATTRIBUTE (`rdf:Property ; rdfs:domain <Type> ;
+    rdfs:label`) — because relationships live under `…/onto/<pred>`, not the
+    attr namespace — must STILL resolve to candidate instance IRIs via the direct
+    build, so the SELECT carries the bound-predicate property path (NOT
+    FILTER(false)). Previously the ontology-only resolver returned [] for
+    relationships → FILTER(false) → matched 0 (the bug)."""
     async def run():
-        # Even though Neptune would "return" a row, the unresolved predicate
-        # makes the run resolve to [] and the SELECT to FILTER(false); we assert
-        # on the generated SPARQL shape (the mock can't model FILTER(false)).
         scoped_rows = [
             {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
         ]
-        # Ontology declares only `title`/`name`, NOT the requested predicate.
+        # Ontology declares only `title`/`name` as attributes — `haslevel`
+        # (the relationship) is absent from the attribute bindings, exactly like
+        # the live adp-mentors data.
         onto_preds = [
             {"attr": "https://cograph.tech/types/Mentor/attrs/title", "label": "title"},
             {"attr": "https://cograph.tech/types/Mentor/attrs/name", "label": "name"},
@@ -1127,22 +1130,77 @@ def test_executor_scope_unknown_predicate_matches_nothing():
         neptune, captured = _capturing_neptune(scoped_rows, onto_preds=onto_preds)
         store = InMemoryJobStore()
         cache = EnrichmentCache()
-        wikidata = FakeWikidata({})
+        wikidata = FakeWikidata(
+            {("Ada", "bio"): [Verdict(value="Ada bio", confidence=0.95, source="wikidata")]}
+        )
         executor = EnrichmentExecutor(neptune, store, cache, wikidata)
 
         job = _make_job(
             type_name="Mentor",
             attributes=["bio"],
-            scope=EnrichScope(predicate="not_declared", value="Manager"),
+            scope=EnrichScope(predicate="haslevel", value="Manager"),
         )
         await store.create(job)
         await executor.run(job, "test-tenant")
 
         sel = captured["select"]
-        assert "FILTER(false)" in sel
-        # No unbounded scan, no concrete-IRI EXISTS machinery.
+        # The direct build means `…/onto/haslevel` is ALWAYS a candidate, so the
+        # bound-predicate property path is emitted (NOT FILTER(false)).
+        assert "FILTER(false)" not in sel
+        assert (
+            "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+            "<https://cograph.tech/onto/haslevel>) ?sv ." in sel
+        )
+        # No unbounded scan, no FILTER EXISTS machinery.
         assert "FILTER EXISTS" not in sel
         assert "REPLACE(STR(?p)" not in sel
+        # The scoped entity was actually processed (not matched-0).
+        final = await store.get(job.id)
+        assert final is not None
+        assert final.progress.total == 1
+        assert final.progress.processed == 1
+
+    asyncio.run(run())
+
+
+def test_resolve_scope_predicate_iris_unions_direct_build_for_relationships():
+    """COG-112 root-cause unit test: `_resolve_scope_predicate_iris` returns the
+    UNION of the ontology-declared resolution and the direct build. When the
+    ontology query returns NO matching attribute (relationship case), the result
+    still INCLUDES `…/onto/<pred>` (and the attr IRI) from the direct build."""
+    async def run():
+        neptune = AsyncMock()
+
+        async def query(sparql, *args, **kwargs):
+            # Ontology declares only `title` — `haslevel` is absent (relationship).
+            if "#domain>" in sparql and "#Property>" in sparql:
+                return _ontology_predicates_response(
+                    [{"attr": "https://cograph.tech/types/Mentor/attrs/title", "label": "title"}]
+                )
+            return _strategy_query_response([])
+
+        neptune.query.side_effect = query
+        executor = EnrichmentExecutor(
+            neptune, InMemoryJobStore(), EnrichmentCache(), FakeWikidata({})
+        )
+
+        iris = await executor._resolve_scope_predicate_iris(
+            "test-tenant", "Mentor", EnrichScope(predicate="haslevel", value="Manager")
+        )
+        # The relationship is NOT in the ontology attribute bindings, but the
+        # direct build always yields the onto/<pred> candidate (the fix).
+        assert "https://cograph.tech/onto/haslevel" in iris
+        assert "https://cograph.tech/types/Mentor/attrs/haslevel" in iris
+
+        # An ATTRIBUTE declared in the ontology still resolves (and the union
+        # dedups: the ontology arm and the direct build agree on the same IRIs).
+        attr_iris = await executor._resolve_scope_predicate_iris(
+            "test-tenant", "Mentor", EnrichScope(predicate="TITLE", value="Senior")
+        )
+        assert attr_iris == [
+            "https://cograph.tech/types/Mentor/attrs/title",
+            "https://cograph.tech/onto/title",
+        ]
 
     asyncio.run(run())
 
@@ -1308,23 +1366,34 @@ def test_count_entities_honors_scope_and_entity_uris():
     asyncio.run(run())
 
 
-def test_count_entities_unknown_scope_predicate_short_circuits_to_zero():
-    """An unresolved scope predicate makes count_entities return 0 WITHOUT
-    issuing the COUNT (honest matched-0, fast — no per-entity scan, COG-112)."""
+def test_count_entities_relationship_not_in_ontology_attrs_still_counts():
+    """COG-112 root-cause fix: a RELATIONSHIP predicate absent from the ontology
+    attribute bindings (relationships live under `…/onto/<pred>`, not the attr
+    namespace) still resolves to candidate IRIs via the direct build, so
+    count_entities ISSUES the bounded COUNT (not a short-circuit to 0). Only a
+    truly empty resolution would short-circuit; a valid predicate never does."""
     async def run():
         neptune = AsyncMock()
         count_calls = {"n": 0}
 
         async def query(sparql, *args, **kwargs):
             if "#domain>" in sparql and "#Property>" in sparql:
-                # Type declares `title`/`name` but NOT the requested predicate.
+                # Type declares only `title` as an attribute — `haslevel`
+                # (the relationship) is absent, like the live adp-mentors data.
                 return _ontology_predicates_response(
                     [
                         {"attr": "https://cograph.tech/types/Mentor/attrs/title", "label": "title"},
                     ]
                 )
             count_calls["n"] += 1
-            return _count_response(99)
+            # The COUNT must run over the bound-predicate property path that now
+            # includes …/onto/haslevel.
+            assert (
+                "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+                "<https://cograph.tech/onto/haslevel>) ?sv ." in sparql
+            )
+            assert "FILTER(false)" not in sparql
+            return _count_response(7)
 
         neptune.query.side_effect = query
         store = InMemoryJobStore()
@@ -1333,24 +1402,33 @@ def test_count_entities_unknown_scope_predicate_short_circuits_to_zero():
 
         n = await executor.count_entities(
             "test-tenant", "kg", "Mentor",
-            scope=EnrichScope(predicate="not_declared", value="Manager"),
+            scope=EnrichScope(predicate="haslevel", value="Manager"),
         )
-        assert n == 0
-        # The COUNT query was never issued (short-circuited on unresolved pred).
-        assert count_calls["n"] == 0
+        assert n == 7
+        # The COUNT query WAS issued (the relationship now resolves, no short-circuit).
+        assert count_calls["n"] == 1
 
     asyncio.run(run())
 
 
-def test_count_entities_scope_resolve_error_returns_zero():
-    """A Neptune error during scope-predicate resolution degrades to matched 0
-    rather than raising (create stays fast, never 500s)."""
+def test_count_entities_scope_resolve_error_falls_back_to_direct_build():
+    """A Neptune error during the ontology arm of scope-predicate resolution does
+    NOT raise (create stays fast, never 500s) and does NOT collapse to matched 0:
+    it skips the ontology arm and still uses the direct build (which always yields
+    `…/onto/<pred>` and the attr IRI), so a relationship scope still resolves and
+    the bounded COUNT is issued even when the ontology read fails (COG-112)."""
     async def run():
         neptune = AsyncMock()
 
         async def query(sparql, *args, **kwargs):
             if "#domain>" in sparql and "#Property>" in sparql:
                 raise RuntimeError("neptune timeout")
+            # The COUNT still runs over the direct-build bound-predicate path.
+            assert (
+                "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+                "<https://cograph.tech/onto/haslevel>) ?sv ." in sparql
+            )
+            assert "FILTER(false)" not in sparql
             return _count_response(5)
 
         neptune.query.side_effect = query
@@ -1362,7 +1440,7 @@ def test_count_entities_scope_resolve_error_returns_zero():
             "test-tenant", "kg", "Mentor",
             scope=EnrichScope(predicate="haslevel", value="Manager"),
         )
-        assert n == 0
+        assert n == 5
 
     asyncio.run(run())
 
