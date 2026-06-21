@@ -451,8 +451,10 @@ def test_build_select_query_scope_matches_bound_predicate_path():
     (which Neptune evaluates once per type instance), never a variable predicate +
     ``FILTER(?p IN (...))`` (which Neptune does NOT predicate-index) and never an
     unbounded ``?e ?p ?sv`` scan — and the value is matched case-insensitively
-    against a literal OR the target label. The scoped subset is reduced first by a
-    ``SELECT DISTINCT ?e`` sub-select, then attributes are hydrated."""
+    against a literal OR any literal property of the (already-bounded) target node
+    (NOT pinned to the source type's attr namespace — COG-112 target-label fix).
+    The scoped subset is reduced first by a ``SELECT DISTINCT ?e`` sub-select,
+    then attributes are hydrated."""
     scope = EnrichScope(predicate="haslevel", value="Manager")
     # The resolved instance IRI(s) for the predicate (attr_uri + onto/<leaf>).
     pred_iris = [
@@ -483,13 +485,24 @@ def test_build_select_query_scope_matches_bound_predicate_path():
     assert 'REPLACE(STR(?p)' not in q
     # Literal-attribute arm: case-insensitive literal match (value lower-cased).
     assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "manager"' in q
-    # Relationship arm: match the target node's label / name predicates, bound
-    # as a property path (no ?sv ?slp ?stl scan).
-    assert "<http://www.w3.org/2000/01/rdf-schema#label>" in q
-    assert "<https://cograph.tech/types/Mentor/attrs/name>" in q
-    assert "?sv (<http://www.w3.org/2000/01/rdf-schema#label>|" in q
-    assert "?sv ?slp ?stl" not in q
-    assert 'LCASE(STR(?stl)) = "manager"' in q
+    # Relationship arm: ?sv (the target node) is already bounded by the predicate
+    # triple, so match ANY literal property on it (?sv ?slp ?stl) — NOT pinned to
+    # the SOURCE type's attr namespace. The target's display name lives under the
+    # TARGET type's namespace (e.g. …/types/Level/attrs/name), so binding the
+    # source type's attr predicate would match ZERO targets (the COG-112 bug).
+    assert "?sv ?slp ?stl ." in q
+    assert 'isLiteral(?stl) && LCASE(STR(?stl)) = "manager"' in q
+    # The relationship arm must NOT bind the TARGET-label predicate to ANY fixed
+    # IRI(s) — the bug was pinning it to the SOURCE type's attr namespace
+    # (…/types/Mentor/attrs/*) / rdfs:label, which matched the TARGET node under
+    # the wrong namespace → zero matches. The target-label predicate is now the
+    # free variable ?slp, never a `?sv <…> ?stl` bound predicate. (The OUTER
+    # query still references …/attrs/name etc. for ENTITY-label hydration — that
+    # is the ?fp OPTIONAL, unrelated to the scope arm — so we assert on the
+    # `?sv <pred>` shape rather than substring-absence in the whole query.)
+    assert "?sv <http://www.w3.org/2000/01/rdf-schema#label>" not in q
+    assert "?sv <https://cograph.tech/types/Mentor/attrs/name>" not in q
+    assert "?sv (<" not in q  # no property-path alternation pinned on the target
     # IRI local-name fallback for the relationship target.
     assert 'isIRI(?sv)' in q
 
@@ -1026,7 +1039,17 @@ def test_executor_scope_relationship_selects_only_scoped_entities():
         )
         assert "?e ?p ?sv" not in sel
         assert "REPLACE(STR(?p)" not in sel
-        assert 'LCASE(STR(?stl)) = "manager"' in sel
+        # Relationship arm matches ANY literal property of the bounded target node
+        # (?sv ?slp ?stl), NOT a label predicate pinned to the SOURCE type's attr
+        # namespace — the target's name lives under the TARGET type's namespace
+        # (e.g. …/types/Level/attrs/name), so pinning Mentor's would match 0.
+        assert "?sv ?slp ?stl ." in sel
+        assert 'isLiteral(?stl) && LCASE(STR(?stl)) = "manager"' in sel
+        # The target-label predicate is the free variable ?slp, never bound to the
+        # SOURCE type's attr namespace (the bug). (…/attrs/name still appears in
+        # the OUTER ?fp entity-label OPTIONAL — unrelated — so assert on shape.)
+        assert "?sv <https://cograph.tech/types/Mentor/attrs/name>" not in sel
+        assert "?sv (<" not in sel
 
         # (b) Only the two scoped entities were processed (not all Mentors).
         final = await store.get(job.id)

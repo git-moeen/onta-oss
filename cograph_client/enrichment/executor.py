@@ -166,12 +166,18 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
 
       - **literal attribute** — the object is a literal; match its string value
         case-insensitively: ``FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = "<v>")``.
-      - **relationship to a node** — the object is an IRI; match the target
-        node's display label/name case-insensitively over a BOUNDED set of
-        concrete label/name predicates (``rdfs:label`` + the
-        ``name``/``title``/``headline`` attribute predicates), matched as a
-        bound-predicate property path too, OR the target IRI's local-name as a
-        fallback.
+      - **relationship to a node** — the object is an IRI; ``?sv`` is already
+        bounded by the predicate triple to the handful of related TARGET nodes,
+        so match ANY literal property on it case-insensitively
+        (``?sv ?slp ?stl . FILTER(isLiteral(?stl) && LCASE(STR(?stl)) = "<v>")``),
+        OR the target IRI's local-name as a fallback. We deliberately do NOT pin
+        the label predicate to ``…/types/<sourceType>/attrs/*`` here: the target
+        node's display name lives under the TARGET type's namespace (e.g. a
+        ``Level`` node's "Manager" is ``…/types/Level/attrs/name``), so binding
+        the source type's attr predicate would match ZERO targets (COG-112 bug).
+        ``?slp`` is a variable (not interpolated) and the value stays
+        ``_esc_lit``-escaped, so this is injection-safe; ``?sv`` is bounded so the
+        open ``?slp`` carries no perf cost.
 
     If ``pred_iris`` is empty (predicate not declared on the type) the block
     emits ``FILTER(false)`` so the scope matches NOTHING fast — never the old
@@ -184,8 +190,6 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
 
     v_lower = _esc_lit(scope.value.lower())
     pred_path = _pred_path(safe_iris)
-    label_iris = [RDFS_LABEL] + [_attr_uri(type_name, a) for a in NAME_FALLBACK_ATTRS]
-    label_path = _pred_path(label_iris)
     return (
         # Match the predicate by a BOUND property path (POS-indexed, no scan).
         # Inlined directly into the WHERE — the planner drives from this selective
@@ -195,11 +199,14 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
         # Literal-attribute arm.
         f"    FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
         f"  }} UNION {{\n"
-        # Relationship arm: match the target node's label / name over a bounded
-        # set of concrete label predicates, bound as a property path (not an open
-        # ?sv ?slp ?stl scan).
-        f"    ?sv {label_path} ?stl .\n"
-        f"    FILTER(LCASE(STR(?stl)) = \"{v_lower}\")\n"
+        # Relationship arm: ?sv is the target node, already bounded to the handful
+        # of related nodes by the predicate triple above. Match ANY literal value
+        # on it case-insensitively (its display name lives on the TARGET type's
+        # namespace, e.g. …/types/Level/attrs/name — NOT the scope source type's,
+        # so we must not pin the predicate to <sourceType>/attrs/* here). ?slp is a
+        # variable (no interpolation); the value stays escaped → injection-safe.
+        f"    ?sv ?slp ?stl .\n"
+        f"    FILTER(isLiteral(?stl) && LCASE(STR(?stl)) = \"{v_lower}\")\n"
         f"  }} UNION {{\n"
         # … or the target IRI's local-name as a fallback.
         f"    FILTER(isIRI(?sv) && LCASE(REPLACE(STR(?sv), \"^.*[/#]\", \"\")) = \"{v_lower}\")\n"
