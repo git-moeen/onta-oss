@@ -20,6 +20,7 @@ from cograph_client.enrichment.models import (
     ConflictPolicy,
     ConflictReview,
     EnrichJob,
+    EnrichScope,
     JobStatus,
     RowResult,
     Verdict,
@@ -43,6 +44,12 @@ logger = structlog.stdlib.get_logger("cograph.enrichment")
 
 
 TYPE_URI_PREFIX = "https://cograph.tech/types/"
+ENTITY_URI_PREFIX = "https://cograph.tech/entities/"
+# Relationship (object-property) predicates are minted on instance triples under
+# the onto/ namespace (nlp/pipeline.py): `…/onto/<predName>`. A scope predicate
+# given as a local-name may be stored under EITHER this form OR the attribute-URI
+# form, so the scope filter matches both.
+ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
 RDFS_LABEL = "http://www.w3.org/2000/01/rdf-schema#label"
 NAME_FALLBACK_ATTRS = ["name", "title", "headline"]
 WORKER_POOL_SIZE = 8
@@ -57,13 +64,98 @@ def _attr_uri(type_name: str, attr: str) -> str:
     return f"{TYPE_URI_PREFIX}{type_name}/attrs/{attr}"
 
 
+def _onto_pred_uri(local_name: str) -> str:
+    return f"{ONTO_PRED_PREFIX}{local_name}"
+
+
+def _esc_lit(value: str) -> str:
+    """Escape a string for use inside a SPARQL double-quoted literal."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _local_name(uri_or_value: str) -> str:
+    """Last path / fragment segment of a URI; the value itself if not a URI."""
+    s = uri_or_value.rstrip("/")
+    if "#" in s:
+        s = s.split("#")[-1]
+    if "/" in s:
+        s = s.rsplit("/", 1)[-1]
+    return s
+
+
+def _scope_block(type_name: str, scope: EnrichScope) -> str:
+    """SPARQL graph pattern restricting ``?e`` (already typed) to a value-scope.
+
+    ``scope.predicate`` is an attribute OR relationship local-name; it may be
+    stored on instance triples under the attribute-URI form
+    (``…/types/<Type>/attrs/<name>``) OR the relationship form
+    (``…/onto/<name>``), so both predicate URIs are matched via a property-path
+    alternation (``<attrUri>|<ontoUri>``).
+
+    Attribute vs relationship is discriminated by the OBJECT, not by an ontology
+    lookup, so the same builder is correct without a round-trip:
+
+      - **literal attribute** — the object is a literal; match its string value
+        case-insensitively: ``FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = "<v>")``.
+      - **relationship to a node** — the object is an IRI; match the target
+        node's display label/name case-insensitively (``rdfs:label`` with the
+        ``name``/``title``/``headline`` attribute fallbacks), OR the target
+        IRI's local-name as a fallback.
+
+    The two arms are UNIONed inside an EXISTS so a single entity matching either
+    is selected. The value is lower-cased in Python AND via ``LCASE`` so the
+    match is case-insensitive on both sides.
+    """
+    attr_pred = _attr_uri(type_name, scope.predicate)
+    onto_pred = _onto_pred_uri(scope.predicate)
+    pred_path = f"<{attr_pred}>|<{onto_pred}>"
+    v = _esc_lit(scope.value)
+    v_lower = _esc_lit(scope.value.lower())
+    label_preds = ", ".join(
+        f"<{p}>"
+        for p in [RDFS_LABEL] + [_attr_uri(type_name, a) for a in NAME_FALLBACK_ATTRS]
+    )
+    return (
+        f"  FILTER EXISTS {{\n"
+        f"    ?e {pred_path} ?sv .\n"
+        f"    {{\n"
+        # Literal-attribute arm.
+        f"      FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
+        f"    }} UNION {{\n"
+        # Relationship arm: match the target node's label / name …
+        f"      ?sv ?slp ?stl .\n"
+        f"      FILTER(?slp IN ({label_preds}))\n"
+        f"      FILTER(LCASE(STR(?stl)) = \"{v_lower}\")\n"
+        f"    }} UNION {{\n"
+        # … or the target IRI's local-name as a fallback.
+        f"      FILTER(isIRI(?sv) && LCASE(REPLACE(STR(?sv), \"^.*[/#]\", \"\")) = \"{v_lower}\")\n"
+        f"    }}\n"
+        f"  }}"
+    )
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _build_select_query(
-    graph_uri: str, type_name: str, attributes: list[str], limit: Optional[int]
+    graph_uri: str,
+    type_name: str,
+    attributes: list[str],
+    limit: Optional[int],
+    scope: Optional[EnrichScope] = None,
+    entity_uris: Optional[list[str]] = None,
 ) -> str:
+    """Entity-selection SELECT for an enrich job.
+
+    Whole-type by default. Scoped subsets (COG-112):
+
+      - ``entity_uris`` (lower-level primitive, wins over ``scope``): restricts
+        to exactly those URIs via a ``VALUES ?e {…}`` block (still constrained
+        to ``?e a <Type>`` so a stray URI of another type is ignored).
+      - ``scope``: appends a value-filter graph pattern (see :func:`_scope_block`)
+        restricting to entities of the type whose attribute/relationship matches.
+    """
     type_uri = _type_uri(type_name)
     attr_uris = [_attr_uri(type_name, a) for a in attributes]
     fallback_uris = [_attr_uri(type_name, a) for a in NAME_FALLBACK_ATTRS]
@@ -73,6 +165,15 @@ def _build_select_query(
 
     limit_clause = f"\nLIMIT {int(limit)}" if limit else ""
 
+    # Subset constraint. entity_uris (explicit primitive) wins over scope.
+    if entity_uris:
+        values = " ".join(f"<{u}>" for u in entity_uris)
+        subset_clause = f"  VALUES ?e {{ {values} }}\n"
+    elif scope is not None:
+        subset_clause = _scope_block(type_name, scope) + "\n"
+    else:
+        subset_clause = ""
+
     # GROUP_CONCAT predicate::value for all matching attribute triples.
     # Also pull a label / name fallback for entity_label.
     return (
@@ -80,6 +181,7 @@ def _build_select_query(
         f'  (GROUP_CONCAT(DISTINCT CONCAT(STR(?p), "::", STR(?o)); separator="||") AS ?vals)\n'
         f"FROM <{graph_uri}> WHERE {{\n"
         f"  ?e a <{type_uri}> .\n"
+        f"{subset_clause}"
         f"  OPTIONAL {{ ?e <{RDFS_LABEL}> ?label }}\n"
         f"  OPTIONAL {{ ?e ?fp ?nameAttr . FILTER(?fp IN ({fallback_in})) }}\n"
         f"  OPTIONAL {{ ?e ?p ?o . FILTER(?p IN ({in_list})) }}\n"
@@ -153,11 +255,33 @@ class EnrichmentExecutor:
         except Exception:  # noqa: BLE001
             pass
 
-    async def count_entities(self, tenant_id: str, kg_name: str, type_name: str) -> int:
+    async def count_entities(
+        self,
+        tenant_id: str,
+        kg_name: str,
+        type_name: str,
+        scope: Optional[EnrichScope] = None,
+        entity_uris: Optional[list[str]] = None,
+    ) -> int:
+        """Count entities the job will enrich.
+
+        Whole-type by default; honors the same subset semantics as the
+        entity-selection query (COG-112) so the create-job response can report
+        "this will enrich N" before the run starts. ``entity_uris`` wins over
+        ``scope`` (matching :func:`_build_select_query`).
+        """
         graph_uri = kg_graph_uri(tenant_id, kg_name)
+        if entity_uris:
+            values = " ".join(f"<{u}>" for u in entity_uris)
+            subset_clause = f"  VALUES ?e {{ {values} }}\n"
+        elif scope is not None:
+            subset_clause = _scope_block(type_name, scope) + "\n"
+        else:
+            subset_clause = ""
         query = (
             f"SELECT (COUNT(DISTINCT ?e) AS ?n) FROM <{graph_uri}> WHERE {{\n"
             f"  ?e a <{_type_uri(type_name)}> .\n"
+            f"{subset_clause}"
             f"}}"
         )
         raw = await self._neptune.query(query)
@@ -187,7 +311,12 @@ class EnrichmentExecutor:
 
             graph_uri = kg_graph_uri(tenant_id, job.kg_name)
             sel = _build_select_query(
-                graph_uri, job.type_name, job.attributes, job.limit
+                graph_uri,
+                job.type_name,
+                job.attributes,
+                job.limit,
+                scope=job.scope,
+                entity_uris=job.entity_uris,
             )
             raw = await self._neptune.query(sel)
             _, bindings = parse_sparql_results(raw)

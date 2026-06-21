@@ -37,6 +37,7 @@ from cograph_client.enrichment.models import (
     ConflictPolicy,
     EnrichJob,
     EnrichmentTier,
+    EnrichScope,
     JobCategory,
     JobStatus,
     JobTrigger,
@@ -104,6 +105,9 @@ class EnrichActionRequest(BaseModel):
     conflict_policy: ConflictPolicy = ConflictPolicy.stage
     confidence_min: float = 0.85
     limit: Optional[int] = None
+    # COG-112 scoped enrichment (mirrors EnrichRequest). entity_uris wins.
+    scope: Optional[EnrichScope] = None
+    entity_uris: Optional[list[str]] = None
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -127,6 +131,8 @@ def _new_job(
     confidence_min: float = 0.85,
     limit: Optional[int] = None,
     cost_note: Optional[str] = None,
+    scope: Optional[EnrichScope] = None,
+    entity_uris: Optional[list[str]] = None,
 ) -> EnrichJob:
     return EnrichJob(
         id=str(uuid.uuid4()),
@@ -143,6 +149,8 @@ def _new_job(
         category=category,
         trigger=JobTrigger.manual,
         cost_note=cost_note,
+        scope=scope,
+        entity_uris=entity_uris,
     )
 
 
@@ -255,6 +263,8 @@ async def enrich_action(
         conflict_policy=body.conflict_policy,
         confidence_min=body.confidence_min,
         limit=body.limit,
+        scope=body.scope,
+        entity_uris=body.entity_uris,
     )
     await job_store.create(job)
     _spawn(executor.run(job, tenant.tenant_id))

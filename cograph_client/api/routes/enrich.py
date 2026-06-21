@@ -39,8 +39,14 @@ async def create_job(
     executor: EnrichmentExecutor = Depends(get_executor),
     job_store: InMemoryJobStore = Depends(get_enrichment_job_store),
 ):
+    # Matched count honors the scope / entity_uris subset (COG-112) so the UI can
+    # show "this will enrich N" up front; entity_uris wins over scope.
     total_entities = await executor.count_entities(
-        tenant.tenant_id, body.kg_name, body.type_name
+        tenant.tenant_id,
+        body.kg_name,
+        body.type_name,
+        scope=body.scope,
+        entity_uris=body.entity_uris,
     )
     if body.limit is not None:
         total_entities = min(total_entities, body.limit)
@@ -57,6 +63,8 @@ async def create_job(
         conflict_policy=body.conflict_policy,
         confidence_min=body.confidence_min,
         limit=body.limit,
+        scope=body.scope,
+        entity_uris=body.entity_uris,
     )
     await job_store.create(job)
 
@@ -67,6 +75,8 @@ async def create_job(
         "status": job.status.value,
         "estimated_cost_usd": round(total_entities * LITE_COST_PER_ENTITY, 6),
         "total_entities": total_entities,
+        # Alias of total_entities; the scoped "this will enrich N" count.
+        "matched_entities": total_entities,
     }
 
 

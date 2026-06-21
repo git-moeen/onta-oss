@@ -57,6 +57,31 @@ class ConflictPolicy(str, Enum):
     stage = "stage"
 
 
+class EnrichScope(BaseModel):
+    """Value filter restricting an enrich job to a subset of a type's entities (COG-112).
+
+    ``predicate`` is an attribute OR relationship **local-name** (e.g.
+    ``haslevel``, ``title``) of the enriched ``type_name``. ``value`` is matched
+    case-insensitively:
+
+    - For a **literal attribute** the value is matched against the literal's
+      string value.
+    - For a **relationship to another node** (object property, e.g.
+      ``haslevel → Level``) the value is matched against the target node's
+      display label/name — so value ``"Manager"`` selects entities related to
+      the Level node whose ``rdfs:label`` / name is "Manager". The target IRI's
+      local-name is accepted as a fallback.
+
+    The same local-name may be stored on instance triples under either the
+    attribute-URI form (``…/types/<Type>/attrs/<name>``) or the relationship
+    predicate form (``…/onto/<name>``); the executor matches both, so callers
+    never need to know which.
+    """
+
+    predicate: str
+    value: str
+
+
 class EnrichRequest(BaseModel):
     type_name: str
     attributes: list[str]
@@ -65,6 +90,11 @@ class EnrichRequest(BaseModel):
     conflict_policy: ConflictPolicy = ConflictPolicy.stage
     confidence_min: float = 0.85
     limit: Optional[int] = None
+    # COG-112 scoped enrichment. Both optional; default None → unchanged
+    # whole-type behavior. If BOTH are set, ``entity_uris`` wins (the explicit
+    # subset is the lower-level primitive and takes precedence over ``scope``).
+    scope: Optional[EnrichScope] = None
+    entity_uris: Optional[list[str]] = None
 
 
 class Verdict(BaseModel):
@@ -137,6 +167,11 @@ class EnrichJob(BaseModel):
     error: Optional[str] = None
     limit: Optional[int] = None
     results: list[RowResult] = Field(default_factory=list)
+    # COG-112 scoped enrichment. Both optional / default None so existing
+    # enrichment-job construction keeps working unchanged (whole-type behavior).
+    # If both are set, ``entity_uris`` wins (see EnrichRequest).
+    scope: Optional[EnrichScope] = None
+    entity_uris: Optional[list[str]] = None
     # COG-101: unified-jobs fields. All optional with safe defaults so existing
     # enrichment-job construction keeps working unchanged.
     category: JobCategory = JobCategory.enrichment

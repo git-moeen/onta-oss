@@ -13,6 +13,7 @@ from cograph_client.enrichment.executor import (
     EnrichmentExecutor,
     _build_select_query,
     _parse_vals,
+    _scope_block,
     _values_match,
 )
 from cograph_client.enrichment.job_store import InMemoryJobStore
@@ -21,6 +22,7 @@ from cograph_client.enrichment.models import (
     ConflictReview,
     EnrichJob,
     EnrichmentTier,
+    EnrichScope,
     JobStatus,
     Verdict,
 )
@@ -41,6 +43,8 @@ def _make_job(
     attributes: list[str] | None = None,
     policy: ConflictPolicy = ConflictPolicy.stage,
     confidence_min: float = 0.85,
+    scope: EnrichScope | None = None,
+    entity_uris: list[str] | None = None,
 ) -> EnrichJob:
     return EnrichJob(
         id="job-1",
@@ -53,6 +57,8 @@ def _make_job(
         created_at=datetime.now(timezone.utc),
         conflict_policy=policy,
         confidence_min=confidence_min,
+        scope=scope,
+        entity_uris=entity_uris,
     )
 
 
@@ -424,6 +430,91 @@ def test_build_select_query_includes_limit_and_attrs():
 
 
 # ---------------------------------------------------------------------------
+# COG-112 scoped enrichment: SPARQL generation
+# ---------------------------------------------------------------------------
+
+
+def test_build_select_query_no_scope_is_unchanged():
+    """Neither scope nor entity_uris → no subset constraint; whole-type query."""
+    q = _build_select_query("https://g/x", "Mentor", ["bio"], None)
+    assert "?e a <https://cograph.tech/types/Mentor> ." in q
+    # No subset machinery leaks in.
+    assert "FILTER EXISTS" not in q
+    assert "VALUES ?e" not in q
+
+
+def test_build_select_query_scope_emits_both_predicate_forms():
+    """A scope predicate local-name is matched under BOTH the attribute-URI form
+    and the relationship (onto/) form via a property-path alternation, and the
+    value is matched case-insensitively against a literal OR the target label."""
+    scope = EnrichScope(predicate="haslevel", value="Manager")
+    q = _build_select_query("https://g/x", "Mentor", ["bio"], None, scope=scope)
+
+    # Still typed to Mentor and the scope is an EXISTS constraint on ?e.
+    assert "?e a <https://cograph.tech/types/Mentor> ." in q
+    assert "FILTER EXISTS" in q
+    # Both predicate URI forms appear (attr URI | onto URI alternation).
+    assert "<https://cograph.tech/types/Mentor/attrs/haslevel>" in q
+    assert "<https://cograph.tech/onto/haslevel>" in q
+    assert (
+        "<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+        "<https://cograph.tech/onto/haslevel>"
+    ) in q
+    # Literal-attribute arm: case-insensitive literal match (value lower-cased).
+    assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "manager"' in q
+    # Relationship arm: match the target node's label / name predicates.
+    assert "<http://www.w3.org/2000/01/rdf-schema#label>" in q
+    assert "<https://cograph.tech/types/Mentor/attrs/name>" in q
+    assert 'LCASE(STR(?stl)) = "manager"' in q
+    # IRI local-name fallback for the relationship target.
+    assert 'isIRI(?sv)' in q
+
+
+def test_build_select_query_scope_escapes_value():
+    """Quotes/backslashes in the scope value are escaped into the SPARQL literal."""
+    scope = EnrichScope(predicate="title", value='Sr "Eng"')
+    q = _build_select_query("https://g/x", "Mentor", ["bio"], None, scope=scope)
+    # The injected value is lower-cased AND quote-escaped.
+    assert 'sr \\"eng\\"' in q
+
+
+def test_build_select_query_entity_uris_uses_values_block():
+    """entity_uris → a VALUES ?e block; still constrained to the type."""
+    uris = [
+        "https://cograph.tech/entities/Mentor/m1",
+        "https://cograph.tech/entities/Mentor/m2",
+    ]
+    q = _build_select_query("https://g/x", "Mentor", ["bio"], None, entity_uris=uris)
+    assert "?e a <https://cograph.tech/types/Mentor> ." in q
+    assert "VALUES ?e {" in q
+    assert "<https://cograph.tech/entities/Mentor/m1>" in q
+    assert "<https://cograph.tech/entities/Mentor/m2>" in q
+    # No scope EXISTS machinery when using the explicit-URI primitive.
+    assert "FILTER EXISTS" not in q
+
+
+def test_build_select_query_entity_uris_wins_over_scope():
+    """If both are passed, entity_uris is used (the documented precedence)."""
+    uris = ["https://cograph.tech/entities/Mentor/m1"]
+    scope = EnrichScope(predicate="haslevel", value="Manager")
+    q = _build_select_query(
+        "https://g/x", "Mentor", ["bio"], None, scope=scope, entity_uris=uris
+    )
+    assert "VALUES ?e {" in q
+    assert "<https://cograph.tech/entities/Mentor/m1>" in q
+    # The scope constraint must NOT appear when entity_uris wins.
+    assert "FILTER EXISTS" not in q
+    assert "<https://cograph.tech/onto/haslevel>" not in q
+
+
+def test_scope_block_is_pure_helper():
+    """_scope_block builds the constraint independent of the SELECT wrapper."""
+    block = _scope_block("Mentor", EnrichScope(predicate="haslevel", value="Manager"))
+    assert block.lstrip().startswith("FILTER EXISTS")
+    assert "?e <https://cograph.tech/types/Mentor/attrs/haslevel>|" in block
+
+
+# ---------------------------------------------------------------------------
 # Executor end-to-end
 # ---------------------------------------------------------------------------
 
@@ -587,6 +678,220 @@ def test_executor_no_match_when_no_verdict():
         assert final.progress.filled == 0
         assert final.progress.conflicts == 0
         assert final.progress.processed == 1
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# COG-112 scoped enrichment: executor end-to-end
+# ---------------------------------------------------------------------------
+
+
+def _capturing_neptune(scoped_rows: list[dict]):
+    """An AsyncMock Neptune whose entity-SELECT returns ``scoped_rows`` and that
+    records the SELECT SPARQL it was asked. The strategy-load query (over the
+    tenant ontology graph) returns an empty result so no strategy is applied."""
+    neptune = AsyncMock()
+    captured: dict[str, str] = {}
+
+    async def query(sparql, *args, **kwargs):
+        # Strategy load runs first (tenant ontology graph, no /kg/ segment).
+        if "/graphs/test-tenant>" in sparql and "/kg/" not in sparql:
+            return _strategy_query_response([])
+        captured["select"] = sparql
+        return _entities_query_response(scoped_rows)
+
+    neptune.query.side_effect = query
+    neptune.update.return_value = None
+    return neptune, captured
+
+
+def test_executor_scope_relationship_selects_only_scoped_entities():
+    """Acceptance shape (COG-112): a scope on `haslevel`=Manager over Mentor must
+    (a) put the scope constraint into the entity-selection SPARQL and (b) only
+    enrich/count the entities the (mocked) Neptune returns for that scope — not
+    the whole type. progress.total reflects the scoped matched count."""
+    async def run():
+        # Mocked Neptune returns ONLY the two Manager-level mentors for the
+        # scoped SELECT (as a real Neptune would, given the constraint).
+        scoped_rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Mentor/m2", "label": "Grace", "vals": ""},
+        ]
+        neptune, captured = _capturing_neptune(scoped_rows)
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Ada", "bio"): [Verdict(value="Ada bio", confidence=0.95, source="wikidata")],
+                ("Grace", "bio"): [Verdict(value="Grace bio", confidence=0.95, source="wikidata")],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            scope=EnrichScope(predicate="haslevel", value="Manager"),
+        )
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        # (a) The scope constraint is present in the entity-selection SPARQL.
+        sel = captured["select"]
+        assert "FILTER EXISTS" in sel
+        assert (
+            "<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+            "<https://cograph.tech/onto/haslevel>"
+        ) in sel
+        assert 'LCASE(STR(?stl)) = "manager"' in sel
+
+        # (b) Only the two scoped entities were processed (not all Mentors).
+        final = await store.get(job.id)
+        assert final is not None
+        assert final.progress.total == 2  # 2 entities × 1 attribute
+        assert final.progress.processed == 2
+        assert final.progress.filled == 2
+        # Each scoped entity was looked up exactly once for "bio".
+        assert sorted(lbl for lbl, _ in wikidata.calls) == ["Ada", "Grace"]
+
+    asyncio.run(run())
+
+
+def test_executor_scope_literal_attribute_constraint_in_sparql():
+    """A scope on a literal attribute emits the literal-match arm in the SELECT."""
+    async def run():
+        scoped_rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
+        ]
+        neptune, captured = _capturing_neptune(scoped_rows)
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {("Ada", "bio"): [Verdict(value="Ada bio", confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            scope=EnrichScope(predicate="title", value="Director"),
+        )
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        sel = captured["select"]
+        assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "director"' in sel
+        assert "<https://cograph.tech/types/Mentor/attrs/title>" in sel
+
+        final = await store.get(job.id)
+        assert final.progress.total == 1
+        assert final.progress.processed == 1
+
+    asyncio.run(run())
+
+
+def test_executor_entity_uris_subset_only_those_enriched():
+    """entity_uris restricts the run to exactly those URIs via a VALUES block."""
+    async def run():
+        # Neptune returns only the requested subset for the VALUES query.
+        subset_rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
+        ]
+        neptune, captured = _capturing_neptune(subset_rows)
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {("Ada", "bio"): [Verdict(value="Ada bio", confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            entity_uris=["https://cograph.tech/entities/Mentor/m1"],
+        )
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        sel = captured["select"]
+        assert "VALUES ?e {" in sel
+        assert "<https://cograph.tech/entities/Mentor/m1>" in sel
+        assert "FILTER EXISTS" not in sel
+
+        final = await store.get(job.id)
+        assert final.progress.total == 1
+        assert final.progress.processed == 1
+        assert wikidata.calls == [("Ada", "bio")]
+
+    asyncio.run(run())
+
+
+def test_executor_no_scope_runs_whole_type():
+    """No scope/entity_uris → the SELECT has no subset constraint (unchanged)."""
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Mentor/m2", "label": "Grace", "vals": ""},
+        ]
+        neptune, captured = _capturing_neptune(rows)
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata({})
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(type_name="Mentor", attributes=["bio"])
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        sel = captured["select"]
+        assert "FILTER EXISTS" not in sel
+        assert "VALUES ?e" not in sel
+
+        final = await store.get(job.id)
+        assert final.progress.total == 2
+
+    asyncio.run(run())
+
+
+def test_count_entities_honors_scope_and_entity_uris():
+    """count_entities applies the same subset constraints (matched count)."""
+    async def run():
+        neptune = AsyncMock()
+        captured: dict[str, str] = {}
+
+        async def query(sparql, *args, **kwargs):
+            captured["q"] = sparql
+            return _count_response(7)
+
+        neptune.query.side_effect = query
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        executor = EnrichmentExecutor(neptune, store, cache, FakeWikidata({}))
+
+        # Scope path.
+        n = await executor.count_entities(
+            "test-tenant", "kg", "Mentor",
+            scope=EnrichScope(predicate="haslevel", value="Manager"),
+        )
+        assert n == 7
+        assert "FILTER EXISTS" in captured["q"]
+        assert "<https://cograph.tech/onto/haslevel>" in captured["q"]
+
+        # entity_uris path (wins over scope).
+        await executor.count_entities(
+            "test-tenant", "kg", "Mentor",
+            scope=EnrichScope(predicate="haslevel", value="Manager"),
+            entity_uris=["https://cograph.tech/entities/Mentor/m1"],
+        )
+        assert "VALUES ?e {" in captured["q"]
+        assert "FILTER EXISTS" not in captured["q"]
+
+        # No-subset path: bare type count, no subset machinery.
+        await executor.count_entities("test-tenant", "kg", "Mentor")
+        assert "FILTER EXISTS" not in captured["q"]
+        assert "VALUES ?e" not in captured["q"]
 
     asyncio.run(run())
 
@@ -824,6 +1129,61 @@ def test_post_jobs_returns_job_id(client, auth_headers, mock_neptune):
     assert data["status"] == "queued"
     assert data["total_entities"] == 0
     assert data["estimated_cost_usd"] == 0
+
+
+def test_post_jobs_with_scope_threads_and_reports_matched(
+    client, auth_headers, mock_neptune
+):
+    """A scoped create-job (COG-112): count_entities applies the scope (mocked
+    Neptune returns 2), the response carries matched_entities, and the stored
+    job persists the scope so the executor uses it."""
+    mock_neptune.query.return_value = _count_response(2)
+
+    response = client.post(
+        "/graphs/test-tenant/enrich/jobs",
+        headers=auth_headers,
+        json={
+            "type_name": "Mentor",
+            "attributes": ["bio"],
+            "kg_name": "kg",
+            "tier": "lite",
+            "scope": {"predicate": "haslevel", "value": "Manager"},
+        },
+    )
+    assert response.status_code == 202
+    data = response.json()
+    assert data["total_entities"] == 2
+    assert data["matched_entities"] == 2
+
+    # The stored job retains the scope (full-job view).
+    job = client.get(
+        f"/graphs/test-tenant/enrich/jobs/{data['job_id']}", headers=auth_headers
+    ).json()
+    assert job["scope"] == {"predicate": "haslevel", "value": "Manager"}
+    assert job["entity_uris"] is None
+
+
+def test_post_jobs_with_entity_uris_subset(client, auth_headers, mock_neptune):
+    """entity_uris on create-job persists and counts the explicit subset."""
+    mock_neptune.query.return_value = _count_response(1)
+    uris = ["https://cograph.tech/entities/Mentor/m1"]
+    response = client.post(
+        "/graphs/test-tenant/enrich/jobs",
+        headers=auth_headers,
+        json={
+            "type_name": "Mentor",
+            "attributes": ["bio"],
+            "kg_name": "kg",
+            "entity_uris": uris,
+        },
+    )
+    assert response.status_code == 202
+    data = response.json()
+    assert data["matched_entities"] == 1
+    job = client.get(
+        f"/graphs/test-tenant/enrich/jobs/{data['job_id']}", headers=auth_headers
+    ).json()
+    assert job["entity_uris"] == uris
 
 
 def test_get_jobs_lists_jobs(client, auth_headers, mock_neptune):
