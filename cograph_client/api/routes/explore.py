@@ -54,8 +54,19 @@ SYSTEM_PREDICATES: frozenset[str] = frozenset({
 })
 
 # In-memory hot cache on top of the persistent stats graph. Read-heavy data
-# that only changes on ingest; warmed on first read, busted on recompute.
-_SUMMARY_TTL_SECONDS = 300.0
+# warmed on first read, busted whenever the underlying counts change.
+#
+# The TTL is a staleness *backstop*, NOT the invalidation mechanism: every
+# in-process mutation that changes a type's summary — ingest, ER rebuild, AND
+# enrichment/dedupe apply — routes through `recompute_kg_stats` (via
+# `schedule_recompute`), which explicitly evicts this cache for the affected KG
+# (see below). So a short TTL bought nothing but extra Neptune round trips —
+# every ~5 min an active Explorer session re-queried the stats graph for data
+# that had not changed and would be evicted the moment it did. A longer backstop
+# keeps tenant/KG switches served from memory across a working session while
+# still self-healing if an external writer ever mutates the underlying graph
+# without going through `recompute_kg_stats`.
+_SUMMARY_TTL_SECONDS = 1800.0
 _summary_cache: dict[tuple[str, str, str], tuple[float, dict]] = {}
 
 # --- Precomputed stats graph --------------------------------------------------

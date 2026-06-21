@@ -158,10 +158,14 @@ async def _run_dedupe(
 ) -> None:
     """Background worker: run second-pass ER over a KG and record the report.
 
-    Reuses resolver.er.rebuild.rebuild_kg directly (explore.py is owned by
-    another agent and must not be edited). Records the rebuild report into the
+    Reuses resolver.er.rebuild.rebuild_kg directly (the same primitive the
+    explore.py ``er-rebuild`` route uses). Records the rebuild report into the
     job's progress/error and flips status to applied (or failed) + last_run.
+    On success it also schedules a type-stats recompute, mirroring the
+    ``er_rebuild`` route — a dedupe collapses fragments and changes per-type
+    counts, so the Explorer's precomputed stats are stale until recomputed.
     """
+    from cograph_client.api.routes.explore import schedule_recompute
     from cograph_client.resolver.er.rebuild import rebuild_kg
 
     job = await job_store.get(job_id)
@@ -184,6 +188,10 @@ async def _run_dedupe(
             f"{len(report.get('types', []))} type(s)"
         )
         job.status = JobStatus.applied
+        # Merge volume changed per-type counts → refresh the Explorer's
+        # precomputed type-stats in the background (best-effort), exactly as the
+        # explore.py er-rebuild route does after rebuild_kg.
+        schedule_recompute(client, tenant_id, kg_name)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning(
             "dedupe_action_failed", tenant=tenant_id, kg=kg_name, error=str(exc)

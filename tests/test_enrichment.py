@@ -591,7 +591,14 @@ def test_executor_no_match_when_no_verdict():
     asyncio.run(run())
 
 
-def test_apply_decisions_writes_accepted_only():
+def test_apply_decisions_writes_accepted_only(monkeypatch):
+    # apply_decisions now schedules a real stats recompute after a write; stub it
+    # so this test stays focused on the write itself (and doesn't leave a
+    # fire-and-forget recompute task draining against the AsyncMock).
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
     async def run():
         neptune = AsyncMock()
         store = InMemoryJobStore()
@@ -623,6 +630,160 @@ def test_apply_decisions_writes_accepted_only():
         neptune.update.assert_awaited()
 
     asyncio.run(run())
+
+
+def test_executor_apply_schedules_stats_recompute(monkeypatch):
+    """An auto-apply that writes triples must bust the Explorer summary cache by
+    scheduling a stats recompute for the job's (tenant, kg)."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        explore_mod,
+        "schedule_recompute",
+        lambda client, tenant_id, kg_name: calls.append((tenant_id, kg_name)),
+    )
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.return_value = _entities_query_response(rows)
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Bosch", "manufacturer"): [
+                    Verdict(value="Robert Bosch GmbH", confidence=0.95, source="wikidata")
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        final = await store.get(job.id)
+        assert final.status == JobStatus.applied
+
+    asyncio.run(run())
+    assert calls == [("test-tenant", "kg")]
+
+
+def test_executor_no_apply_does_not_recompute(monkeypatch):
+    """A stage-only job writes nothing → no recompute should be scheduled."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        explore_mod,
+        "schedule_recompute",
+        lambda client, tenant_id, kg_name: calls.append((tenant_id, kg_name)),
+    )
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.return_value = _entities_query_response(rows)
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Bosch", "manufacturer"): [
+                    Verdict(value="Robert Bosch GmbH", confidence=0.95, source="wikidata")
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        # stage policy never writes triples (it routes to review and returns).
+        job = _make_job(policy=ConflictPolicy.stage)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+    asyncio.run(run())
+    assert calls == []
+
+
+def test_apply_decisions_schedules_stats_recompute(monkeypatch):
+    """A review-apply that accepts >=1 fact schedules a recompute for (tenant, kg)."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        explore_mod,
+        "schedule_recompute",
+        lambda client, tenant_id, kg_name: calls.append((tenant_id, kg_name)),
+    )
+
+    async def run():
+        neptune = AsyncMock()
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata({})
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+        job = _make_job(policy=ConflictPolicy.stage)
+        await store.create(job)
+
+        decisions = [
+            ConflictReview(
+                entity_uri="https://cograph.tech/entities/Product/p1",
+                attribute="manufacturer",
+                existing_value="Acme",
+                proposed=Verdict(value="Bosch", confidence=0.95, source="wikidata"),
+                decision="accept",
+            ),
+        ]
+        applied = await executor.apply_decisions(job.id, decisions)
+        assert applied == 1
+
+    asyncio.run(run())
+    # job's (tenant_id, kg_name) come from _make_job: "test-tenant" / "kg".
+    assert calls == [("test-tenant", "kg")]
+
+
+def test_apply_decisions_no_accept_does_not_recompute(monkeypatch):
+    """All-reject review applies nothing → no recompute scheduled."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        explore_mod,
+        "schedule_recompute",
+        lambda client, tenant_id, kg_name: calls.append((tenant_id, kg_name)),
+    )
+
+    async def run():
+        neptune = AsyncMock()
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata({})
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+        job = _make_job(policy=ConflictPolicy.stage)
+        await store.create(job)
+
+        decisions = [
+            ConflictReview(
+                entity_uri="https://cograph.tech/entities/Product/p2",
+                attribute="manufacturer",
+                existing_value="X",
+                proposed=Verdict(value="Y", confidence=0.95, source="wikidata"),
+                decision="reject",
+            ),
+        ]
+        applied = await executor.apply_decisions(job.id, decisions)
+        assert applied == 0
+
+    asyncio.run(run())
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------

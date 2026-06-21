@@ -315,6 +315,11 @@ class EnrichmentExecutor:
             triples = self._select_triples_for_policy(all_rows, job.type_name, policy)
             if triples:
                 await self._neptune.update(insert_triples(graph_uri, triples))
+                # New attribute values were written → the Explorer's precomputed
+                # type-stats (coverage %, counts) are now stale. Recompute them
+                # in the background so the panels refresh without waiting for the
+                # summary-cache TTL. Only fire when something was actually applied.
+                self._schedule_stats_recompute(tenant_id, job.kg_name)
             job.status = JobStatus.applied
             job.completed_at = _now()
             await self._jobs.update(job)
@@ -481,10 +486,25 @@ class EnrichmentExecutor:
             applied += 1
         if triples:
             await self._neptune.update(insert_triples(graph_uri, triples))
+            # Accepted facts were written → refresh the Explorer's precomputed
+            # type-stats in the background (mirrors the auto-apply path in run()).
+            self._schedule_stats_recompute(job.tenant_id, job.kg_name)
         job.status = JobStatus.applied
         job.completed_at = _now()
         await self._jobs.update(job)
         return applied
+
+    def _schedule_stats_recompute(self, tenant_id: str, kg_name: str) -> None:
+        """Fire-and-forget a type-stats recompute after an enrichment write.
+
+        Lazy-imported from the explore route to avoid a module-load import cycle
+        (the API route modules cross-reference one another; ingest.py uses the
+        same lazy pattern). ``schedule_recompute`` is best-effort — it swallows
+        Neptune errors internally — so this never affects the job's outcome.
+        """
+        from cograph_client.api.routes.explore import schedule_recompute
+
+        schedule_recompute(self._neptune, tenant_id, kg_name)
 
 
 def _slug_from_uri(uri: str) -> str:

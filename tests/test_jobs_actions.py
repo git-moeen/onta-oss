@@ -399,6 +399,76 @@ def test_action_find_merge_duplicates_creates_dedupe_job(
     assert any(j["id"] == data["job_id"] for j in listing)
 
 
+def test_run_dedupe_schedules_stats_recompute(monkeypatch):
+    """A successful dedupe must refresh the Explorer stats (recompute) for the
+    job's (tenant, kg) — the dedupe worker collapses fragments and changes
+    per-type counts, mirroring the er-rebuild route."""
+    from unittest.mock import AsyncMock
+
+    import cograph_client.api.routes.actions as actions_mod
+    import cograph_client.api.routes.explore as explore_mod
+    import cograph_client.resolver.er.rebuild as rebuild_mod
+
+    async def fake_rebuild(client_, instance_graph):
+        return {"types": [{"type": "Product"}], "fragments_absorbed_total": 3}
+
+    monkeypatch.setattr(rebuild_mod, "rebuild_kg", fake_rebuild)
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        explore_mod,
+        "schedule_recompute",
+        lambda client, tenant_id, kg_name: calls.append((tenant_id, kg_name)),
+    )
+
+    async def run():
+        store = InMemoryJobStore()
+        job = _make_job(job_id="dd-1", category=JobCategory.dedupe)
+        await store.create(job)
+        await actions_mod._run_dedupe(
+            AsyncMock(), store, job.id, "test-tenant", "kg"
+        )
+        final = await store.get(job.id)
+        assert final.status == JobStatus.applied
+
+    asyncio.run(run())
+    assert calls == [("test-tenant", "kg")]
+
+
+def test_run_dedupe_failure_does_not_recompute(monkeypatch):
+    """A failed rebuild writes nothing → no recompute scheduled."""
+    from unittest.mock import AsyncMock
+
+    import cograph_client.api.routes.actions as actions_mod
+    import cograph_client.api.routes.explore as explore_mod
+    import cograph_client.resolver.er.rebuild as rebuild_mod
+
+    async def boom(client_, instance_graph):
+        raise RuntimeError("rebuild blew up")
+
+    monkeypatch.setattr(rebuild_mod, "rebuild_kg", boom)
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        explore_mod,
+        "schedule_recompute",
+        lambda client, tenant_id, kg_name: calls.append((tenant_id, kg_name)),
+    )
+
+    async def run():
+        store = InMemoryJobStore()
+        job = _make_job(job_id="dd-2", category=JobCategory.dedupe)
+        await store.create(job)
+        await actions_mod._run_dedupe(
+            AsyncMock(), store, job.id, "test-tenant", "kg"
+        )
+        final = await store.get(job.id)
+        assert final.status == JobStatus.failed
+
+    asyncio.run(run())
+    assert calls == []
+
+
 def test_action_suggest_relationships_degrades(client, auth_headers):
     from cograph_client.api.routes import actions
 
