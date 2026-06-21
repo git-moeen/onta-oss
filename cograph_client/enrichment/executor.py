@@ -39,13 +39,26 @@ from cograph_client.enrichment.strategy import (
 from cograph_client.enrichment.tiers import get_chain
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.parser import parse_sparql_results
-from cograph_client.graph.queries import insert_triples, kg_graph_uri
+from cograph_client.graph.queries import (
+    insert_triples,
+    kg_graph_uri,
+    tenant_graph_uri,
+)
 
 logger = structlog.stdlib.get_logger("cograph.enrichment")
 
 
 TYPE_URI_PREFIX = "https://cograph.tech/types/"
 RDFS_LABEL = "http://www.w3.org/2000/01/rdf-schema#label"
+RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+RDF_PROPERTY = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
+RDFS_DOMAIN = "http://www.w3.org/2000/01/rdf-schema#domain"
+# Relationship instance triples use the `…/onto/<predName>` namespace (minted in
+# nlp/pipeline.py + resolver/schema_resolver.py); literal-attribute instance
+# triples use the `…/types/<Type>/attrs/<name>` (attr_uri) namespace. A scope
+# predicate's ontology declaration doesn't tell us which the data uses, so a
+# resolved local-name maps to BOTH candidate instance IRIs.
+ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
 NAME_FALLBACK_ATTRS = ["name", "title", "headline"]
 WORKER_POOL_SIZE = 8
 PROGRESS_FLUSH_EVERY = 10
@@ -91,57 +104,71 @@ def _local_name(uri_or_value: str) -> str:
     return s
 
 
-def _scope_block(type_name: str, scope: EnrichScope) -> str:
+def _safe_iri(uri: str) -> bool:
+    """A concrete predicate/label IRI is safe to interpolate into ``<…>`` only if
+    it carries none of the chars that could break out of the term. The resolved
+    IRIs are built from ``attr_uri``/``onto/`` + an ontology-known leaf so they
+    are well-formed, but this is the executor-level backstop (defense in depth)."""
+    return isinstance(uri, str) and bool(_IRI_RE.match(uri))
+
+
+def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> str:
     """SPARQL graph pattern restricting ``?e`` (already typed) to a value-scope.
 
     ``scope.predicate`` is an attribute OR relationship **local-name** (e.g.
-    ``hasLevel``, ``property_type``). Rather than reconstruct candidate predicate
-    IRIs and interpolate the name into them, the predicate is matched by its
-    case-insensitive local-name in a FILTER:
+    ``hasLevel``, ``property_type``). It has already been resolved (case-
+    insensitively) against the type's ontology-declared predicates to a list of
+    **concrete instance predicate IRIs** (``pred_iris``) by
+    :func:`_resolve_scope_predicate_iris`. Matching a bounded set of concrete
+    IRIs — ``?e <pred-iri> ?sv`` — lets Neptune use its predicate index instead
+    of scanning every triple of every entity (the COG-112 perf fix: the old
+    ``?e ?p ?sv`` + ``FILTER(LCASE(REPLACE(STR(?p), …)))`` form was an
+    O(entities × predicates) scan that timed out at create time on a 13.5k-entity
+    type).
 
-      ``?e ?p ?sv . FILTER(LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "<pred>")``
+    Injection safety is preserved: ``scope.predicate`` was validated as a safe
+    local-name AND resolved to an ontology-known IRI, so each interpolated
+    ``pred_iri`` is a concrete, well-formed IRI (re-checked by :func:`_safe_iri`),
+    never raw user text. ``scope.value`` still appears only as a lower-cased,
+    ``_esc_lit``-escaped string *literal*.
 
-    This has two important properties:
-
-      - **No injection surface for the predicate.** The predicate appears ONLY as
-        a lower-cased, ``_esc_lit``-escaped string *literal* — never spliced into
-        an IRI — so a ``>`` / whitespace / quote in the name can't break out of
-        the query. (Pydantic validators on the request models reject such names
-        at the API boundary anyway; this is defense in depth.)
-      - **Case-insensitive matching (#2).** Real local-names are mixed-style; the
-        old exact-IRI form could silently match zero. ``LCASE`` on both sides
-        fixes that — request ``hasLevel`` matches a stored ``haslevel``.
-
-    Attribute vs relationship is discriminated by the OBJECT, not by an ontology
-    lookup, so the same builder is correct without a round-trip:
+    Case-insensitive value matching (#2) is kept on both sides via ``LCASE``.
+    Attribute vs relationship is discriminated by the OBJECT (no extra round-trip):
 
       - **literal attribute** — the object is a literal; match its string value
         case-insensitively: ``FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = "<v>")``.
       - **relationship to a node** — the object is an IRI; match the target
-        node's display label/name case-insensitively (``rdfs:label`` with the
-        ``name``/``title``/``headline`` attribute fallbacks), OR the target
+        node's display label/name case-insensitively over a BOUNDED set of
+        concrete label/name predicates (``rdfs:label`` + the
+        ``name``/``title``/``headline`` attribute predicates), OR the target
         IRI's local-name as a fallback.
 
-    The three arms are UNIONed inside an EXISTS so a single entity matching any
-    one is selected. Values are lower-cased in Python AND via ``LCASE`` so the
-    match is case-insensitive on both sides.
+    If ``pred_iris`` is empty (predicate not declared on the type) the block
+    emits ``FILTER(false)`` so the scope matches NOTHING fast — never the old
+    unbounded scan (COG-112 fix #3).
     """
-    pred_lower = _esc_lit(scope.predicate.lower())
+    safe_iris = [u for u in pred_iris if _safe_iri(u)]
+    if not safe_iris:
+        # Predicate not resolvable on this type → match nothing, fast & honest.
+        return "  FILTER(false)"
+
     v_lower = _esc_lit(scope.value.lower())
+    pred_in = ", ".join(f"<{u}>" for u in safe_iris)
     label_preds = ", ".join(
         f"<{p}>"
         for p in [RDFS_LABEL] + [_attr_uri(type_name, a) for a in NAME_FALLBACK_ATTRS]
     )
     return (
         f"  FILTER EXISTS {{\n"
+        # Match the predicate by CONCRETE IRI(s) (predicate-indexed, no scan).
         f"    ?e ?p ?sv .\n"
-        # Match the predicate by case-insensitive local-name (no IRI interpolation).
-        f"    FILTER(LCASE(REPLACE(STR(?p), \"^.*[/#]\", \"\")) = \"{pred_lower}\")\n"
+        f"    FILTER(?p IN ({pred_in}))\n"
         f"    {{\n"
         # Literal-attribute arm.
         f"      FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
         f"    }} UNION {{\n"
-        # Relationship arm: match the target node's label / name …
+        # Relationship arm: match the target node's label / name over a bounded
+        # set of concrete label predicates (not an open ?sv ?slp ?stl scan).
         f"      ?sv ?slp ?stl .\n"
         f"      FILTER(?slp IN ({label_preds}))\n"
         f"      FILTER(LCASE(STR(?stl)) = \"{v_lower}\")\n"
@@ -151,6 +178,61 @@ def _scope_block(type_name: str, scope: EnrichScope) -> str:
         f"    }}\n"
         f"  }}"
     )
+
+
+def _resolve_scope_predicate_query(graph_uri: str, type_name: str) -> str:
+    """SELECT every predicate the ontology declares on ``type_name`` (leaf + URI).
+
+    Same shape the Explorer summary / records paths use (``?attr a rdf:Property ;
+    rdfs:domain <type> ; rdfs:label ?label``). Tiny — bounded by the type's
+    attribute count, not its instance count — so it is cheap to run at create
+    time. Returns the ontology attribute URI and its label so the caller can
+    derive both candidate instance predicate IRIs (attr_uri vs onto/<leaf>)."""
+    t_uri = _type_uri(type_name)
+    return (
+        f"SELECT ?attr ?label FROM <{graph_uri}> WHERE {{\n"
+        f"  ?attr <{RDF_TYPE}> <{RDF_PROPERTY}> .\n"
+        f"  ?attr <{RDFS_DOMAIN}> <{t_uri}> .\n"
+        f"  ?attr <{RDFS_LABEL}> ?label .\n"
+        f"}}"
+    )
+
+
+def _instance_pred_iris_for_leaf(type_name: str, leaf: str) -> list[str]:
+    """The concrete instance predicate IRIs a declared predicate ``leaf`` can use.
+
+    A literal attribute is stored under ``…/types/<Type>/attrs/<leaf>``
+    (``attr_uri``); a relationship is stored under ``…/onto/<leaf>``
+    (``ONTO_PRED_PREFIX``). The ontology declaration alone doesn't pin which, so
+    we match BOTH — both are concrete, ontology-derived IRIs, so this stays a
+    bounded, predicate-indexed match (no scan)."""
+    return [_attr_uri(type_name, leaf), f"{ONTO_PRED_PREFIX}{leaf}"]
+
+
+def _resolve_pred_iris_from_bindings(
+    type_name: str, predicate: str, bindings: list[dict]
+) -> list[str]:
+    """Case-insensitively resolve ``predicate`` against the type's declared
+    predicates (from :func:`_resolve_scope_predicate_query` bindings) to the
+    concrete instance predicate IRIs to match. Returns ``[]`` when the predicate
+    is not declared on the type (caller treats as matched-0)."""
+    want = predicate.strip().lower()
+    iris: list[str] = []
+    seen: set[str] = set()
+    for row in bindings:
+        attr_uri_val = row.get("attr", "")
+        label = row.get("label", "")
+        # The leaf is the ontology attr-URI's last segment; the label is the
+        # human name. Match against both (case-insensitive) so a request can use
+        # either the stored leaf or the declared label.
+        leaf = _local_name(attr_uri_val) if attr_uri_val else ""
+        candidates_lower = {c.lower() for c in (leaf, label) if c}
+        if want in candidates_lower and leaf:
+            for iri in _instance_pred_iris_for_leaf(type_name, leaf):
+                if iri not in seen:
+                    seen.add(iri)
+                    iris.append(iri)
+    return iris
 
 
 def _now() -> datetime:
@@ -164,6 +246,7 @@ def _build_select_query(
     limit: Optional[int],
     scope: Optional[EnrichScope] = None,
     entity_uris: Optional[list[str]] = None,
+    scope_pred_iris: Optional[list[str]] = None,
 ) -> str:
     """Entity-selection SELECT for an enrich job.
 
@@ -174,6 +257,10 @@ def _build_select_query(
         to ``?e a <Type>`` so a stray URI of another type is ignored).
       - ``scope``: appends a value-filter graph pattern (see :func:`_scope_block`)
         restricting to entities of the type whose attribute/relationship matches.
+        ``scope_pred_iris`` are the concrete instance predicate IRI(s) the scope
+        predicate resolved to (see :func:`_resolve_scope_predicate_iris`); an
+        empty list means the predicate is not declared on the type, so the scope
+        matches nothing (fast, no per-entity scan — COG-112 perf fix).
     """
     type_uri = _type_uri(type_name)
     attr_uris = [_attr_uri(type_name, a) for a in attributes]
@@ -189,7 +276,7 @@ def _build_select_query(
         values = " ".join(f"<{u}>" for u in _validate_entity_uris(entity_uris))
         subset_clause = f"  VALUES ?e {{ {values} }}\n"
     elif scope is not None:
-        subset_clause = _scope_block(type_name, scope) + "\n"
+        subset_clause = _scope_block(type_name, scope, scope_pred_iris or []) + "\n"
     else:
         subset_clause = ""
 
@@ -274,6 +361,36 @@ class EnrichmentExecutor:
         except Exception:  # noqa: BLE001
             pass
 
+    async def _resolve_scope_predicate_iris(
+        self, tenant_id: str, type_name: str, scope: EnrichScope
+    ) -> list[str]:
+        """Resolve ``scope.predicate`` (a local-name) to the concrete instance
+        predicate IRI(s) to match, case-insensitively, from the type's
+        ontology-declared predicates.
+
+        Returns ``[]`` when the predicate is not declared on the type — the
+        caller then builds a "matches nothing" scope (fast, honest matched-0)
+        rather than the old unbounded per-entity predicate scan (COG-112 fix).
+
+        On a Neptune error this also returns ``[]`` (matched-0) so create stays
+        fast and never 500s; reads degrade to an honest zero rather than a hang.
+        """
+        onto_graph = tenant_graph_uri(tenant_id)
+        query = _resolve_scope_predicate_query(onto_graph, type_name)
+        try:
+            raw = await self._neptune.query(query)
+            _, bindings = parse_sparql_results(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "scope_predicate_resolve_failed",
+                tenant_id=tenant_id,
+                type_name=type_name,
+                predicate=scope.predicate,
+                error=str(exc),
+            )
+            return []
+        return _resolve_pred_iris_from_bindings(type_name, scope.predicate, bindings)
+
     async def count_entities(
         self,
         tenant_id: str,
@@ -288,13 +405,26 @@ class EnrichmentExecutor:
         entity-selection query (COG-112) so the create-job response can report
         "this will enrich N" before the run starts. ``entity_uris`` wins over
         ``scope`` (matching :func:`_build_select_query`).
+
+        For a ``scope`` the predicate is resolved to a concrete instance IRI
+        first (cheap, ontology-bounded), so the COUNT matches on a
+        predicate-indexed term instead of scanning every predicate of every
+        entity — the COG-112 perf fix that kept this query (run synchronously at
+        create time) from timing out on a 13.5k-entity type.
         """
         graph_uri = kg_graph_uri(tenant_id, kg_name)
         if entity_uris:
             values = " ".join(f"<{u}>" for u in _validate_entity_uris(entity_uris))
             subset_clause = f"  VALUES ?e {{ {values} }}\n"
         elif scope is not None:
-            subset_clause = _scope_block(type_name, scope) + "\n"
+            pred_iris = await self._resolve_scope_predicate_iris(
+                tenant_id, type_name, scope
+            )
+            # Unresolved predicate → scope matches nothing; short-circuit to 0
+            # without even issuing the COUNT (honest matched-0, fast).
+            if not pred_iris:
+                return 0
+            subset_clause = _scope_block(type_name, scope, pred_iris) + "\n"
         else:
             subset_clause = ""
         query = (
@@ -329,6 +459,16 @@ class EnrichmentExecutor:
             missing_adapter_names: set[str] = set()
 
             graph_uri = kg_graph_uri(tenant_id, job.kg_name)
+            # Resolve a scope predicate to concrete instance IRI(s) so the
+            # entity-selection SELECT matches a predicate-indexed term, not an
+            # unbounded per-entity scan (COG-112 perf fix). entity_uris path
+            # never needs this. An unresolved predicate yields [] → the scope
+            # block matches nothing (consistent with count_entities → matched 0).
+            scope_pred_iris: Optional[list[str]] = None
+            if job.scope is not None and not job.entity_uris:
+                scope_pred_iris = await self._resolve_scope_predicate_iris(
+                    tenant_id, job.type_name, job.scope
+                )
             sel = _build_select_query(
                 graph_uri,
                 job.type_name,
@@ -336,6 +476,7 @@ class EnrichmentExecutor:
                 job.limit,
                 scope=job.scope,
                 entity_uris=job.entity_uris,
+                scope_pred_iris=scope_pred_iris,
             )
             raw = await self._neptune.query(sel)
             _, bindings = parse_sparql_results(raw)
