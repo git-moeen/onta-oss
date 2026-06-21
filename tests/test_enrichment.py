@@ -15,6 +15,7 @@ from cograph_client.enrichment.executor import (
     _parse_vals,
     _resolve_pred_iris_from_bindings,
     _scope_block,
+    _scope_subselect,
     _values_match,
 )
 from cograph_client.enrichment.job_store import InMemoryJobStore
@@ -446,10 +447,12 @@ def test_build_select_query_no_scope_is_unchanged():
 
 def test_build_select_query_scope_matches_bound_predicate_path():
     """A scope predicate is matched by a BOUND-predicate property-path alternation
-    (the COG-112 fix #2) — never a variable predicate + ``FILTER(?p IN (...))``
-    (which Neptune does NOT predicate-index) and never an unbounded ``?e ?p ?sv``
-    scan — and the value is matched case-insensitively against a literal OR the
-    target label."""
+    INLINED in the WHERE (the COG-112 fix #4) — never wrapped in ``FILTER EXISTS``
+    (which Neptune evaluates once per type instance), never a variable predicate +
+    ``FILTER(?p IN (...))`` (which Neptune does NOT predicate-index) and never an
+    unbounded ``?e ?p ?sv`` scan — and the value is matched case-insensitively
+    against a literal OR the target label. The scoped subset is reduced first by a
+    ``SELECT DISTINCT ?e`` sub-select, then attributes are hydrated."""
     scope = EnrichScope(predicate="haslevel", value="Manager")
     # The resolved instance IRI(s) for the predicate (attr_uri + onto/<leaf>).
     pred_iris = [
@@ -460,14 +463,18 @@ def test_build_select_query_scope_matches_bound_predicate_path():
         "https://g/x", "Mentor", ["bio"], None, scope=scope, scope_pred_iris=pred_iris
     )
 
-    # Still typed to Mentor and the scope is an EXISTS constraint on ?e.
+    # Typed to Mentor, but inside a bounded DISTINCT sub-select that the planner
+    # can reduce to the scoped subset BEFORE the attribute OPTIONALs run. The
+    # scope must NOT be wrapped in a FILTER EXISTS (the third COG-112 perf bug).
+    assert "FILTER EXISTS" not in q
+    assert "SELECT DISTINCT ?e WHERE {" in q
     assert "?e a <https://cograph.tech/types/Mentor> ." in q
-    assert "FILTER EXISTS" in q
-    # The predicate is matched by a BOUND property-path alternation — Neptune
-    # uses the POS index. The scope must NOT use a variable predicate (?e ?p ?sv
-    # + FILTER(?p IN ...)). (The attribute-value OPTIONAL legitimately uses a
-    # bounded FILTER(?p IN ...) for which attrs to GROUP_CONCAT — that is not the
-    # scope predicate, so we assert specifically on the scope's ?sv object var.)
+    # The predicate is matched by a BOUND property-path alternation INLINED next
+    # to ?e a <Type> — Neptune uses the POS index. The scope must NOT use a
+    # variable predicate (?e ?p ?sv + FILTER(?p IN ...)). (The attribute-value
+    # OPTIONAL legitimately uses a bounded FILTER(?p IN ...) for which attrs to
+    # GROUP_CONCAT — that is not the scope predicate, so we assert specifically on
+    # the scope's ?sv object var.)
     assert (
         "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
         "<https://cograph.tech/onto/haslevel>) ?sv ." in q
@@ -554,14 +561,19 @@ def test_build_select_query_entity_uris_wins_over_scope():
 
 
 def test_scope_block_is_pure_helper():
-    """_scope_block builds the constraint independent of the SELECT wrapper,
-    using the concrete predicate IRI(s) it is handed."""
+    """_scope_block builds INLINE join patterns (no FILTER EXISTS wrapper)
+    independent of the SELECT wrapper, using the concrete predicate IRI(s) it is
+    handed. The first pattern is the bound-predicate triple so the planner can
+    drive from it (COG-112 fix #4)."""
     block = _scope_block(
         "Mentor",
         EnrichScope(predicate="haslevel", value="Manager"),
         ["https://cograph.tech/onto/haslevel"],
     )
-    assert block.lstrip().startswith("FILTER EXISTS")
+    # No EXISTS wrapper — the patterns are inlined directly into the WHERE.
+    assert "FILTER EXISTS" not in block
+    # The very first pattern is the selective bound-predicate triple.
+    assert block.lstrip().startswith("?e <https://cograph.tech/onto/haslevel> ?sv .")
     # Predicate matched by a BOUND property path (single IRI → bare term) — no
     # variable predicate, no scan.
     assert "?e <https://cograph.tech/onto/haslevel> ?sv ." in block
@@ -593,6 +605,52 @@ def test_scope_block_empty_pred_iris_matches_nothing():
     """No concrete IRIs → FILTER(false) (fast matched-0), not an unbounded scan."""
     block = _scope_block("Mentor", EnrichScope(predicate="haslevel", value="x"), [])
     assert block.strip() == "FILTER(false)"
+
+
+def test_scope_subselect_dedups_and_caps():
+    """The scoped subset is reduced by a bounded ``SELECT DISTINCT ?e`` sub-select
+    that (a) types + scopes ?e with the inline patterns, (b) DISTINCT-dedups so a
+    multi-arm UNION match can't multiply ?e rows, and (c) applies the LIMIT INSIDE
+    the sub-select so it caps the SELECTED entities — never a FILTER EXISTS
+    (COG-112 fix #4)."""
+    scope = EnrichScope(predicate="haslevel", value="Manager")
+    pred_iris = [
+        "https://cograph.tech/types/Mentor/attrs/haslevel",
+        "https://cograph.tech/onto/haslevel",
+    ]
+    sub = _scope_subselect("Mentor", scope, pred_iris, limit=50)
+    # De-dup: a DISTINCT sub-select on ?e.
+    assert "SELECT DISTINCT ?e WHERE {" in sub
+    # Typed inside the sub-select.
+    assert "?e a <https://cograph.tech/types/Mentor> ." in sub
+    # Inline bound-predicate scope triple — no EXISTS wrapper.
+    assert "FILTER EXISTS" not in sub
+    assert (
+        "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
+        "<https://cograph.tech/onto/haslevel>) ?sv ." in sub
+    )
+    # LIMIT is INSIDE the sub-select (caps the selected entities).
+    assert "LIMIT 50" in sub
+    # Without a limit, no LIMIT is emitted (count path reuses this).
+    sub_no_limit = _scope_subselect("Mentor", scope, pred_iris)
+    assert "SELECT DISTINCT ?e WHERE {" in sub_no_limit
+    assert "LIMIT" not in sub_no_limit
+
+
+def test_build_select_query_scope_limit_caps_inside_subselect():
+    """For a scoped SELECT the LIMIT lives INSIDE the DISTINCT sub-select (so it
+    caps the SELECTED entities before the attribute OPTIONALs hydrate them), not
+    as a top-level LIMIT on the GROUP BY (which would cap post-hydration rows)."""
+    scope = EnrichScope(predicate="haslevel", value="Manager")
+    pred_iris = ["https://cograph.tech/types/Mentor/attrs/haslevel"]
+    q = _build_select_query(
+        "https://g/x", "Mentor", ["bio"], 25, scope=scope, scope_pred_iris=pred_iris
+    )
+    # LIMIT appears within the sub-select, before the attribute OPTIONALs.
+    sub_end = q.index("OPTIONAL")
+    assert "LIMIT 25" in q[:sub_end]
+    # The GROUP BY tail must NOT carry a second top-level LIMIT.
+    assert q.rstrip().endswith("GROUP BY ?e ?label ?nameAttr")
 
 
 def test_resolve_pred_iris_from_bindings_case_insensitive():
@@ -955,11 +1013,13 @@ def test_executor_scope_relationship_selects_only_scoped_entities():
         await store.create(job)
         await executor.run(job, "test-tenant")
 
-        # (a) The scope constraint is present in the entity-selection SPARQL and
-        # matches via a BOUND-predicate property path — no variable predicate +
-        # FILTER, no unbounded ?e ?p ?sv scan.
+        # (a) The scope constraint is present in the entity-selection SPARQL,
+        # inlined in a bounded DISTINCT sub-select (NOT a FILTER EXISTS — the
+        # third COG-112 perf bug) and matched via a BOUND-predicate property path
+        # — no variable predicate + FILTER, no unbounded ?e ?p ?sv scan.
         sel = captured["select"]
-        assert "FILTER EXISTS" in sel
+        assert "FILTER EXISTS" not in sel
+        assert "SELECT DISTINCT ?e WHERE {" in sel
         assert (
             "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
             "<https://cograph.tech/onto/haslevel>) ?sv ." in sel
@@ -1193,7 +1253,11 @@ def test_count_entities_honors_scope_and_entity_uris():
             scope=EnrichScope(predicate="haslevel", value="Manager"),
         )
         assert n == 7
-        assert "FILTER EXISTS" in captured["q"]
+        # COUNT(DISTINCT ?e) over the SAME bounded DISTINCT sub-select the SELECT
+        # uses — inline bound-predicate scope patterns, never a FILTER EXISTS.
+        assert "FILTER EXISTS" not in captured["q"]
+        assert "COUNT(DISTINCT ?e)" in captured["q"]
+        assert "SELECT DISTINCT ?e WHERE {" in captured["q"]
         assert (
             "?e (<https://cograph.tech/types/Mentor/attrs/haslevel>|"
             "<https://cograph.tech/onto/haslevel>) ?sv ." in captured["q"]
@@ -1201,6 +1265,8 @@ def test_count_entities_honors_scope_and_entity_uris():
         assert "FILTER(?p IN (" not in captured["q"]
         assert "?e ?p ?sv" not in captured["q"]
         assert "REPLACE(STR(?p)" not in captured["q"]
+        # The COUNT must NOT carry a LIMIT (it reflects the full scoped subset).
+        assert "LIMIT" not in captured["q"]
 
         # entity_uris path (wins over scope).
         await executor.count_entities(

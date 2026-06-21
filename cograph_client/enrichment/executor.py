@@ -126,7 +126,10 @@ def _pred_path(iris: list[str]) -> str:
 
 
 def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> str:
-    """SPARQL graph pattern restricting ``?e`` (already typed) to a value-scope.
+    """INLINE SPARQL graph patterns restricting ``?e`` (already typed) to a
+    value-scope — emitted directly into the WHERE next to ``?e a <Type>`` so the
+    planner can drive from the selective bound-predicate triple, NOT wrapped in a
+    ``FILTER EXISTS``.
 
     ``scope.predicate`` is an attribute OR relationship **local-name** (e.g.
     ``hasLevel``, ``property_type``). It has already been resolved (case-
@@ -136,14 +139,21 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
     **bound-predicate property-path alternation** — ``?e (<a>|<b>) ?sv`` — so
     Neptune uses its POS (predicate-object) index instead of scanning.
 
-    COG-112 two-layer perf history:
+    COG-112 three-layer perf history:
       1. The original form ``?e ?p ?sv . FILTER(LCASE(REPLACE(STR(?p), …)))``
          was an O(entities × predicates) local-name scan that timed out.
       2. The first fix resolved the predicate to concrete IRIs but still matched
          with a VARIABLE predicate + ``FILTER(?p IN (<a>,<b>))``. On Neptune a
          variable predicate + FILTER does NOT use the predicate index, so it
-         still scanned. This version binds the predicate via a property path so
-         the POS index is used.
+         still scanned. The second fix bound the predicate via a property path.
+      3. The bound property path lived inside ``FILTER EXISTS { … }`` wrapped
+         around ``?e a <Type>``, so Neptune evaluated the EXISTS **once per type
+         instance** (O(all instances), 13.5k Mentors) — still a timeout. This
+         fix inlines the scope as join patterns so the optimizer starts from the
+         selective bound-predicate triple (~9k haslevel edges via the POS index),
+         joins/filters down to the <10 matches, and only then (in the caller)
+         hydrates attributes. The caller wraps this in a ``SELECT DISTINCT ?e``
+         sub-select so the multi-arm UNION can never multiply ``?e`` rows.
 
     Injection safety is preserved: ``scope.predicate`` was validated as a safe
     local-name AND resolved to an ontology-known IRI, so each interpolated
@@ -177,23 +187,55 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
     label_iris = [RDFS_LABEL] + [_attr_uri(type_name, a) for a in NAME_FALLBACK_ATTRS]
     label_path = _pred_path(label_iris)
     return (
-        f"  FILTER EXISTS {{\n"
         # Match the predicate by a BOUND property path (POS-indexed, no scan).
-        f"    ?e {pred_path} ?sv .\n"
-        f"    {{\n"
+        # Inlined directly into the WHERE — the planner drives from this selective
+        # triple instead of evaluating an EXISTS once per type instance.
+        f"  ?e {pred_path} ?sv .\n"
+        f"  {{\n"
         # Literal-attribute arm.
-        f"      FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
-        f"    }} UNION {{\n"
+        f"    FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
+        f"  }} UNION {{\n"
         # Relationship arm: match the target node's label / name over a bounded
         # set of concrete label predicates, bound as a property path (not an open
         # ?sv ?slp ?stl scan).
-        f"      ?sv {label_path} ?stl .\n"
-        f"      FILTER(LCASE(STR(?stl)) = \"{v_lower}\")\n"
-        f"    }} UNION {{\n"
+        f"    ?sv {label_path} ?stl .\n"
+        f"    FILTER(LCASE(STR(?stl)) = \"{v_lower}\")\n"
+        f"  }} UNION {{\n"
         # … or the target IRI's local-name as a fallback.
-        f"      FILTER(isIRI(?sv) && LCASE(REPLACE(STR(?sv), \"^.*[/#]\", \"\")) = \"{v_lower}\")\n"
-        f"    }}\n"
+        f"    FILTER(isIRI(?sv) && LCASE(REPLACE(STR(?sv), \"^.*[/#]\", \"\")) = \"{v_lower}\")\n"
         f"  }}"
+    )
+
+
+def _scope_subselect(
+    type_name: str,
+    scope: EnrichScope,
+    pred_iris: list[str],
+    limit: Optional[int] = None,
+) -> str:
+    """A bounded ``SELECT DISTINCT ?e`` sub-select that reduces ``?e`` to the
+    scoped (and, if ``limit`` given, capped) subset of ``type_name`` instances
+    BEFORE any attribute hydration.
+
+    The inner WHERE inlines :func:`_scope_block`'s join patterns next to
+    ``?e a <Type>`` so the planner drives from the selective bound-predicate
+    triple (POS-indexed) → joins/filters down to the matches, never evaluating
+    an EXISTS once per type instance (the third COG-112 perf layer).
+
+    ``DISTINCT`` collapses the multi-arm scope UNION so an entity matching more
+    than one arm yields a single ``?e`` row — the caller can then attach the
+    GROUP_CONCAT attribute OPTIONALs without row multiplication. The ``LIMIT``
+    is applied INSIDE the sub-select so the cap bounds the selected entities (and
+    the subsequent attribute hydration), matching the no-scope ``LIMIT`` semantics.
+    """
+    type_uri = _type_uri(type_name)
+    limit_clause = f"\n    LIMIT {int(limit)}" if limit else ""
+    scope_patterns = _scope_block(type_name, scope, pred_iris)
+    return (
+        f"  {{ SELECT DISTINCT ?e WHERE {{\n"
+        f"    ?e a <{type_uri}> .\n"
+        f"  {scope_patterns}\n"
+        f"  }}{limit_clause} }}\n"
     )
 
 
@@ -272,12 +314,18 @@ def _build_select_query(
       - ``entity_uris`` (lower-level primitive, wins over ``scope``): restricts
         to exactly those URIs via a ``VALUES ?e {…}`` block (still constrained
         to ``?e a <Type>`` so a stray URI of another type is ignored).
-      - ``scope``: appends a value-filter graph pattern (see :func:`_scope_block`)
-        restricting to entities of the type whose attribute/relationship matches.
-        ``scope_pred_iris`` are the concrete instance predicate IRI(s) the scope
-        predicate resolved to (see :func:`_resolve_scope_predicate_iris`); an
-        empty list means the predicate is not declared on the type, so the scope
-        matches nothing (fast, no per-entity scan — COG-112 perf fix).
+      - ``scope``: restricts to entities of the type whose attribute/relationship
+        matches, via a bounded ``SELECT DISTINCT ?e`` sub-select (see
+        :func:`_scope_subselect`) that inlines the scope join patterns (see
+        :func:`_scope_block`) next to ``?e a <Type>`` — so the planner drives
+        from the selective bound-predicate triple instead of evaluating an
+        ``EXISTS`` once per type instance (COG-112 perf fix #4). The LIMIT is
+        applied INSIDE the sub-select so it caps the SELECTED entities before the
+        attribute OPTIONALs hydrate them. ``scope_pred_iris`` are the concrete
+        instance predicate IRI(s) the scope predicate resolved to (see
+        :func:`_resolve_scope_predicate_iris`); an empty list means the predicate
+        is not declared on the type, so the scope matches nothing (fast,
+        ``FILTER(false)``, no per-entity scan — COG-112 perf fix).
     """
     type_uri = _type_uri(type_name)
     attr_uris = [_attr_uri(type_name, a) for a in attributes]
@@ -286,16 +334,30 @@ def _build_select_query(
     in_list = ", ".join(f"<{u}>" for u in attr_uris) if attr_uris else "<urn:none>"
     fallback_in = ", ".join(f"<{u}>" for u in fallback_uris)
 
-    limit_clause = f"\nLIMIT {int(limit)}" if limit else ""
-
     # Subset constraint. entity_uris (explicit primitive) wins over scope.
+    #
+    # For a `scope`, the typed+scoped+capped `?e` set is produced by a bounded
+    # DISTINCT sub-select (the LIMIT lives INSIDE it so it caps the SELECTED
+    # entities, then attribute OPTIONALs hydrate that bounded set — COG-112 fix
+    # #4). For the no-scope / entity_uris paths the outer query keeps the bare
+    # `?e a <Type>` + a trailing top-level LIMIT exactly as before.
     if entity_uris:
         values = " ".join(f"<{u}>" for u in _validate_entity_uris(entity_uris))
+        type_clause = f"  ?e a <{type_uri}> .\n"
         subset_clause = f"  VALUES ?e {{ {values} }}\n"
+        limit_clause = f"\nLIMIT {int(limit)}" if limit else ""
     elif scope is not None:
-        subset_clause = _scope_block(type_name, scope, scope_pred_iris or []) + "\n"
+        # The sub-select emits `?e a <Type>` + the inline scope patterns and caps
+        # to LIMIT internally; the outer query must not re-type or re-LIMIT.
+        type_clause = ""
+        subset_clause = _scope_subselect(
+            type_name, scope, scope_pred_iris or [], limit
+        )
+        limit_clause = ""
     else:
+        type_clause = f"  ?e a <{type_uri}> .\n"
         subset_clause = ""
+        limit_clause = f"\nLIMIT {int(limit)}" if limit else ""
 
     # GROUP_CONCAT predicate::value for all matching attribute triples.
     # Also pull a label / name fallback for entity_label.
@@ -303,7 +365,7 @@ def _build_select_query(
         f"SELECT ?e ?label ?nameAttr\n"
         f'  (GROUP_CONCAT(DISTINCT CONCAT(STR(?p), "::", STR(?o)); separator="||") AS ?vals)\n'
         f"FROM <{graph_uri}> WHERE {{\n"
-        f"  ?e a <{type_uri}> .\n"
+        f"{type_clause}"
         f"{subset_clause}"
         f"  OPTIONAL {{ ?e <{RDFS_LABEL}> ?label }}\n"
         f"  OPTIONAL {{ ?e ?fp ?nameAttr . FILTER(?fp IN ({fallback_in})) }}\n"
@@ -429,14 +491,19 @@ class EnrichmentExecutor:
         tests; it shares the same index-efficient SPARQL as the SELECT.
 
         For a ``scope`` the predicate is resolved to a concrete instance IRI
-        first (cheap, ontology-bounded), and the COUNT matches it via a
-        BOUND-predicate property path (POS-indexed) instead of a variable
-        predicate + ``FILTER`` (which Neptune does NOT predicate-index) or a
-        per-triple scan — the two-layer COG-112 perf fix.
+        first (cheap, ontology-bounded), and the COUNT runs over the SAME bounded
+        ``SELECT DISTINCT ?e`` sub-select the SELECT uses (see
+        :func:`_scope_subselect`): the inline scope patterns let the planner drive
+        from the selective BOUND-predicate property path (POS-indexed) instead of
+        a variable predicate + ``FILTER`` (which Neptune does NOT predicate-index),
+        a per-triple scan, OR an ``EXISTS`` evaluated once per type instance — the
+        three-layer COG-112 perf fix. (No LIMIT: the COUNT reflects the full
+        scoped subset, not the capped SELECT.)
         """
         graph_uri = kg_graph_uri(tenant_id, kg_name)
         if entity_uris:
             values = " ".join(f"<{u}>" for u in _validate_entity_uris(entity_uris))
+            type_clause = f"  ?e a <{_type_uri(type_name)}> .\n"
             subset_clause = f"  VALUES ?e {{ {values} }}\n"
         elif scope is not None:
             pred_iris = await self._resolve_scope_predicate_iris(
@@ -446,12 +513,19 @@ class EnrichmentExecutor:
             # without even issuing the COUNT (honest matched-0, fast).
             if not pred_iris:
                 return 0
-            subset_clause = _scope_block(type_name, scope, pred_iris) + "\n"
+            # Count over the SAME bounded DISTINCT sub-select the SELECT uses: the
+            # inline scope patterns let the planner drive from the selective
+            # bound-predicate triple instead of evaluating an EXISTS once per
+            # type instance (COG-112 fix #4). No LIMIT — the COUNT reflects the
+            # full scoped subset, not the capped SELECT.
+            type_clause = ""
+            subset_clause = _scope_subselect(type_name, scope, pred_iris)
         else:
+            type_clause = f"  ?e a <{_type_uri(type_name)}> .\n"
             subset_clause = ""
         query = (
             f"SELECT (COUNT(DISTINCT ?e) AS ?n) FROM <{graph_uri}> WHERE {{\n"
-            f"  ?e a <{_type_uri(type_name)}> .\n"
+            f"{type_clause}"
             f"{subset_clause}"
             f"}}"
         )
