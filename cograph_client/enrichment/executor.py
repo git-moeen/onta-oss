@@ -591,14 +591,37 @@ class EnrichmentExecutor:
             f"{subset_clause}"
             f"}}"
         )
+        # TEMPORARY diagnostic (COG-112): for a scoped count log the resolved IRIs
+        # and the full COUNT query. Remove once the 0-match issue is diagnosed.
+        if scope is not None or entity_uris:
+            logger.info(
+                "scope_debug_count_query",
+                kg_name=kg_name,
+                type_name=type_name,
+                scope_predicate=(scope.predicate if scope else None),
+                scope_value=(scope.value if scope else None),
+                entity_uris=entity_uris,
+                count_query=query,
+            )
         raw = await self._neptune.query(query)
         _, bindings = parse_sparql_results(raw)
         if not bindings:
             return 0
         try:
-            return int(bindings[0].get("n", "0"))
+            n = int(bindings[0].get("n", "0"))
         except (TypeError, ValueError):
             return 0
+        # TEMPORARY diagnostic (COG-112): the count Neptune returned for the scope.
+        if scope is not None or entity_uris:
+            logger.info(
+                "scope_debug_count_result",
+                kg_name=kg_name,
+                type_name=type_name,
+                scope_predicate=(scope.predicate if scope else None),
+                scope_value=(scope.value if scope else None),
+                count=n,
+            )
+        return n
 
     async def run(self, job: EnrichJob, tenant_id: str) -> None:
         try:
@@ -638,6 +661,31 @@ class EnrichmentExecutor:
                 entity_uris=job.entity_uris,
                 scope_pred_iris=scope_pred_iris,
             )
+            # TEMPORARY diagnostic (COG-112): for a scoped enrich (scope or
+            # entity_uris present) log the resolved scope predicate IRIs and the
+            # full SELECT string sent to Neptune, so we can see why a scoped
+            # enrich matches 0 entities on live data. Remove once diagnosed.
+            _is_scoped = job.scope is not None or bool(job.entity_uris)
+            if _is_scoped:
+                logger.info(
+                    "scope_debug_resolved_iris",
+                    job_id=job.id,
+                    kg_name=job.kg_name,
+                    type_name=job.type_name,
+                    scope_predicate=(job.scope.predicate if job.scope else None),
+                    scope_value=(job.scope.value if job.scope else None),
+                    entity_uris=job.entity_uris,
+                    scope_pred_iris=scope_pred_iris,
+                )
+                logger.info(
+                    "scope_debug_select_query",
+                    job_id=job.id,
+                    kg_name=job.kg_name,
+                    type_name=job.type_name,
+                    scope_predicate=(job.scope.predicate if job.scope else None),
+                    scope_value=(job.scope.value if job.scope else None),
+                    select_query=sel,
+                )
             raw = await self._neptune.query(sel)
             _, bindings = parse_sparql_results(raw)
 
@@ -649,6 +697,19 @@ class EnrichmentExecutor:
                 label = row.get("label") or row.get("nameAttr") or _slug_from_uri(e_uri)
                 vals = _parse_vals(row.get("vals", ""))
                 entities.append({"uri": e_uri, "label": label, "vals": vals})
+
+            # TEMPORARY diagnostic (COG-112): how many entities the scoped SELECT
+            # returned (the 0-match symptom is visible here). Remove once diagnosed.
+            if _is_scoped:
+                logger.info(
+                    "scope_debug_selected_count",
+                    job_id=job.id,
+                    kg_name=job.kg_name,
+                    type_name=job.type_name,
+                    scope_predicate=(job.scope.predicate if job.scope else None),
+                    scope_value=(job.scope.value if job.scope else None),
+                    selected_count=len(entities),
+                )
 
             job.progress.total = len(entities) * len(job.attributes)
             await self._jobs.update(job)
