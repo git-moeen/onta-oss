@@ -516,3 +516,86 @@ def test_action_enrich_creates_enrichment_job(client, auth_headers, mock_neptune
         "/graphs/test-tenant/jobs?category=enrichment", headers=auth_headers
     ).json()
     assert any(j["id"] == data["job_id"] for j in listing)
+
+
+def test_action_enrich_threads_scope(client, auth_headers, mock_neptune):
+    """The /actions/enrich body accepts scope (COG-112) and persists it on the job."""
+    mock_neptune.query.return_value = {
+        "head": {"vars": ["n"]},
+        "results": {"bindings": [{"n": {"type": "literal", "value": "0"}}]},
+    }
+    r = client.post(
+        "/graphs/test-tenant/actions/enrich",
+        headers=auth_headers,
+        json={
+            "type_name": "Mentor",
+            "attributes": ["bio"],
+            "kg_name": "kg",
+            "scope": {"predicate": "haslevel", "value": "Manager"},
+        },
+    )
+    assert r.status_code == 202
+    job_id = r.json()["job_id"]
+
+    job = client.get(
+        f"/graphs/test-tenant/enrich/jobs/{job_id}", headers=auth_headers
+    ).json()
+    assert job["scope"] == {"predicate": "haslevel", "value": "Manager"}
+
+
+# ---------------------------------------------------------------------------
+# COG-112 review: injection rejected at the API boundary (422)
+# ---------------------------------------------------------------------------
+
+
+def test_create_job_rejects_injecting_scope_predicate(
+    client, auth_headers, mock_neptune
+):
+    """An injecting scope.predicate is rejected with 422 and never reaches the
+    enrich pipeline (count_entities must not be called)."""
+    r = client.post(
+        "/graphs/test-tenant/enrich/jobs",
+        headers=auth_headers,
+        json={
+            "type_name": "Mentor",
+            "attributes": ["bio"],
+            "kg_name": "kg",
+            # `>` would break out of the predicate IRI in a naive builder.
+            "scope": {"predicate": "haslevel> } UNION", "value": "Manager"},
+        },
+    )
+    assert r.status_code == 422
+    mock_neptune.query.assert_not_called()
+
+
+def test_create_job_rejects_injecting_entity_uri(client, auth_headers, mock_neptune):
+    """An injecting entity_uris entry is rejected with 422; never reaches SPARQL."""
+    r = client.post(
+        "/graphs/test-tenant/enrich/jobs",
+        headers=auth_headers,
+        json={
+            "type_name": "Mentor",
+            "attributes": ["bio"],
+            "kg_name": "kg",
+            "entity_uris": ["https://evil> } INSERT { ?s ?p ?o }"],
+        },
+    )
+    assert r.status_code == 422
+    mock_neptune.query.assert_not_called()
+
+
+def test_action_enrich_rejects_injecting_entity_uri(
+    client, auth_headers, mock_neptune
+):
+    """The /actions/enrich body applies the same entity_uris validation (422)."""
+    r = client.post(
+        "/graphs/test-tenant/actions/enrich",
+        headers=auth_headers,
+        json={
+            "type_name": "Mentor",
+            "attributes": ["bio"],
+            "kg_name": "kg",
+            "entity_uris": ["not-a-url"],
+        },
+    )
+    assert r.status_code == 422
