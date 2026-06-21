@@ -8,6 +8,7 @@ review or applies them directly based on conflict_policy.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -44,12 +45,6 @@ logger = structlog.stdlib.get_logger("cograph.enrichment")
 
 
 TYPE_URI_PREFIX = "https://cograph.tech/types/"
-ENTITY_URI_PREFIX = "https://cograph.tech/entities/"
-# Relationship (object-property) predicates are minted on instance triples under
-# the onto/ namespace (nlp/pipeline.py): `…/onto/<predName>`. A scope predicate
-# given as a local-name may be stored under EITHER this form OR the attribute-URI
-# form, so the scope filter matches both.
-ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
 RDFS_LABEL = "http://www.w3.org/2000/01/rdf-schema#label"
 NAME_FALLBACK_ATTRS = ["name", "title", "headline"]
 WORKER_POOL_SIZE = 8
@@ -64,13 +59,26 @@ def _attr_uri(type_name: str, attr: str) -> str:
     return f"{TYPE_URI_PREFIX}{type_name}/attrs/{attr}"
 
 
-def _onto_pred_uri(local_name: str) -> str:
-    return f"{ONTO_PRED_PREFIX}{local_name}"
-
-
 def _esc_lit(value: str) -> str:
     """Escape a string for use inside a SPARQL double-quoted literal."""
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+# A well-formed http(s) IRI with none of the characters that could break out of
+# a SPARQL ``<…>`` term (``<``, ``>``, ``"``, ``{``, ``}``, whitespace). The
+# Pydantic validators on the request models reject bad input at the API
+# boundary; this is the executor-level backstop so a malformed URI can never be
+# spliced into a VALUES block (defense in depth — SPARQL injection fix #1).
+_IRI_RE = re.compile(r'^https?://[^\s<>"{}]+$')
+
+
+def _validate_entity_uris(entity_uris: list[str]) -> list[str]:
+    """Return ``entity_uris`` unchanged, or raise ``ValueError`` if any entry is
+    not a safe http(s) IRI (no ``<>"{}`` or whitespace)."""
+    for u in entity_uris:
+        if not isinstance(u, str) or not _IRI_RE.match(u):
+            raise ValueError(f"invalid entity URI for scoped enrichment: {u!r}")
+    return entity_uris
 
 
 def _local_name(uri_or_value: str) -> str:
@@ -86,11 +94,23 @@ def _local_name(uri_or_value: str) -> str:
 def _scope_block(type_name: str, scope: EnrichScope) -> str:
     """SPARQL graph pattern restricting ``?e`` (already typed) to a value-scope.
 
-    ``scope.predicate`` is an attribute OR relationship local-name; it may be
-    stored on instance triples under the attribute-URI form
-    (``…/types/<Type>/attrs/<name>``) OR the relationship form
-    (``…/onto/<name>``), so both predicate URIs are matched via a property-path
-    alternation (``<attrUri>|<ontoUri>``).
+    ``scope.predicate`` is an attribute OR relationship **local-name** (e.g.
+    ``hasLevel``, ``property_type``). Rather than reconstruct candidate predicate
+    IRIs and interpolate the name into them, the predicate is matched by its
+    case-insensitive local-name in a FILTER:
+
+      ``?e ?p ?sv . FILTER(LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "<pred>")``
+
+    This has two important properties:
+
+      - **No injection surface for the predicate.** The predicate appears ONLY as
+        a lower-cased, ``_esc_lit``-escaped string *literal* — never spliced into
+        an IRI — so a ``>`` / whitespace / quote in the name can't break out of
+        the query. (Pydantic validators on the request models reject such names
+        at the API boundary anyway; this is defense in depth.)
+      - **Case-insensitive matching (#2).** Real local-names are mixed-style; the
+        old exact-IRI form could silently match zero. ``LCASE`` on both sides
+        fixes that — request ``hasLevel`` matches a stored ``haslevel``.
 
     Attribute vs relationship is discriminated by the OBJECT, not by an ontology
     lookup, so the same builder is correct without a round-trip:
@@ -102,14 +122,11 @@ def _scope_block(type_name: str, scope: EnrichScope) -> str:
         ``name``/``title``/``headline`` attribute fallbacks), OR the target
         IRI's local-name as a fallback.
 
-    The two arms are UNIONed inside an EXISTS so a single entity matching either
-    is selected. The value is lower-cased in Python AND via ``LCASE`` so the
+    The three arms are UNIONed inside an EXISTS so a single entity matching any
+    one is selected. Values are lower-cased in Python AND via ``LCASE`` so the
     match is case-insensitive on both sides.
     """
-    attr_pred = _attr_uri(type_name, scope.predicate)
-    onto_pred = _onto_pred_uri(scope.predicate)
-    pred_path = f"<{attr_pred}>|<{onto_pred}>"
-    v = _esc_lit(scope.value)
+    pred_lower = _esc_lit(scope.predicate.lower())
     v_lower = _esc_lit(scope.value.lower())
     label_preds = ", ".join(
         f"<{p}>"
@@ -117,7 +134,9 @@ def _scope_block(type_name: str, scope: EnrichScope) -> str:
     )
     return (
         f"  FILTER EXISTS {{\n"
-        f"    ?e {pred_path} ?sv .\n"
+        f"    ?e ?p ?sv .\n"
+        # Match the predicate by case-insensitive local-name (no IRI interpolation).
+        f"    FILTER(LCASE(REPLACE(STR(?p), \"^.*[/#]\", \"\")) = \"{pred_lower}\")\n"
         f"    {{\n"
         # Literal-attribute arm.
         f"      FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
@@ -167,7 +186,7 @@ def _build_select_query(
 
     # Subset constraint. entity_uris (explicit primitive) wins over scope.
     if entity_uris:
-        values = " ".join(f"<{u}>" for u in entity_uris)
+        values = " ".join(f"<{u}>" for u in _validate_entity_uris(entity_uris))
         subset_clause = f"  VALUES ?e {{ {values} }}\n"
     elif scope is not None:
         subset_clause = _scope_block(type_name, scope) + "\n"
@@ -272,7 +291,7 @@ class EnrichmentExecutor:
         """
         graph_uri = kg_graph_uri(tenant_id, kg_name)
         if entity_uris:
-            values = " ".join(f"<{u}>" for u in entity_uris)
+            values = " ".join(f"<{u}>" for u in _validate_entity_uris(entity_uris))
             subset_clause = f"  VALUES ?e {{ {values} }}\n"
         elif scope is not None:
             subset_clause = _scope_block(type_name, scope) + "\n"

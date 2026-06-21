@@ -443,23 +443,22 @@ def test_build_select_query_no_scope_is_unchanged():
     assert "VALUES ?e" not in q
 
 
-def test_build_select_query_scope_emits_both_predicate_forms():
-    """A scope predicate local-name is matched under BOTH the attribute-URI form
-    and the relationship (onto/) form via a property-path alternation, and the
-    value is matched case-insensitively against a literal OR the target label."""
+def test_build_select_query_scope_matches_predicate_by_local_name():
+    """A scope predicate is matched by its case-insensitive LOCAL-NAME in a
+    FILTER (no IRI interpolation), and the value is matched case-insensitively
+    against a literal OR the target label."""
     scope = EnrichScope(predicate="haslevel", value="Manager")
     q = _build_select_query("https://g/x", "Mentor", ["bio"], None, scope=scope)
 
     # Still typed to Mentor and the scope is an EXISTS constraint on ?e.
     assert "?e a <https://cograph.tech/types/Mentor> ." in q
     assert "FILTER EXISTS" in q
-    # Both predicate URI forms appear (attr URI | onto URI alternation).
-    assert "<https://cograph.tech/types/Mentor/attrs/haslevel>" in q
-    assert "<https://cograph.tech/onto/haslevel>" in q
-    assert (
-        "<https://cograph.tech/types/Mentor/attrs/haslevel>|"
-        "<https://cograph.tech/onto/haslevel>"
-    ) in q
+    # The predicate appears ONLY as a lower-cased string literal in a local-name
+    # FILTER — never spliced into an IRI (injection-safe + casing-insensitive).
+    assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in q
+    # No predicate IRI is reconstructed from the scope predicate any more.
+    assert "<https://cograph.tech/types/Mentor/attrs/haslevel>" not in q
+    assert "<https://cograph.tech/onto/haslevel>" not in q
     # Literal-attribute arm: case-insensitive literal match (value lower-cased).
     assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "manager"' in q
     # Relationship arm: match the target node's label / name predicates.
@@ -468,6 +467,18 @@ def test_build_select_query_scope_emits_both_predicate_forms():
     assert 'LCASE(STR(?stl)) = "manager"' in q
     # IRI local-name fallback for the relationship target.
     assert 'isIRI(?sv)' in q
+
+
+def test_build_select_query_scope_predicate_casing_is_normalized():
+    """A mixed-case request predicate (`hasLevel`) is lower-cased into the
+    local-name FILTER so it matches entities stored as `haslevel` (#2)."""
+    scope = EnrichScope(predicate="hasLevel", value="Manager")
+    q = _build_select_query("https://g/x", "Mentor", ["bio"], None, scope=scope)
+    # The generated SPARQL LCASEs the predicate local-name and compares to the
+    # lower-cased request predicate, so casing on either side is irrelevant.
+    assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in q
+    # The original mixed-case form must NOT leak into the query verbatim.
+    assert '"hasLevel"' not in q
 
 
 def test_build_select_query_scope_escapes_value():
@@ -511,7 +522,85 @@ def test_scope_block_is_pure_helper():
     """_scope_block builds the constraint independent of the SELECT wrapper."""
     block = _scope_block("Mentor", EnrichScope(predicate="haslevel", value="Manager"))
     assert block.lstrip().startswith("FILTER EXISTS")
-    assert "?e <https://cograph.tech/types/Mentor/attrs/haslevel>|" in block
+    # Predicate matched by local-name FILTER (no IRI interpolation).
+    assert "?e ?p ?sv ." in block
+    assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in block
+
+
+# ---------------------------------------------------------------------------
+# COG-112 review: SPARQL-injection hardening (validators + escaping)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_predicate",
+    [
+        "has>level",          # IRI-closing bracket
+        "has level",          # whitespace
+        'has"level',          # quote
+        "has{level}",         # braces
+        "",                   # empty
+        "   ",                # whitespace-only
+        "1level",             # must start with letter/underscore
+        "ns:level",           # colon (would let it look like a prefixed name)
+    ],
+)
+def test_enrich_scope_rejects_injecting_or_empty_predicate(bad_predicate):
+    """An injecting / empty scope.predicate is rejected by the model validator
+    (422 at the API boundary) and never reaches the SPARQL builder."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        EnrichScope(predicate=bad_predicate, value="Manager")
+
+
+@pytest.mark.parametrize("bad_value", ["", "   "])
+def test_enrich_scope_rejects_empty_value(bad_value):
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        EnrichScope(predicate="haslevel", value=bad_value)
+
+
+def test_enrich_request_rejects_injecting_entity_uri():
+    """A non-IRI / injecting entity_uris entry is rejected by the request model
+    before it can be spliced into a VALUES block."""
+    import pydantic
+
+    from cograph_client.enrichment.models import EnrichRequest
+
+    bad = [
+        "https://cograph.tech/entities/Mentor/m1",  # valid
+        "https://evil> } DROP",                      # injects out of <…>
+    ]
+    with pytest.raises(pydantic.ValidationError):
+        EnrichRequest(
+            type_name="Mentor",
+            attributes=["bio"],
+            kg_name="kg",
+            entity_uris=bad,
+        )
+    # A clean list is accepted.
+    ok = EnrichRequest(
+        type_name="Mentor",
+        attributes=["bio"],
+        kg_name="kg",
+        entity_uris=["https://cograph.tech/entities/Mentor/m1"],
+    )
+    assert ok.entity_uris == ["https://cograph.tech/entities/Mentor/m1"]
+
+
+def test_build_select_query_rejects_injecting_entity_uri_at_executor():
+    """Defense in depth: even if a bad URI reaches the builder (bypassing the
+    request model), it raises rather than emitting an injectable VALUES term."""
+    with pytest.raises(ValueError):
+        _build_select_query(
+            "https://g/x",
+            "Mentor",
+            ["bio"],
+            None,
+            entity_uris=["https://evil> } INSERT { ?s ?p ?o }"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -741,10 +830,7 @@ def test_executor_scope_relationship_selects_only_scoped_entities():
         # (a) The scope constraint is present in the entity-selection SPARQL.
         sel = captured["select"]
         assert "FILTER EXISTS" in sel
-        assert (
-            "<https://cograph.tech/types/Mentor/attrs/haslevel>|"
-            "<https://cograph.tech/onto/haslevel>"
-        ) in sel
+        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in sel
         assert 'LCASE(STR(?stl)) = "manager"' in sel
 
         # (b) Only the two scoped entities were processed (not all Mentors).
@@ -755,6 +841,45 @@ def test_executor_scope_relationship_selects_only_scoped_entities():
         assert final.progress.filled == 2
         # Each scoped entity was looked up exactly once for "bio".
         assert sorted(lbl for lbl, _ in wikidata.calls) == ["Ada", "Grace"]
+
+    asyncio.run(run())
+
+
+def test_executor_scope_predicate_casing_matches_via_lcase():
+    """A mixed-case request predicate (`hasLevel`) selects entities stored under
+    a `haslevel` local-name: the generated SELECT LCASEs the predicate
+    local-name and compares to the lower-cased request value (#2)."""
+    async def run():
+        scoped_rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
+        ]
+        neptune, captured = _capturing_neptune(scoped_rows)
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {("Ada", "bio"): [Verdict(value="Ada bio", confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            # Request uses mixed case; storage local-name is `haslevel`.
+            scope=EnrichScope(predicate="hasLevel", value="Manager"),
+        )
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        sel = captured["select"]
+        # The generated SPARQL LCASEs the predicate local-name and compares to
+        # the LOWER-cased request predicate, so a `haslevel`-stored triple
+        # matches a `hasLevel` request. The mixed-case form never leaks verbatim.
+        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in sel
+        assert '"hasLevel"' not in sel
+
+        final = await store.get(job.id)
+        assert final.progress.total == 1
+        assert final.progress.processed == 1
 
     asyncio.run(run())
 
@@ -783,7 +908,8 @@ def test_executor_scope_literal_attribute_constraint_in_sparql():
 
         sel = captured["select"]
         assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "director"' in sel
-        assert "<https://cograph.tech/types/Mentor/attrs/title>" in sel
+        # Predicate matched by local-name FILTER, not an interpolated attr IRI.
+        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "title"' in sel
 
         final = await store.get(job.id)
         assert final.progress.total == 1
@@ -877,7 +1003,7 @@ def test_count_entities_honors_scope_and_entity_uris():
         )
         assert n == 7
         assert "FILTER EXISTS" in captured["q"]
-        assert "<https://cograph.tech/onto/haslevel>" in captured["q"]
+        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in captured["q"]
 
         # entity_uris path (wins over scope).
         await executor.count_entities(

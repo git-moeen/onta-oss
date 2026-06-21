@@ -24,7 +24,7 @@ from typing import Awaitable, Callable, Optional
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from cograph_client.api.deps import (
     get_enrichment_job_store,
@@ -41,6 +41,7 @@ from cograph_client.enrichment.models import (
     JobCategory,
     JobStatus,
     JobTrigger,
+    _validate_entity_uris_field,
 )
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.queries import kg_graph_uri
@@ -108,6 +109,9 @@ class EnrichActionRequest(BaseModel):
     # COG-112 scoped enrichment (mirrors EnrichRequest). entity_uris wins.
     scope: Optional[EnrichScope] = None
     entity_uris: Optional[list[str]] = None
+
+    # Reject malformed IRIs at the API boundary with 422 (COG-112 review fix #1).
+    _check_entity_uris = field_validator("entity_uris")(_validate_entity_uris_field)
 
 
 # --- Helpers ------------------------------------------------------------------
