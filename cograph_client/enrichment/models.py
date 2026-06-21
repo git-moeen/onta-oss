@@ -99,12 +99,20 @@ class EnrichScope(BaseModel):
       the Level node whose ``rdfs:label`` / name is "Manager". The target IRI's
       local-name is accepted as a fallback.
 
-    The predicate is matched by its **case-insensitive local-name**, so callers
-    never need to know the storage namespace (attribute-URI vs ``onto/``
-    relationship form) and casing differences (``hasLevel`` vs ``haslevel``) do
-    not matter. ``predicate`` is validated to a safe local-name and ``value`` to
-    be non-empty (see validators below), and both are escaped string literals in
-    the generated SPARQL — never spliced into an IRI — so neither can inject.
+    The predicate is given as a **case-insensitive local-name**, so callers never
+    need to know the storage namespace (attribute-URI vs ``onto/`` relationship
+    form) and casing differences (``hasLevel`` vs ``haslevel``) do not matter.
+    The executor resolves it against the type's ontology-declared predicates to a
+    concrete instance predicate IRI before building the query — so the SELECT/
+    COUNT match a predicate-indexed term instead of scanning every predicate of
+    every entity (COG-112 perf fix). An unresolved predicate matches nothing
+    (honest matched-0), never an unbounded scan.
+
+    ``predicate`` is validated to a safe local-name and ``value`` to be non-empty
+    (see validators below). Injection-safety is twofold: the predicate is BOTH a
+    safe local-name AND resolved to an ontology-known IRI before interpolation,
+    and ``value`` is only ever an escaped, lower-cased string literal — never
+    spliced into an IRI — so neither can inject.
     """
 
     predicate: str

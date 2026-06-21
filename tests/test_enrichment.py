@@ -13,6 +13,7 @@ from cograph_client.enrichment.executor import (
     EnrichmentExecutor,
     _build_select_query,
     _parse_vals,
+    _resolve_pred_iris_from_bindings,
     _scope_block,
     _values_match,
 )
@@ -443,22 +444,30 @@ def test_build_select_query_no_scope_is_unchanged():
     assert "VALUES ?e" not in q
 
 
-def test_build_select_query_scope_matches_predicate_by_local_name():
-    """A scope predicate is matched by its case-insensitive LOCAL-NAME in a
-    FILTER (no IRI interpolation), and the value is matched case-insensitively
-    against a literal OR the target label."""
+def test_build_select_query_scope_matches_concrete_predicate_iri():
+    """A scope predicate is matched by a CONCRETE instance predicate IRI (the
+    COG-112 perf fix) — never an unbounded ``?e ?p ?sv`` predicate scan — and the
+    value is matched case-insensitively against a literal OR the target label."""
     scope = EnrichScope(predicate="haslevel", value="Manager")
-    q = _build_select_query("https://g/x", "Mentor", ["bio"], None, scope=scope)
+    # The resolved instance IRI(s) for the predicate (attr_uri + onto/<leaf>).
+    pred_iris = [
+        "https://cograph.tech/types/Mentor/attrs/haslevel",
+        "https://cograph.tech/onto/haslevel",
+    ]
+    q = _build_select_query(
+        "https://g/x", "Mentor", ["bio"], None, scope=scope, scope_pred_iris=pred_iris
+    )
 
     # Still typed to Mentor and the scope is an EXISTS constraint on ?e.
     assert "?e a <https://cograph.tech/types/Mentor> ." in q
     assert "FILTER EXISTS" in q
-    # The predicate appears ONLY as a lower-cased string literal in a local-name
-    # FILTER — never spliced into an IRI (injection-safe + casing-insensitive).
-    assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in q
-    # No predicate IRI is reconstructed from the scope predicate any more.
-    assert "<https://cograph.tech/types/Mentor/attrs/haslevel>" not in q
-    assert "<https://cograph.tech/onto/haslevel>" not in q
+    # The predicate is matched by CONCRETE IRI(s) in a FILTER(?p IN (...)) — the
+    # predicate index is usable; there is NO unbounded local-name predicate scan.
+    assert (
+        "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
+        "<https://cograph.tech/onto/haslevel>))" in q
+    )
+    assert 'REPLACE(STR(?p)' not in q
     # Literal-attribute arm: case-insensitive literal match (value lower-cased).
     assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "manager"' in q
     # Relationship arm: match the target node's label / name predicates.
@@ -469,22 +478,27 @@ def test_build_select_query_scope_matches_predicate_by_local_name():
     assert 'isIRI(?sv)' in q
 
 
-def test_build_select_query_scope_predicate_casing_is_normalized():
-    """A mixed-case request predicate (`hasLevel`) is lower-cased into the
-    local-name FILTER so it matches entities stored as `haslevel` (#2)."""
-    scope = EnrichScope(predicate="hasLevel", value="Manager")
-    q = _build_select_query("https://g/x", "Mentor", ["bio"], None, scope=scope)
-    # The generated SPARQL LCASEs the predicate local-name and compares to the
-    # lower-cased request predicate, so casing on either side is irrelevant.
-    assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in q
-    # The original mixed-case form must NOT leak into the query verbatim.
-    assert '"hasLevel"' not in q
+def test_build_select_query_scope_unresolved_predicate_matches_nothing():
+    """An unresolved scope predicate (no concrete IRIs) emits a fast
+    ``FILTER(false)`` rather than the old unbounded per-entity predicate scan
+    (COG-112 fix #3)."""
+    scope = EnrichScope(predicate="haslevel", value="Manager")
+    q = _build_select_query(
+        "https://g/x", "Mentor", ["bio"], None, scope=scope, scope_pred_iris=[]
+    )
+    assert "FILTER(false)" in q
+    # No predicate scan, no concrete-IRI EXISTS machinery.
+    assert "FILTER EXISTS" not in q
+    assert 'REPLACE(STR(?p)' not in q
 
 
 def test_build_select_query_scope_escapes_value():
     """Quotes/backslashes in the scope value are escaped into the SPARQL literal."""
     scope = EnrichScope(predicate="title", value='Sr "Eng"')
-    q = _build_select_query("https://g/x", "Mentor", ["bio"], None, scope=scope)
+    pred_iris = ["https://cograph.tech/types/Mentor/attrs/title"]
+    q = _build_select_query(
+        "https://g/x", "Mentor", ["bio"], None, scope=scope, scope_pred_iris=pred_iris
+    )
     # The injected value is lower-cased AND quote-escaped.
     assert 'sr \\"eng\\"' in q
 
@@ -519,12 +533,47 @@ def test_build_select_query_entity_uris_wins_over_scope():
 
 
 def test_scope_block_is_pure_helper():
-    """_scope_block builds the constraint independent of the SELECT wrapper."""
-    block = _scope_block("Mentor", EnrichScope(predicate="haslevel", value="Manager"))
+    """_scope_block builds the constraint independent of the SELECT wrapper,
+    using the concrete predicate IRI(s) it is handed."""
+    block = _scope_block(
+        "Mentor",
+        EnrichScope(predicate="haslevel", value="Manager"),
+        ["https://cograph.tech/onto/haslevel"],
+    )
     assert block.lstrip().startswith("FILTER EXISTS")
-    # Predicate matched by local-name FILTER (no IRI interpolation).
+    # Predicate matched by concrete IRI in a bounded FILTER(?p IN (...)) — no scan.
     assert "?e ?p ?sv ." in block
-    assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in block
+    assert "FILTER(?p IN (<https://cograph.tech/onto/haslevel>))" in block
+    assert "REPLACE(STR(?p)" not in block
+
+
+def test_scope_block_empty_pred_iris_matches_nothing():
+    """No concrete IRIs → FILTER(false) (fast matched-0), not an unbounded scan."""
+    block = _scope_block("Mentor", EnrichScope(predicate="haslevel", value="x"), [])
+    assert block.strip() == "FILTER(false)"
+
+
+def test_resolve_pred_iris_from_bindings_case_insensitive():
+    """A request predicate resolves (case-insensitively) against the type's
+    ontology-declared predicates to BOTH candidate instance IRIs; an unknown
+    predicate resolves to []."""
+    bindings = [
+        {"attr": "https://cograph.tech/types/Mentor/attrs/haslevel", "label": "haslevel"},
+        {"attr": "https://cograph.tech/types/Mentor/attrs/title", "label": "title"},
+    ]
+    # Mixed-case request matches the stored `haslevel` leaf/label.
+    iris = _resolve_pred_iris_from_bindings("Mentor", "hasLevel", bindings)
+    assert iris == [
+        "https://cograph.tech/types/Mentor/attrs/haslevel",
+        "https://cograph.tech/onto/haslevel",
+    ]
+    # Resolving by the declared label also works.
+    assert _resolve_pred_iris_from_bindings("Mentor", "TITLE", bindings) == [
+        "https://cograph.tech/types/Mentor/attrs/title",
+        "https://cograph.tech/onto/title",
+    ]
+    # Unknown predicate → no IRIs (caller treats as matched 0, no scan).
+    assert _resolve_pred_iris_from_bindings("Mentor", "nope", bindings) == []
 
 
 # ---------------------------------------------------------------------------
@@ -776,16 +825,53 @@ def test_executor_no_match_when_no_verdict():
 # ---------------------------------------------------------------------------
 
 
-def _capturing_neptune(scoped_rows: list[dict]):
+def _ontology_predicates_response(predicates: list[dict]) -> dict:
+    """Build a SPARQL response for the scope-predicate-resolution SELECT
+    (``?attr a rdf:Property ; rdfs:domain <type> ; rdfs:label ?label``).
+
+    predicates: list of {"attr": <onto attr URI>, "label": <display label>}.
+    """
+    bindings = []
+    for p in predicates:
+        bindings.append(
+            {
+                "attr": {"type": "uri", "value": p["attr"]},
+                "label": {"type": "literal", "value": p.get("label", "")},
+            }
+        )
+    return {"head": {"vars": ["attr", "label"]}, "results": {"bindings": bindings}}
+
+
+# Default ontology predicate declarations for the Mentor type used in the scope
+# tests: a `haslevel` relationship and `title` literal attribute, plus the
+# `name` display attribute. Keyed by ontology attr URI + its label.
+_MENTOR_ONTO_PREDS = [
+    {"attr": "https://cograph.tech/types/Mentor/attrs/haslevel", "label": "haslevel"},
+    {"attr": "https://cograph.tech/types/Mentor/attrs/title", "label": "title"},
+    {"attr": "https://cograph.tech/types/Mentor/attrs/name", "label": "name"},
+]
+
+
+def _capturing_neptune(scoped_rows: list[dict], onto_preds: list[dict] | None = None):
     """An AsyncMock Neptune whose entity-SELECT returns ``scoped_rows`` and that
-    records the SELECT SPARQL it was asked. The strategy-load query (over the
-    tenant ontology graph) returns an empty result so no strategy is applied."""
+    records the SELECT SPARQL it was asked.
+
+    Two queries run over the tenant ontology graph (no ``/kg/`` segment): the
+    scope-predicate resolution (``rdfs:domain`` + ``rdf:Property``) and the
+    strategy load (``onto/matchKey`` etc.). The resolution returns
+    ``onto_preds`` (default: the Mentor predicate set) so a scope predicate
+    resolves to a concrete IRI; the strategy load returns empty (no strategy)."""
     neptune = AsyncMock()
     captured: dict[str, str] = {}
+    preds = _MENTOR_ONTO_PREDS if onto_preds is None else onto_preds
 
     async def query(sparql, *args, **kwargs):
-        # Strategy load runs first (tenant ontology graph, no /kg/ segment).
+        # Tenant ontology graph (no /kg/ segment): either resolution or strategy.
         if "/graphs/test-tenant>" in sparql and "/kg/" not in sparql:
+            # Scope-predicate resolution: domain + rdf:Property shape.
+            if "#domain>" in sparql and "#Property>" in sparql:
+                return _ontology_predicates_response(preds)
+            # Strategy load: empty so no strategy is applied.
             return _strategy_query_response([])
         captured["select"] = sparql
         return _entities_query_response(scoped_rows)
@@ -827,10 +913,15 @@ def test_executor_scope_relationship_selects_only_scoped_entities():
         await store.create(job)
         await executor.run(job, "test-tenant")
 
-        # (a) The scope constraint is present in the entity-selection SPARQL.
+        # (a) The scope constraint is present in the entity-selection SPARQL and
+        # matches the CONCRETE predicate IRI(s) — no unbounded ?e ?p ?sv scan.
         sel = captured["select"]
         assert "FILTER EXISTS" in sel
-        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in sel
+        assert (
+            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
+            "<https://cograph.tech/onto/haslevel>))" in sel
+        )
+        assert "REPLACE(STR(?p)" not in sel
         assert 'LCASE(STR(?stl)) = "manager"' in sel
 
         # (b) Only the two scoped entities were processed (not all Mentors).
@@ -871,15 +962,58 @@ def test_executor_scope_predicate_casing_matches_via_lcase():
         await executor.run(job, "test-tenant")
 
         sel = captured["select"]
-        # The generated SPARQL LCASEs the predicate local-name and compares to
-        # the LOWER-cased request predicate, so a `haslevel`-stored triple
-        # matches a `hasLevel` request. The mixed-case form never leaks verbatim.
-        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in sel
-        assert '"hasLevel"' not in sel
+        # The mixed-case `hasLevel` request resolves (case-insensitively) to the
+        # stored `haslevel` predicate's concrete IRI(s); the mixed-case form
+        # never leaks verbatim and there is no per-predicate scan.
+        assert (
+            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
+            "<https://cograph.tech/onto/haslevel>))" in sel
+        )
+        assert "hasLevel" not in sel
+        assert "REPLACE(STR(?p)" not in sel
 
         final = await store.get(job.id)
         assert final.progress.total == 1
         assert final.progress.processed == 1
+
+    asyncio.run(run())
+
+
+def test_executor_scope_unknown_predicate_matches_nothing():
+    """A scope predicate not declared on the type resolves to no concrete IRIs,
+    so the SELECT matches nothing fast (FILTER(false)) — never the old unbounded
+    per-entity predicate scan (COG-112 fix #3)."""
+    async def run():
+        # Even though Neptune would "return" a row, the unresolved predicate
+        # makes the run resolve to [] and the SELECT to FILTER(false); we assert
+        # on the generated SPARQL shape (the mock can't model FILTER(false)).
+        scoped_rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
+        ]
+        # Ontology declares only `title`/`name`, NOT the requested predicate.
+        onto_preds = [
+            {"attr": "https://cograph.tech/types/Mentor/attrs/title", "label": "title"},
+            {"attr": "https://cograph.tech/types/Mentor/attrs/name", "label": "name"},
+        ]
+        neptune, captured = _capturing_neptune(scoped_rows, onto_preds=onto_preds)
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata({})
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            scope=EnrichScope(predicate="not_declared", value="Manager"),
+        )
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        sel = captured["select"]
+        assert "FILTER(false)" in sel
+        # No unbounded scan, no concrete-IRI EXISTS machinery.
+        assert "FILTER EXISTS" not in sel
+        assert "REPLACE(STR(?p)" not in sel
 
     asyncio.run(run())
 
@@ -908,8 +1042,12 @@ def test_executor_scope_literal_attribute_constraint_in_sparql():
 
         sel = captured["select"]
         assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "director"' in sel
-        # Predicate matched by local-name FILTER, not an interpolated attr IRI.
-        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "title"' in sel
+        # Predicate matched by the concrete IRI(s) it resolved to — no scan.
+        assert (
+            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/title>, "
+            "<https://cograph.tech/onto/title>))" in sel
+        )
+        assert "REPLACE(STR(?p)" not in sel
 
         final = await store.get(job.id)
         assert final.progress.total == 1
@@ -982,12 +1120,17 @@ def test_executor_no_scope_runs_whole_type():
 
 
 def test_count_entities_honors_scope_and_entity_uris():
-    """count_entities applies the same subset constraints (matched count)."""
+    """count_entities applies the same subset constraints (matched count) and,
+    for a scope, matches the resolved concrete predicate IRI(s) — not a scan."""
     async def run():
         neptune = AsyncMock()
         captured: dict[str, str] = {}
 
         async def query(sparql, *args, **kwargs):
+            # Scope-predicate resolution (tenant ontology graph): return the
+            # Mentor predicate declarations so `haslevel` resolves to an IRI.
+            if "#domain>" in sparql and "#Property>" in sparql:
+                return _ontology_predicates_response(_MENTOR_ONTO_PREDS)
             captured["q"] = sparql
             return _count_response(7)
 
@@ -1003,7 +1146,11 @@ def test_count_entities_honors_scope_and_entity_uris():
         )
         assert n == 7
         assert "FILTER EXISTS" in captured["q"]
-        assert 'LCASE(REPLACE(STR(?p), "^.*[/#]", "")) = "haslevel"' in captured["q"]
+        assert (
+            "FILTER(?p IN (<https://cograph.tech/types/Mentor/attrs/haslevel>, "
+            "<https://cograph.tech/onto/haslevel>))" in captured["q"]
+        )
+        assert "REPLACE(STR(?p)" not in captured["q"]
 
         # entity_uris path (wins over scope).
         await executor.count_entities(
@@ -1018,6 +1165,65 @@ def test_count_entities_honors_scope_and_entity_uris():
         await executor.count_entities("test-tenant", "kg", "Mentor")
         assert "FILTER EXISTS" not in captured["q"]
         assert "VALUES ?e" not in captured["q"]
+
+    asyncio.run(run())
+
+
+def test_count_entities_unknown_scope_predicate_short_circuits_to_zero():
+    """An unresolved scope predicate makes count_entities return 0 WITHOUT
+    issuing the COUNT (honest matched-0, fast — no per-entity scan, COG-112)."""
+    async def run():
+        neptune = AsyncMock()
+        count_calls = {"n": 0}
+
+        async def query(sparql, *args, **kwargs):
+            if "#domain>" in sparql and "#Property>" in sparql:
+                # Type declares `title`/`name` but NOT the requested predicate.
+                return _ontology_predicates_response(
+                    [
+                        {"attr": "https://cograph.tech/types/Mentor/attrs/title", "label": "title"},
+                    ]
+                )
+            count_calls["n"] += 1
+            return _count_response(99)
+
+        neptune.query.side_effect = query
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        executor = EnrichmentExecutor(neptune, store, cache, FakeWikidata({}))
+
+        n = await executor.count_entities(
+            "test-tenant", "kg", "Mentor",
+            scope=EnrichScope(predicate="not_declared", value="Manager"),
+        )
+        assert n == 0
+        # The COUNT query was never issued (short-circuited on unresolved pred).
+        assert count_calls["n"] == 0
+
+    asyncio.run(run())
+
+
+def test_count_entities_scope_resolve_error_returns_zero():
+    """A Neptune error during scope-predicate resolution degrades to matched 0
+    rather than raising (create stays fast, never 500s)."""
+    async def run():
+        neptune = AsyncMock()
+
+        async def query(sparql, *args, **kwargs):
+            if "#domain>" in sparql and "#Property>" in sparql:
+                raise RuntimeError("neptune timeout")
+            return _count_response(5)
+
+        neptune.query.side_effect = query
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        executor = EnrichmentExecutor(neptune, store, cache, FakeWikidata({}))
+
+        n = await executor.count_entities(
+            "test-tenant", "kg", "Mentor",
+            scope=EnrichScope(predicate="haslevel", value="Manager"),
+        )
+        assert n == 0
 
     asyncio.run(run())
 
@@ -1260,10 +1466,20 @@ def test_post_jobs_returns_job_id(client, auth_headers, mock_neptune):
 def test_post_jobs_with_scope_threads_and_reports_matched(
     client, auth_headers, mock_neptune
 ):
-    """A scoped create-job (COG-112): count_entities applies the scope (mocked
-    Neptune returns 2), the response carries matched_entities, and the stored
-    job persists the scope so the executor uses it."""
-    mock_neptune.query.return_value = _count_response(2)
+    """A scoped create-job (COG-112): count_entities resolves the scope predicate
+    to a concrete IRI then applies the scope (mocked Neptune returns 2), the
+    response carries matched_entities, and the stored job persists the scope so
+    the executor uses it."""
+
+    async def _query(sparql, *args, **kwargs):
+        # Scope-predicate resolution (ontology graph) returns the Mentor preds so
+        # `haslevel` resolves to a concrete IRI; everything else (COUNT + the
+        # executor's entity SELECT after the job spawns) returns the count shape.
+        if "#domain>" in sparql and "#Property>" in sparql:
+            return _ontology_predicates_response(_MENTOR_ONTO_PREDS)
+        return _count_response(2)
+
+    mock_neptune.query.side_effect = _query
 
     response = client.post(
         "/graphs/test-tenant/enrich/jobs",
