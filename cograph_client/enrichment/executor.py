@@ -607,18 +607,6 @@ class EnrichmentExecutor:
             f"{subset_clause}"
             f"}}"
         )
-        # TEMPORARY diagnostic (COG-112): for a scoped count log the resolved IRIs
-        # and the full COUNT query. Remove once the 0-match issue is diagnosed.
-        if scope is not None or entity_uris:
-            logger.info(
-                "scope_debug_count_query",
-                kg_name=kg_name,
-                type_name=type_name,
-                scope_predicate=(scope.predicate if scope else None),
-                scope_value=(scope.value if scope else None),
-                entity_uris=entity_uris,
-                count_query=query,
-            )
         raw = await self._neptune.query(query)
         _, bindings = parse_sparql_results(raw)
         if not bindings:
@@ -627,16 +615,6 @@ class EnrichmentExecutor:
             n = int(bindings[0].get("n", "0"))
         except (TypeError, ValueError):
             return 0
-        # TEMPORARY diagnostic (COG-112): the count Neptune returned for the scope.
-        if scope is not None or entity_uris:
-            logger.info(
-                "scope_debug_count_result",
-                kg_name=kg_name,
-                type_name=type_name,
-                scope_predicate=(scope.predicate if scope else None),
-                scope_value=(scope.value if scope else None),
-                count=n,
-            )
         return n
 
     async def run(self, job: EnrichJob, tenant_id: str) -> None:
@@ -677,31 +655,6 @@ class EnrichmentExecutor:
                 entity_uris=job.entity_uris,
                 scope_pred_iris=scope_pred_iris,
             )
-            # TEMPORARY diagnostic (COG-112): for a scoped enrich (scope or
-            # entity_uris present) log the resolved scope predicate IRIs and the
-            # full SELECT string sent to Neptune, so we can see why a scoped
-            # enrich matches 0 entities on live data. Remove once diagnosed.
-            _is_scoped = job.scope is not None or bool(job.entity_uris)
-            if _is_scoped:
-                logger.info(
-                    "scope_debug_resolved_iris",
-                    job_id=job.id,
-                    kg_name=job.kg_name,
-                    type_name=job.type_name,
-                    scope_predicate=(job.scope.predicate if job.scope else None),
-                    scope_value=(job.scope.value if job.scope else None),
-                    entity_uris=job.entity_uris,
-                    scope_pred_iris=scope_pred_iris,
-                )
-                logger.info(
-                    "scope_debug_select_query",
-                    job_id=job.id,
-                    kg_name=job.kg_name,
-                    type_name=job.type_name,
-                    scope_predicate=(job.scope.predicate if job.scope else None),
-                    scope_value=(job.scope.value if job.scope else None),
-                    select_query=sel,
-                )
             raw = await self._neptune.query(sel)
             _, bindings = parse_sparql_results(raw)
 
@@ -714,41 +667,8 @@ class EnrichmentExecutor:
                 vals = _parse_vals(row.get("vals", ""))
                 entities.append({"uri": e_uri, "label": label, "vals": vals})
 
-            # TEMPORARY diagnostic (COG-112): how many entities the scoped SELECT
-            # returned (the 0-match symptom is visible here). Remove once diagnosed.
-            if _is_scoped:
-                logger.info(
-                    "scope_debug_selected_count",
-                    job_id=job.id,
-                    kg_name=job.kg_name,
-                    type_name=job.type_name,
-                    scope_predicate=(job.scope.predicate if job.scope else None),
-                    scope_value=(job.scope.value if job.scope else None),
-                    selected_count=len(entities),
-                )
-
-            # TEMP diag (COG-112): resolve the adapter chain for the FIRST attribute
-            # and log which names are registered, so we can tell whether the chain is
-            # empty / paid adapters are unregistered (vs process_entity never running).
-            _diag_chain = get_chain(job.tier)
-            logger.info(
-                "enrich_diag_chain",
-                job_id=job.id,
-                tier=str(job.tier),
-                attributes=job.attributes,
-                job_store_class=type(self._jobs).__name__,
-                resolved=[
-                    {"name": n, "registered": (n == "cache" or get_adapter(n) is not None)}
-                    for n in _diag_chain
-                ],
-            )
-
             job.progress.total = len(entities) * len(job.attributes)
-            # TEMP diag (COG-112): bracket the post-select jobs.update to prove
-            # whether it returns (a hung job-store update would stall here).
-            logger.info("enrich_diag_pre_update", job_id=job.id)
             await self._jobs.update(job)
-            logger.info("enrich_diag_post_update", job_id=job.id)
 
             sem = asyncio.Semaphore(WORKER_POOL_SIZE)
             counter = {"n": 0}
@@ -756,13 +676,6 @@ class EnrichmentExecutor:
 
             async def process_entity(ent: dict) -> list[RowResult]:
                 results: list[RowResult] = []
-                # TEMP diag (COG-112): prove process_entity actually runs per entity.
-                logger.info(
-                    "enrich_diag_process_entity_enter",
-                    job_id=job.id,
-                    entity=ent.get("uri"),
-                    label=ent.get("label"),
-                )
                 async with sem:
                     for attribute in job.attributes:
                         # Cooperative cancellation
@@ -790,15 +703,6 @@ class EnrichmentExecutor:
                         else:
                             chain = get_chain(job.tier)
 
-                        # TEMP diag (COG-112): bracket the chain lookup to see if it
-                        # is entered and what it returns (or whether it stalls here).
-                        logger.info(
-                            "enrich_diag_pre_lookup_chain",
-                            job_id=job.id,
-                            attribute=attribute,
-                            entity=ent.get("label"),
-                            chain=chain,
-                        )
                         verdicts = await self._lookup_chain(
                             ent["label"],
                             attribute,
@@ -807,12 +711,6 @@ class EnrichmentExecutor:
                             missing_adapter_names,
                             effective_confidence,
                             strategy_version,
-                        )
-                        logger.info(
-                            "enrich_diag_post_lookup_chain",
-                            job_id=job.id,
-                            attribute=attribute,
-                            n_verdicts=len(verdicts),
                         )
                         best = self._pick_best(verdicts, effective_confidence)
 
@@ -888,15 +786,6 @@ class EnrichmentExecutor:
                 # in the background so the panels refresh without waiting for the
                 # summary-cache TTL. Only fire when something was actually applied.
                 self._schedule_stats_recompute(tenant_id, job.kg_name)
-            # TEMP diag (COG-112): the job reached the apply phase — log the result
-            # counts so we can confirm completion vs a silent 0-result finish.
-            logger.info(
-                "enrich_diag_applying",
-                job_id=job.id,
-                n_results=len(job.results),
-                policy=str(job.conflict_policy),
-                n_triples=len(triples),
-            )
             job.status = JobStatus.applied
             job.completed_at = _now()
             await self._jobs.update(job)
@@ -976,13 +865,6 @@ class EnrichmentExecutor:
                     cache_hit_counted = True
                 verdicts = cached
             else:
-                # TEMP diag (COG-112): bracket the actual adapter HTTP call so we can
-                # see which adapter is reached and whether it returns or stalls.
-                logger.info(
-                    "enrich_diag_pre_adapter",
-                    adapter=name,
-                    attribute=attribute,
-                )
                 try:
                     # Bound every adapter call so one stalled lookup (e.g. a
                     # hung network call whose own client lacks a total-operation
@@ -990,13 +872,6 @@ class EnrichmentExecutor:
                     verdicts = await asyncio.wait_for(
                         adapter.lookup(entity_label, attribute, {}),
                         timeout=ADAPTER_LOOKUP_TIMEOUT_S,
-                    )
-                    # TEMP diag (COG-112): adapter returned (not stalled/timed out).
-                    logger.info(
-                        "enrich_diag_post_adapter",
-                        adapter=name,
-                        attribute=attribute,
-                        n=len(verdicts),
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
