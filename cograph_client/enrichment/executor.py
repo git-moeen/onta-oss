@@ -8,6 +8,7 @@ review or applies them directly based on conflict_policy.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -62,6 +63,21 @@ ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
 NAME_FALLBACK_ATTRS = ["name", "title", "headline"]
 WORKER_POOL_SIZE = 8
 PROGRESS_FLUSH_EVERY = 10
+
+# Hard ceiling on a single adapter lookup (COG-112). A misbehaving adapter — a
+# stalled TCP/TLS connect, a server that dribbles keepalive bytes (which resets
+# httpx's per-byte read timeout forever), or any adapter whose own client lacks a
+# timeout — must NEVER hang the whole job. Without this wrapper a single
+# `await adapter.lookup(...)` that never returns AND never raises strands the job
+# in `running` with zero logs and no failure (the exact production symptom: logs
+# stop right after the scoped SELECT, no outbound adapter HTTP, no
+# enrichment_job_failed). This bound makes such a stall surface as a visible,
+# retryable `enrichment_adapter_timeout` log instead (verdicts=[] → the chain
+# moves on and the job completes). Generous enough to cover a slow
+# multi-step adapter (e.g. wikidata's search→claims→label round-trips) while
+# still failing fast relative to "forever". Overridable via the
+# COGRAPH_ADAPTER_LOOKUP_TIMEOUT_S env var.
+ADAPTER_LOOKUP_TIMEOUT_S = float(os.environ.get("COGRAPH_ADAPTER_LOOKUP_TIMEOUT_S", "30"))
 
 
 def _type_uri(type_name: str) -> str:
@@ -910,7 +926,23 @@ class EnrichmentExecutor:
                 verdicts = cached
             else:
                 try:
-                    verdicts = await adapter.lookup(entity_label, attribute, {})
+                    # Bound every adapter call so one stalled lookup (e.g. a
+                    # hung network call whose own client lacks a total-operation
+                    # timeout) can never strand the whole job (COG-112).
+                    verdicts = await asyncio.wait_for(
+                        adapter.lookup(entity_label, attribute, {}),
+                        timeout=ADAPTER_LOOKUP_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "enrichment_adapter_timeout",
+                        adapter=name,
+                        job_id=job.id,
+                        timeout_s=ADAPTER_LOOKUP_TIMEOUT_S,
+                        entity=entity_label,
+                        attribute=attribute,
+                    )
+                    verdicts = []
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "enrichment_adapter_error",

@@ -5,11 +5,14 @@ Two-step lookup:
   2. wbgetentities (Q-id → claims for the requested property)
 
 Designed to be defensive: any HTTP error, rate-limit, or missing data
-returns []. Network calls have a 10s timeout.
+returns []. Network calls use explicit per-phase httpx timeouts (connect/
+read/write/pool) so a stalled connection fails fast instead of hanging — a
+bare total timeout does not bound a dribbling connection (COG-112).
 """
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional
 
@@ -23,7 +26,27 @@ logger = structlog.stdlib.get_logger("cograph.enrichment")
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 WIKIDATA_ENTITY_BASE = "https://www.wikidata.org/wiki/"
-TIMEOUT_S = 10.0
+
+# Explicit, per-phase httpx timeouts (COG-112). A bare ``timeout=10.0`` maps to
+# connect/read/write/pool=10s, but httpx has NO total-operation timeout: the
+# ``read`` timeout is the max gap *between bytes*, so a stalled connection that
+# dribbles keepalive bytes resets it forever and the call hangs with no
+# "HTTP Request" log and no exception (the production hang). Bounding each phase
+# explicitly makes a stall fail fast and surface as ``wikidata_lookup_failed``
+# (returns [] — the chain moves on) instead of stranding the enrichment job. The
+# executor additionally wraps every adapter lookup in ``asyncio.wait_for`` as a
+# total-operation backstop. All four are overridable via env so ops can tune
+# them without a code change.
+CONNECT_TIMEOUT_S = float(os.environ.get("COGRAPH_WIKIDATA_CONNECT_TIMEOUT_S", "5"))
+READ_TIMEOUT_S = float(os.environ.get("COGRAPH_WIKIDATA_READ_TIMEOUT_S", "10"))
+WRITE_TIMEOUT_S = float(os.environ.get("COGRAPH_WIKIDATA_WRITE_TIMEOUT_S", "10"))
+POOL_TIMEOUT_S = float(os.environ.get("COGRAPH_WIKIDATA_POOL_TIMEOUT_S", "5"))
+TIMEOUT = httpx.Timeout(
+    connect=CONNECT_TIMEOUT_S,
+    read=READ_TIMEOUT_S,
+    write=WRITE_TIMEOUT_S,
+    pool=POOL_TIMEOUT_S,
+)
 
 
 _CLEAN_CACHE: dict[str, list[str]] = {}
@@ -130,7 +153,7 @@ class WikidataAdapter:
             # ourselves with project + contact so the request is honored.
             # See https://meta.wikimedia.org/wiki/User-Agent_policy
             self._client = httpx.AsyncClient(
-                timeout=TIMEOUT_S,
+                timeout=TIMEOUT,
                 headers={
                     "User-Agent": (
                         "cograph-enrichment/0.1 "

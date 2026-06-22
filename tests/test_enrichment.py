@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from cograph_client.enrichment.cache import EnrichmentCache
@@ -199,6 +200,29 @@ def test_wikidata_adapter_unknown_attribute_returns_empty():
         adapter = WikidataAdapter()
         result = await adapter.lookup("Bosch", "not_a_known_attr", {})
         assert result == []
+
+    asyncio.run(run())
+
+
+def test_wikidata_client_has_granular_per_phase_timeout():
+    """COG-112: the lazily-built httpx client must use an explicit per-phase
+    ``httpx.Timeout`` (connect/read/write/pool all bounded), not a bare float.
+    A bare total timeout does not bound a dribbling connection — that is what
+    let the production lookup hang forever."""
+
+    async def run():
+        adapter = WikidataAdapter()
+        client = await adapter._get_client()
+        try:
+            t = client.timeout
+            assert isinstance(t, httpx.Timeout)
+            # Every phase is bounded (no None == "no timeout").
+            assert t.connect is not None and t.connect > 0
+            assert t.read is not None and t.read > 0
+            assert t.write is not None and t.write > 0
+            assert t.pool is not None and t.pool > 0
+        finally:
+            await adapter.aclose()
 
     asyncio.run(run())
 
@@ -929,6 +953,116 @@ def test_executor_no_match_when_no_verdict():
         assert final.progress.filled == 0
         assert final.progress.conflicts == 0
         assert final.progress.processed == 1
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# COG-112: a hung adapter lookup must NOT strand the whole job (the production
+# hang). A single ``await adapter.lookup(...)`` that never returns and never
+# raises (a stalled network call) used to leave the job in ``running`` forever:
+# logs stop right after the scoped SELECT, no outbound HTTP, no
+# enrichment_job_failed, no completion. The executor now bounds every adapter
+# call with ``asyncio.wait_for``, so a stall surfaces as a logged
+# ``enrichment_adapter_timeout`` (verdicts=[] → the chain moves on) and the job
+# completes. Each test wraps ``executor.run`` in its own ``asyncio.wait_for`` so
+# that if the bound regresses the test FAILS (TimeoutError) instead of hanging
+# CI forever.
+# ---------------------------------------------------------------------------
+
+
+class _HangingAdapter:
+    """A SourceAdapter whose ``lookup`` never returns and never raises —
+    mimics a stalled httpx network call (no connect/read timeout fires because
+    the connection lingers). Named ``wikidata`` so the default ``lite`` chain
+    (["wikidata"]) resolves it after the executor registers it."""
+
+    name = "wikidata"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def lookup(self, entity_label, attribute, context):
+        self.calls += 1
+        await asyncio.Event().wait()  # block forever, never raise
+        return []
+
+
+def test_executor_hung_adapter_does_not_strand_job(monkeypatch):
+    """Regression for COG-112: a forever-hanging adapter must time out per
+    lookup and let the job finish, not leave it stuck in ``running``."""
+
+    async def run():
+        # Tiny per-adapter timeout so the test is fast. The executor reads this
+        # env var at module import, so patch the module-level constant directly.
+        import cograph_client.enrichment.executor as ex_mod
+
+        monkeypatch.setattr(ex_mod, "ADAPTER_LOOKUP_TIMEOUT_S", 0.2)
+
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Acme", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p2", "label": "Globex", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.return_value = _entities_query_response(rows)
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        hang = _HangingAdapter()
+        executor = EnrichmentExecutor(neptune, store, cache, hang)
+
+        job = _make_job(policy=ConflictPolicy.skip)
+        await store.create(job)
+
+        # If the per-adapter timeout regresses, run() hangs → wait_for raises
+        # TimeoutError → the test FAILS (loud) instead of hanging CI.
+        await asyncio.wait_for(executor.run(job, "test-tenant"), timeout=10)
+
+        final = await store.get(job.id)
+        assert final is not None
+        # The job MUST reach a terminal state, not be stuck in `running`.
+        assert final.status == JobStatus.applied
+        # The adapter was actually invoked (and timed out) for each entity.
+        assert hang.calls == 2
+        # Nothing usable came back, so no triples were written.
+        neptune.update.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_executor_completes_with_fast_adapter_under_wait_for():
+    """Control: with a fast adapter the same job completes well within the
+    wait_for budget and writes triples — proving the timeout backstop does not
+    interfere with the normal path."""
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.return_value = _entities_query_response(rows)
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Bosch", "manufacturer"): [
+                    Verdict(value="Robert Bosch GmbH", confidence=0.95, source="wikidata")
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await asyncio.wait_for(executor.run(job, "test-tenant"), timeout=10)
+
+        final = await store.get(job.id)
+        assert final.status == JobStatus.applied
+        assert final.progress.filled == 1
+        assert neptune.update.await_count >= 1
 
     asyncio.run(run())
 
