@@ -3,10 +3,19 @@
 :func:`suggest_rules` enumerates a type's attributes and relationships from the
 ontology, draws a few INDEPENDENT samples of distinct values per predicate from
 the KG graph, and asks an LLM (once per predicate) whether that predicate needs
-normalization and of which kind. v1 only needs to detect ``list_explode`` —
-multi-valued source cells that were collapsed into one composite value (a
-delimited literal, or a composite entity whose local-name/label packs several
-atomic values joined by the slugified delimiter ``__``).
+normalization and of which kind(s). It detects two problems today:
+
+* ``list_explode`` — multi-valued source cells that were collapsed into one
+  composite value (a delimited literal, or a composite entity whose
+  local-name/label packs several atomic values joined by the slug ``__``).
+* ``strip_emoji`` — text values carrying emoji / pictographic junk characters
+  (``"🎨 design; 🚀 growth"``) that should be removed.
+
+A single predicate can warrant BOTH (``skills`` often needs ``list_explode``
+AND ``strip_emoji``), so the LLM returns a LIST of recommended rules per
+predicate and :func:`suggest_rules` emits one :class:`NormalizationRule` per
+recommendation (deduped by ``(predicate, rule_type)``; the deterministic id
+folds in ``rule_type`` so the two never collide).
 
 Nothing is persisted here — the route persists the returned ``suggested`` rules
 so a human can confirm them. Rules come back ranked by confidence (desc).
@@ -41,14 +50,32 @@ You are a data-normalization analyst for a knowledge graph. You are shown the \
 distinct VALUES a single predicate takes across many entities of one type, and \
 you must decide whether those values need NORMALIZATION before they are useful.
 
-v1 detects exactly ONE problem: list_explode — a multi-valued source cell that \
-was collapsed into ONE composite value instead of split into N atomic values. \
-Tell-tale signs:
-- a literal packing several items with a delimiter: "English, Russian, Ukrainian", \
-  "Python; SQL; Go", "Sales / Marketing", "a|b|c";
-- an entity whose name/local-name packs several items with the slugified \
-  delimiter "__" (a list separator that was turned into "__" at ingest), e.g. \
-  "English__Russian__Ukrainian", "Sales__Marketing".
+You can recommend ZERO, ONE, or MULTIPLE of these normalization types for the \
+SAME predicate (a value can have more than one problem at once):
+
+1) list_explode — a multi-valued source cell that was collapsed into ONE \
+composite value instead of split into N atomic values. Tell-tale signs:
+   - a literal packing several items with a delimiter: "English, Russian, \
+     Ukrainian", "Python; SQL; Go", "Sales / Marketing", "a|b|c";
+   - an entity whose name/local-name packs several items with the slugified \
+     delimiter "__" (a list separator turned into "__" at ingest), e.g. \
+     "English__Russian__Ukrainian", "Sales__Marketing".
+   params: {"delimiters": ["<each delimiter you observed>"], \
+"target": "entity"|"literal"} — use "entity" when the values are entity \
+names/local-names (the predicate is a relationship to other entities), \
+"literal" when they are plain attribute literals.
+
+2) strip_emoji — text values carry emoji, pictographs, or other non-text JUNK \
+characters that should be removed, leaving the real text: "🎨 design", \
+"ai 🚀", "growth ✨", "🔥🔥 sales". Recommend this whenever you see emoji / \
+pictographic / symbol junk mixed into otherwise-text values. Do NOT recommend \
+it for ordinary punctuation that belongs to real values (e.g. "c++", "C#", \
+"Node.js", "R&D", accented letters like "café"). \
+   params: {"targets": ["attribute"]}
+
+A predicate can need BOTH at once — e.g. skills = "🎨 design; ai; 🚀 growth" \
+needs list_explode (split on "; ") AND strip_emoji (remove 🎨 and 🚀). In that \
+case return BOTH rules.
 
 CRITICAL — do NOT false-split single multi-word values. Many legitimate single \
 values contain spaces or punctuation and must be left intact: "Bahasa Indonesia", \
@@ -57,24 +84,25 @@ Nevis", "Trinidad and Tobago". A space is NOT a delimiter. Only treat a value as
 a packed list when a clear list-delimiter (comma, semicolon, pipe, slash, or the \
 slug "__") separates items that are each individually plausible standalone values.
 
-If the values are already atomic (each value is a single item), return \
-needs_normalization=false. If you see a different normalization problem that is \
-NOT list_explode (casing, trimming, units, value mapping), return \
-needs_normalization=false with rule_type=null and explain it in the rationale — \
-v1 will not act on it but the note is recorded.
+If the values are already atomic AND emoji-free, return an empty "rules" list. \
+If you see a normalization problem that is NEITHER list_explode NOR strip_emoji \
+(casing, trimming, units, value mapping), do NOT invent a rule for it — leave \
+"rules" empty and explain the observation in a rule's rationale only if you are \
+also returning a supported rule.
 
 Respond with STRICT JSON only, no markdown:
 {
-  "needs_normalization": true|false,
-  "rule_type": "list_explode"|null,
-  "params": {"delimiters": ["<each delimiter you observed>"], "target": "entity"|"literal"},
-  "confidence": 0.0,
-  "rationale": "one or two sentences"
+  "rules": [
+    {
+      "rule_type": "list_explode"|"strip_emoji",
+      "params": { ...rule-type-specific params (see above)... },
+      "confidence": 0.0,
+      "rationale": "one or two sentences"
+    }
+  ]
 }
-For target: use "entity" when the values are entity names/local-names (the \
-predicate is a relationship to other entities), "literal" when they are plain \
-attribute literals. Set confidence in [0,1] reflecting how sure you are the \
-values are a packed delimited list."""
+Return an empty list ({"rules": []}) when no normalization is needed. Set each \
+confidence in [0,1] reflecting how sure you are that problem is present."""
 
 SUGGEST_USER_TEMPLATE = """\
 Type: {type_name}
@@ -83,7 +111,8 @@ Predicate: {predicate}   (kind: {target_kind})
 Distinct sample values for this predicate (pooled from several independent draws):
 {values}
 
-Does this predicate need list_explode normalization? Respond with strict JSON."""
+Which normalization(s) does this predicate need (list_explode, strip_emoji, both, \
+or none)? Respond with strict JSON ({{"rules": [...]}})."""
 
 
 async def suggest_rules(
@@ -112,48 +141,83 @@ async def suggest_rules(
         )
         if not samples:
             continue
-        verdict = await _ask_llm(api_key, type_name, pred_uri, target_kind, samples)
-        if not verdict or not verdict.get("needs_normalization"):
-            continue
-        rule_type = verdict.get("rule_type")
-        if rule_type != "list_explode":
-            # v1 only acts on list_explode; a non-null other type isn't emitted.
-            logger.info(
-                "non_list_explode_skipped",
-                predicate=pred_uri,
-                rule_type=rule_type,
-                rationale=verdict.get("rationale", ""),
-            )
+        recommendations = await _ask_llm(
+            api_key, type_name, pred_uri, target_kind, samples
+        )
+        if not recommendations:
             continue
         pred_leaf = _predicate_leaf(pred_uri)
-        params = verdict.get("params") or {}
+        # Dedupe by rule_type within a predicate (one rule per (predicate,
+        # rule_type)); first recommendation of a type wins.
+        seen_types: set[str] = set()
+        for rec in recommendations:
+            rule = _rule_from_recommendation(
+                rec, kg_name, type_name, pred_leaf, target_kind, samples
+            )
+            if rule is None or rule.rule_type in seen_types:
+                continue
+            seen_types.add(rule.rule_type)
+            rules.append(rule)
+
+    # Rank ALL emitted rules (across predicates and rule types) by confidence.
+    rules.sort(key=lambda r: r.confidence, reverse=True)
+    return rules
+
+
+_SUPPORTED_RULE_TYPES = {"list_explode", "strip_emoji"}
+_DEFAULT_DELIMITERS = [", ", "; ", " / ", " | ", "__"]
+
+
+def _rule_from_recommendation(
+    rec: dict,
+    kg_name: str,
+    type_name: str,
+    pred_leaf: str,
+    target_kind: str,
+    samples: list[str],
+) -> NormalizationRule | None:
+    """Build one :class:`NormalizationRule` from one LLM recommendation, or None.
+
+    Unsupported / malformed rule types are logged and skipped so a stray entry
+    can't poison the whole predicate. The id folds in ``rule_type`` so
+    list_explode and strip_emoji on the SAME predicate get distinct ids.
+    """
+    if not isinstance(rec, dict):
+        return None
+    rule_type = rec.get("rule_type")
+    if rule_type not in _SUPPORTED_RULE_TYPES:
+        logger.info(
+            "unsupported_rule_type_skipped",
+            predicate=pred_leaf,
+            rule_type=rule_type,
+            rationale=rec.get("rationale", ""),
+        )
+        return None
+    params = dict(rec.get("params") or {})
+    if rule_type == "list_explode":
         # Default the target from the predicate kind if the LLM omitted it.
         params.setdefault(
             "target", "entity" if target_kind == "relationship" else "literal"
         )
         if not params.get("delimiters"):
             params["delimiters"] = _DEFAULT_DELIMITERS
-        rules.append(
-            NormalizationRule(
-                id=make_rule_id(kg_name, type_name, pred_leaf),
-                kg_name=kg_name,
-                type_name=type_name,
-                predicate=pred_leaf,
-                target_kind=target_kind,
-                rule_type="list_explode",
-                params=params,
-                confidence=float(verdict.get("confidence", 0.0) or 0.0),
-                rationale=verdict.get("rationale", ""),
-                sample_values=samples[:25],
-                status="suggested",
-            )
-        )
-
-    rules.sort(key=lambda r: r.confidence, reverse=True)
-    return rules
-
-
-_DEFAULT_DELIMITERS = [", ", "; ", " / ", " | ", "__"]
+    elif rule_type == "strip_emoji":
+        # Cleaning attribute literals is the default (the skills case).
+        if not params.get("targets"):
+            params["targets"] = ["attribute"]
+    return NormalizationRule(
+        id=make_rule_id(kg_name, type_name, pred_leaf, rule_type),
+        kg_name=kg_name,
+        type_name=type_name,
+        predicate=pred_leaf,
+        target_kind=target_kind,
+        rule_type=rule_type,
+        params=params,
+        confidence=float(rec.get("confidence", 0.0) or 0.0),
+        rationale=rec.get("rationale", ""),
+        sample_values=samples[:25],
+        status="suggested",
+    )
 
 
 def _openrouter_key() -> str:
@@ -273,11 +337,15 @@ async def _ask_llm(
     pred_uri: str,
     target_kind: str,
     samples: list[str],
-) -> dict | None:
-    """One LLM call per predicate. Returns parsed verdict dict, or None on error."""
+) -> list[dict]:
+    """One LLM call per predicate. Returns a list of recommendation dicts.
+
+    Empty list = no normalization needed (or an error / no key) — the caller
+    treats every non-recommendation the same way.
+    """
     if not api_key:
         logger.warning("no_openrouter_key_for_inference")
-        return None
+        return []
     values_block = "\n".join(f"- {v}" for v in samples)
     user = SUGGEST_USER_TEMPLATE.format(
         type_name=type_name,
@@ -297,23 +365,53 @@ async def _ask_llm(
         )
     except Exception:
         logger.warning("inference_llm_failed", predicate=pred_uri, exc_info=True)
-        return None
-    return _parse_verdict(text)
+        return []
+    return _parse_recommendations(text)
 
 
-def _parse_verdict(text: str) -> dict | None:
+def _parse_recommendations(text: str) -> list[dict]:
+    """Parse the LLM reply into a list of recommendation dicts.
+
+    Accepts the current ``{"rules": [...]}`` shape; also tolerates a bare list
+    ``[...]`` and the legacy single-verdict shape
+    (``{"needs_normalization": ..., "rule_type": ...}``) so a stale response or
+    a partial upgrade degrades gracefully instead of dropping the predicate.
+    """
+    data = _parse_json_object(text)
+    if data is None:
+        return []
+    # New shape: {"rules": [ {...}, ... ]}.
+    if isinstance(data, dict) and isinstance(data.get("rules"), list):
+        return [r for r in data["rules"] if isinstance(r, dict)]
+    # Legacy single-verdict shape — promote it to a one-element list if it
+    # actually asked for a rule.
+    if isinstance(data, dict) and "needs_normalization" in data:
+        if data.get("needs_normalization") and data.get("rule_type"):
+            return [
+                {
+                    "rule_type": data.get("rule_type"),
+                    "params": data.get("params") or {},
+                    "confidence": data.get("confidence", 0.0),
+                    "rationale": data.get("rationale", ""),
+                }
+            ]
+        return []
+    return []
+
+
+def _parse_json_object(text: str):
+    """Best-effort JSON parse, tolerant of code fences and a prose wrapper."""
     stripped = (text or "").strip()
     if stripped.startswith("```"):
         lines = [l for l in stripped.split("\n") if not l.strip().startswith("```")]
         stripped = "\n".join(lines)
-    # Be tolerant of a leading/trailing prose wrapper: grab the outermost {...}.
+    # Grab the outermost {...} (object) — the response is always an object today.
     start = stripped.find("{")
     end = stripped.rfind("}")
     if start != -1 and end != -1 and end > start:
         stripped = stripped[start : end + 1]
     try:
-        data = json.loads(stripped)
+        return json.loads(stripped)
     except (json.JSONDecodeError, TypeError):
         logger.warning("verdict_parse_failed", raw=text[:300])
         return None
-    return data if isinstance(data, dict) else None

@@ -2,10 +2,15 @@
 
 A :class:`NormalizationRule` is an INFERRED, human-confirmed instruction for
 fixing a systematic data-shape problem on one predicate of one type in one KG.
-v1 implements ``rule_type="list_explode"`` (multi-valued source cells that got
-collapsed into one composite value instead of split into N atomic ones — e.g.
-``speaks -> Language/English__Russian__Ukrainian`` becoming three edges to the
-atomic ``English`` / ``Russian`` / ``Ukrainian`` entities).
+Two ``rule_type``\\ s ship today:
+
+* ``"list_explode"`` — multi-valued source cells that got collapsed into one
+  composite value instead of split into N atomic ones (e.g.
+  ``speaks -> Language/English__Russian__Ukrainian`` becoming three edges to the
+  atomic ``English`` / ``Russian`` / ``Ukrainian`` entities).
+* ``"strip_emoji"`` — text literals carrying emoji / pictographic junk
+  characters (e.g. ``skills = "🎨 design"`` → ``"design"``); the junk is removed
+  and the leftover whitespace collapsed, in place.
 
 Rules live as ordinary triples in the **tenant ontology graph**
 (:func:`tenant_graph_uri`) — one ``…/entities/NormalizationRule/<id>`` resource
@@ -62,11 +67,19 @@ TargetKind = Literal["attribute", "relationship"]
 class NormalizationRule(BaseModel):
     """One inferred normalization for a (kg, type, predicate).
 
-    ``rule_type`` is an open string (not an Enum) on purpose: v1 only emits
-    ``"list_explode"``, but ``params`` carries every rule-type-specific knob, so
-    ``"trim"`` / ``"case"`` / ``"value_map"`` / ``"unit_canonical"`` can be added
-    later with zero store-schema change. For ``list_explode`` the params are
-    ``{"delimiters": [", ", ";", " / "], "target": "entity"|"literal"}``.
+    ``rule_type`` is an open string (not an Enum) on purpose: ``params`` carries
+    every rule-type-specific knob, so new rule types can be added with zero
+    store-schema change. Two rule types ship today:
+
+    * ``"list_explode"`` — params ``{"delimiters": [", ", ";", " / "],
+      "target": "entity"|"literal"}``.
+    * ``"strip_emoji"`` — params ``{"targets": ["attribute"]}`` (which kinds of
+      object to clean; attribute literals by default). Removes emoji /
+      pictographic junk from text values.
+
+    A single predicate can warrant BOTH (e.g. ``skills`` may need
+    ``list_explode`` AND ``strip_emoji``); :func:`make_rule_id` folds
+    ``rule_type`` into the id so they don't collide in the store.
     """
 
     id: str
@@ -90,8 +103,17 @@ class NormalizationRule(BaseModel):
         return RULE_ENTITY_PREFIX + self.id
 
 
-def make_rule_id(kg_name: str, type_name: str, predicate: str) -> str:
-    """Deterministic id for a (kg, type, predicate) so re-suggesting is idempotent.
+def make_rule_id(
+    kg_name: str, type_name: str, predicate: str, rule_type: str = "list_explode"
+) -> str:
+    """Deterministic id for a (kg, type, predicate, rule_type) so re-suggesting is idempotent.
+
+    The id incorporates ``rule_type`` so two *different* normalizations on the
+    SAME predicate (e.g. ``list_explode`` AND ``strip_emoji`` on ``skills``) get
+    DISTINCT ids and don't clobber each other in the store. ``list_explode``
+    keeps its historical id shape (``<kg>__<type>__<pred>``) so previously-stored
+    rules and the existing callers stay byte-compatible; every other rule_type
+    gets a ``__<rule_type>`` suffix.
 
     Sanitized to URI-safe chars so it slots straight into the entity IRI without
     any further escaping (it is only ever spliced into ``<…>`` term positions).
@@ -99,6 +121,8 @@ def make_rule_id(kg_name: str, type_name: str, predicate: str) -> str:
     import re
 
     raw = f"{kg_name}__{type_name}__{predicate}"
+    if rule_type and rule_type != "list_explode":
+        raw = f"{raw}__{rule_type}"
     return re.sub(r"[^A-Za-z0-9_-]", "_", raw)[:200] or "rule"
 
 

@@ -179,7 +179,11 @@ class FakeNeptune:
         if "SELECT ?s ?p ?composite ?clabel" in sparql:
             return self._eval_explode_rel(sparql, quads)
 
-        # Executor _explode_literal: SELECT ?s ?p ?o ... isLiteral
+        # Executor _strip_emoji: SELECT ?s ?p ?o ... isLiteral, NO CONTAINS filter.
+        if "isLiteral(?o)" in sparql and "CONTAINS(STR(?o)" not in sparql:
+            return self._eval_strip_emoji(sparql, quads)
+
+        # Executor _explode_literal: SELECT ?s ?p ?o ... isLiteral + CONTAINS.
         if "isLiteral(?o)" in sparql:
             return self._eval_explode_lit(sparql, quads)
 
@@ -246,6 +250,22 @@ class FakeNeptune:
                 continue  # treat URIs as non-literal
             if any(_unescape(d) in o for d in delims):
                 out.append({"s": s, "p": p, "o": o})
+        return out
+
+    def _eval_strip_emoji(self, sparql: str, quads: set) -> list[dict]:
+        # SELECT ?s ?p ?o for the predicate's LITERAL objects (no delimiter
+        # filter — strip_emoji cleans in Python).
+        onto_m = re.search(r"\?p = <([^>]+)>", sparql)
+        onto_pred = onto_m.group(1) if onto_m else None
+        suffix_m = re.search(r'STRENDS\(STR\(\?p\), "([^"]+)"\)', sparql)
+        suffix = suffix_m.group(1) if suffix_m else None
+        out = []
+        for (s, p, o) in quads:
+            if not (p == onto_pred or (suffix and p.endswith(suffix))):
+                continue
+            if o.startswith("http://") or o.startswith("https://"):
+                continue  # treat URIs as non-literal
+            out.append({"s": s, "p": p, "o": o})
         return out
 
 
@@ -599,6 +619,186 @@ async def test_execute_explode_literal():
     before = set(neptune.graphs[kg])
     await apply_rule(neptune, TENANT, rule)
     assert neptune.graphs[kg] == before
+
+
+# --------------------------------------------------------------------------- #
+# 3b. Execution — strip_emoji.
+# --------------------------------------------------------------------------- #
+def _strip_emoji_rule() -> NormalizationRule:
+    return NormalizationRule(
+        id=make_rule_id(KG, "Mentor", "skills", "strip_emoji"),
+        kg_name=KG,
+        type_name="Mentor",
+        predicate="skills",
+        target_kind="attribute",
+        rule_type="strip_emoji",
+        params={"targets": ["attribute"]},
+        confidence=0.9,
+        status="confirmed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_strip_emoji_cleans_and_drops_pure_emoji():
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    skills = ONTO + "skills"
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", skills, "🎨 design"),   # leading emoji + space
+            (ENTITY + "Mentor/B", skills, "ai 🚀"),        # trailing emoji + space
+            (ENTITY + "Mentor/C", skills, "growth"),       # no emoji — untouched
+            (ENTITY + "Mentor/D", skills, "🔥🔥"),          # pure emoji — dropped
+            (ENTITY + "Mentor/E", skills, "data  📊  viz"),  # interior + double space
+        }
+    )
+
+    summary = await apply_rule(neptune, TENANT, _strip_emoji_rule())
+    quads = neptune.graphs[kg]
+
+    # emoji removed, whitespace collapsed/trimmed
+    assert (ENTITY + "Mentor/A", skills, "design") in quads
+    assert (ENTITY + "Mentor/A", skills, "🎨 design") not in quads
+    assert (ENTITY + "Mentor/B", skills, "ai") in quads
+    assert (ENTITY + "Mentor/B", skills, "ai 🚀") not in quads
+    assert (ENTITY + "Mentor/E", skills, "data viz") in quads
+
+    # non-emoji value untouched
+    assert (ENTITY + "Mentor/C", skills, "growth") in quads
+
+    # pure-emoji value dropped entirely (no replacement literal)
+    assert not [t for t in quads if t[0] == ENTITY + "Mentor/D" and t[1] == skills]
+
+    assert summary == {"literals_cleaned": 4, "triples_rewritten": 4}
+
+    # idempotent: re-running finds nothing to clean -> no-op
+    before = set(neptune.graphs[kg])
+    summary2 = await apply_rule(neptune, TENANT, _strip_emoji_rule())
+    assert neptune.graphs[kg] == before
+    assert summary2 == {"literals_cleaned": 0, "triples_rewritten": 0}
+
+
+@pytest.mark.asyncio
+async def test_execute_strip_emoji_preserves_real_skill_names():
+    """Accented letters, digits, and punctuation that belong to real skills
+    (c++, C#, Node.js, R&D, café) must survive untouched."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    skills = ONTO + "skills"
+    keepers = ["c++", "C#", "Node.js", "R&D", "café", "machine-learning", "A/B testing"]
+    neptune._g(kg).add((ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"))
+    for v in keepers:
+        neptune._g(kg).add((ENTITY + "Mentor/A", skills, v))
+
+    summary = await apply_rule(neptune, TENANT, _strip_emoji_rule())
+    quads = neptune.graphs[kg]
+    for v in keepers:
+        assert (ENTITY + "Mentor/A", skills, v) in quads
+    assert summary == {"literals_cleaned": 0, "triples_rewritten": 0}
+
+
+@pytest.mark.asyncio
+async def test_execute_strip_emoji_works_on_exploded_atomic_literals():
+    """strip_emoji is per-literal, so it cleans atomic literals the same way it
+    would clean a still-packed one (works whether or not list_explode ran)."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    skills = ONTO + "skills"
+    # already exploded into atomic literals, but each still carries emoji
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", skills, "🎨 design"),
+            (ENTITY + "Mentor/A", skills, "🚀 growth"),
+        }
+    )
+    summary = await apply_rule(neptune, TENANT, _strip_emoji_rule())
+    quads = neptune.graphs[kg]
+    assert (ENTITY + "Mentor/A", skills, "design") in quads
+    assert (ENTITY + "Mentor/A", skills, "growth") in quads
+    assert summary == {"literals_cleaned": 2, "triples_rewritten": 2}
+
+
+# --------------------------------------------------------------------------- #
+# 3c. Inference — multi-rule per predicate + id collision.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_inference_emits_multiple_rules_per_predicate(monkeypatch):
+    """skills warrants BOTH list_explode AND strip_emoji -> both emitted, with
+    distinct ids, ranked by confidence (desc)."""
+    neptune = FakeNeptune()
+    _seed_mentor_ontology(neptune, rng="http://www.w3.org/2001/XMLSchema#string")  # attribute
+    _seed_mentor_instances(
+        neptune,
+        ["🎨 design; ai; 🚀 growth", "design; data"],
+        pred=ONTO + "speaks",  # _seed_mentor_ontology declares the 'speaks' attr
+    )
+
+    async def fake_chat(api_key, system, user, **kw):
+        return (
+            '{"rules": ['
+            '{"rule_type": "strip_emoji", "params": {"targets": ["attribute"]}, '
+            '"confidence": 0.95, "rationale": "values carry emoji junk"},'
+            '{"rule_type": "list_explode", '
+            '"params": {"delimiters": ["; "], "target": "literal"}, '
+            '"confidence": 0.8, "rationale": "semicolon-delimited list"}'
+            ']}'
+        )
+
+    monkeypatch.setattr(inference_mod, "openrouter_chat", fake_chat)
+    monkeypatch.setattr(inference_mod, "_openrouter_key", lambda: "key")
+
+    rules = await suggest_rules(neptune, TENANT, KG, "Mentor")
+    assert len(rules) == 2
+    # ranked by confidence desc: strip_emoji (0.95) before list_explode (0.8)
+    assert [r.rule_type for r in rules] == ["strip_emoji", "list_explode"]
+    assert rules[0].confidence > rules[1].confidence
+    # distinct ids
+    assert rules[0].id != rules[1].id
+    # both target the same predicate
+    assert {r.predicate for r in rules} == {"speaks"}
+    # params carried through per rule type
+    le = next(r for r in rules if r.rule_type == "list_explode")
+    se = next(r for r in rules if r.rule_type == "strip_emoji")
+    assert "; " in le.params["delimiters"]
+    assert se.params["targets"] == ["attribute"]
+
+
+@pytest.mark.asyncio
+async def test_inference_dedupes_repeated_rule_type(monkeypatch):
+    """Two recommendations of the SAME rule_type collapse to one (first wins)."""
+    neptune = FakeNeptune()
+    _seed_mentor_ontology(neptune, rng="http://www.w3.org/2001/XMLSchema#string")
+    _seed_mentor_instances(neptune, ["🎨 design", "ai 🚀"], pred=ONTO + "speaks")
+
+    async def fake_chat(api_key, system, user, **kw):
+        return (
+            '{"rules": ['
+            '{"rule_type": "strip_emoji", "params": {}, "confidence": 0.9, "rationale": "a"},'
+            '{"rule_type": "strip_emoji", "params": {}, "confidence": 0.4, "rationale": "b"}'
+            ']}'
+        )
+
+    monkeypatch.setattr(inference_mod, "openrouter_chat", fake_chat)
+    monkeypatch.setattr(inference_mod, "_openrouter_key", lambda: "key")
+
+    rules = await suggest_rules(neptune, TENANT, KG, "Mentor")
+    assert len(rules) == 1
+    assert rules[0].rule_type == "strip_emoji"
+    assert rules[0].confidence == pytest.approx(0.9)  # first recommendation wins
+
+
+def test_make_rule_id_distinguishes_rule_type():
+    """list_explode and strip_emoji on the SAME predicate get DISTINCT ids; the
+    list_explode id stays byte-identical to the historical (3-arg) scheme."""
+    le_id = make_rule_id(KG, "Mentor", "skills", "list_explode")
+    se_id = make_rule_id(KG, "Mentor", "skills", "strip_emoji")
+    assert le_id != se_id
+    # backward compatible: list_explode id == legacy 3-arg id (no suffix)
+    assert le_id == make_rule_id(KG, "Mentor", "skills")
+    # strip_emoji carries the rule_type suffix
+    assert se_id.endswith("__strip_emoji")
 
 
 # --------------------------------------------------------------------------- #

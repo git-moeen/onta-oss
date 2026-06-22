@@ -1,7 +1,8 @@
-"""Execute a confirmed normalization rule (v1: list_explode).
+"""Execute a confirmed normalization rule.
 
-:func:`apply_rule` rewrites a KG graph in place to split collapsed multi-value
-cells into atomic ones. Two shapes:
+:func:`apply_rule` rewrites a KG graph in place. Two rule types ship today.
+
+``list_explode`` splits collapsed multi-value cells into atomic ones. Two shapes:
 
 * **relationship, target=entity** (the ``speaks`` case): an edge points at a
   COMPOSITE entity whose local-name/label packs several atomic values joined by
@@ -15,8 +16,19 @@ cells into atomic ones. Two shapes:
   several items with a delimiter. We split into atomic literals, write N triples,
   and remove the original packed literal.
 
-Idempotent: re-running finds nothing to split (the values are already atomic) and
-is a no-op. Returns ``{edges_rewritten, atomic_created, orphans_dropped}``.
+``strip_emoji`` removes emoji / pictographic junk characters from text literals
+(the ``skills = "🎨 design"`` case): for each matching ``attrs/<pred>`` (or
+``onto/<pred>``) literal we strip emoji codepoints + variation selectors + ZWJ +
+skin-tone modifiers, collapse the leftover whitespace, and rewrite ONLY the
+literals that actually changed. A value with no emoji is untouched (idempotent
+re-run is a no-op). A literal that becomes empty after stripping (a pure-emoji
+value) is dropped. It operates per-literal, so it works whether ``skills`` is
+still one packed literal or already exploded into atomic literals.
+
+Idempotent: re-running finds nothing to change (values are already atomic /
+emoji-free) and is a no-op. ``list_explode`` returns
+``{edges_rewritten, atomic_created, orphans_dropped}``; ``strip_emoji`` returns
+``{literals_cleaned, triples_rewritten}``.
 """
 
 from __future__ import annotations
@@ -48,13 +60,52 @@ NAME_ATTR_SUFFIX = "/attrs/name"
 # split form too. Each is a literal substring to split on.
 _FALLBACK_DELIMITERS = [", ", "; ", " / ", " | ", " - ", "__"]
 
+# Emoji / pictographic / junk codepoints to strip from text literals
+# (strip_emoji). Scoped to the symbol/pictograph blocks so ordinary letters
+# (incl. accented), digits, and real-skill-name punctuation (& + - / # . etc.)
+# are left ALONE — e.g. "c++", "C#", "Node.js", "café", "R&D" survive intact.
+#   U+200D            zero-width joiner (binds emoji sequences)
+#   U+FE0E/U+FE0F     variation selectors (text/emoji presentation)
+#   U+1F3FB–U+1F3FF   skin-tone modifiers
+#   U+1F1E6–U+1F1FF   regional-indicator letters (flags)
+#   U+2600–U+27BF     Misc Symbols + Dingbats
+#   U+2B00–U+2BFF     Misc Symbols & Arrows (incl. ⭐ stars, ✅-adjacent)
+#   U+1F000–U+1FAFF   the emoji/pictograph planes (Emoticons, Misc Symbols &
+#                     Pictographs, Transport & Map, Supplemental, Symbols &
+#                     Pictographs Extended-A, etc.)
+#   U+2190–U+21FF     Arrows (decorative junk that shows up in scraped text)
+#   U+2300–U+23FF     Misc Technical (⌚⏰ etc.)
+#   U+2B50 etc. fall inside the ranges above.
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0000200d"
+    "\U0000fe0e\U0000fe0f"
+    "\U0001f3fb-\U0001f3ff"
+    "\U0001f1e6-\U0001f1ff"
+    "\U00002190-\U000021ff"
+    "\U00002300-\U000023ff"
+    "\U00002600-\U000027bf"
+    "\U00002b00-\U00002bff"
+    "\U0001f000-\U0001faff"
+    "]+"
+)
+# Collapse the whitespace left behind once emoji are removed.
+_WS_PATTERN = re.compile(r"\s+")
+
 
 async def apply_rule(neptune: NeptuneClient, tenant_id: str, rule) -> dict:
-    """Apply a confirmed list_explode rule. Returns a summary dict."""
-    if rule.rule_type != "list_explode":
-        raise ValueError(f"unsupported rule_type {rule.rule_type!r} (v1: list_explode)")
+    """Apply a confirmed rule (``list_explode`` or ``strip_emoji``). Returns a summary."""
+    if rule.rule_type not in ("list_explode", "strip_emoji"):
+        raise ValueError(
+            f"unsupported rule_type {rule.rule_type!r} "
+            f"(supported: list_explode, strip_emoji)"
+        )
 
     kg_graph = kg_graph_uri(tenant_id, rule.kg_name)
+
+    if rule.rule_type == "strip_emoji":
+        return await _strip_emoji(neptune, kg_graph, rule)
+
     delimiters = _delimiters(rule)
     target = (rule.params or {}).get("target")
     pred_leaf = rule.predicate
@@ -311,6 +362,78 @@ async def _explode_literal(
         "orphans_dropped": 0,
     }
     logger.info("explode_literal_done", predicate=pred_leaf, **summary)
+    return summary
+
+
+def _strip_emoji_value(value: str) -> str:
+    """Remove emoji / pictographic junk from one text value, collapse whitespace.
+
+    Pure + deterministic. ``"🎨 design"`` → ``"design"``; ``"design 🚀"`` →
+    ``"design"``; ``"ai 🚀 growth"`` → ``"ai growth"``; a pure-emoji value → ``""``
+    (the caller drops empties). A value with no emoji is returned UNCHANGED after
+    a no-op whitespace collapse, so re-running is idempotent and ordinary names
+    (``"c++"``, ``"café"``, ``"R&D"``) are never touched.
+    """
+    stripped = _EMOJI_PATTERN.sub(" ", value)
+    return _WS_PATTERN.sub(" ", stripped).strip()
+
+
+async def _strip_emoji(neptune: NeptuneClient, kg_graph: str, rule) -> dict:
+    """Strip emoji/junk from this predicate's literals; rewrite only what changed.
+
+    Selects every ``attrs/<leaf>`` (or ``onto/<leaf>``) literal for the
+    predicate, cleans each value, and — for the literals that actually changed —
+    deletes the old triple and (unless the cleaned value is empty) inserts the
+    cleaned one. Unchanged literals (already emoji-free) and non-literal objects
+    are left alone, so the pass is idempotent. ``targets`` in params is reserved
+    for future relationship-label cleaning; v1 cleans attribute literals.
+    """
+    pred_leaf = rule.predicate
+    onto_pred = ONTO_PRED_PREFIX + pred_leaf
+    attr_pred_suffix = ATTRS_INFIX + pred_leaf
+
+    # Pull every literal for the predicate (both predicate forms). No CONTAINS
+    # pre-filter — emoji are spread across many codepoints, so we clean in Python
+    # and only rewrite the rows that change (the SELECT is bounded by predicate).
+    q = (
+        f"SELECT ?s ?p ?o FROM <{kg_graph}> WHERE {{\n"
+        f"  ?s ?p ?o .\n"
+        f"  FILTER(?p = <{onto_pred}> || STRENDS(STR(?p), \"{_sparql_str(attr_pred_suffix)}\"))\n"
+        f"  FILTER(isLiteral(?o))\n"
+        f"}}"
+    )
+    _, rows = parse_sparql_results(await neptune.query(q))
+
+    to_delete: list[tuple[str, str, str]] = []
+    to_add: list[tuple[str, str, str]] = []
+    literals_cleaned = 0
+    for r in rows:
+        s = r.get("s", "")
+        p = r.get("p", "")
+        o = r.get("o", "")
+        if not s or not p:
+            continue
+        cleaned = _strip_emoji_value(o)
+        if cleaned == o:
+            continue  # no emoji / already clean — idempotent no-op
+        literals_cleaned += 1
+        to_delete.append((s, p, o))
+        if cleaned:
+            to_add.append((s, p, cleaned))
+        # else: cleaned is empty (pure-emoji value) — drop the triple entirely.
+
+    if to_add:
+        for sparql in batched_insert_triples(kg_graph, to_add):
+            await neptune.update(sparql)
+    if to_delete:
+        for i in range(0, len(to_delete), 500):
+            await neptune.update(delete_triples(kg_graph, to_delete[i : i + 500]))
+
+    summary = {
+        "literals_cleaned": literals_cleaned,
+        "triples_rewritten": len(to_delete),
+    }
+    logger.info("strip_emoji_done", predicate=pred_leaf, **summary)
     return summary
 
 
