@@ -4,12 +4,20 @@ Lifecycle: suggest → (human) confirm/reject → apply.
 
   POST /graphs/{tenant}/normalize/suggest?kg=&type=   run inference, persist
                                                        suggested rules, return ranked
+  POST /graphs/{tenant}/normalize/rules                create a USER-AUTHORED rule
+                                                       directly (no inference); upsert
   GET  /graphs/{tenant}/normalize/rules?kg=&status=    list stored rules
   POST /graphs/{tenant}/normalize/rules/{id}/confirm   status -> confirmed
   POST /graphs/{tenant}/normalize/rules/{id}/reject    status -> rejected
   POST /graphs/{tenant}/normalize/rules/{id}/apply     run apply_rule in the
                                                        background (confirmed only),
                                                        set status=applied on success
+
+The user-authored create path complements inference: for sparse issues (e.g. an
+emoji in ~0.4% of values) random-sample inference is unreliable, and a user may
+simply KNOW they want a rule. It shares ids with inferred rules of the same
+(kg, type, predicate, rule_type) via :func:`make_rule_id`, so creating one that
+already exists UPSERTs rather than duplicating.
 
 Apply uses the SAME strong-ref ``_spawn`` background-task pattern as enrich.py so
 the task can't be garbage-collected after the request returns.
@@ -19,16 +27,28 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from cograph_client.api.deps import get_neptune_client
 from cograph_client.auth.api_keys import TenantContext, get_tenant
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.normalization.execute import apply_rule
 from cograph_client.normalization.inference import suggest_rules
-from cograph_client.normalization.rules import NormalizationRule, NormalizationRuleStore
+from cograph_client.normalization.rules import (
+    NormalizationRule,
+    NormalizationRuleStore,
+    make_rule_id,
+)
+
+# Rule types a user may author directly. Mirrors inference's
+# ``_SUPPORTED_RULE_TYPES`` (kept local so the create route doesn't depend on an
+# inference internal): the two normalizations the executor knows how to apply.
+_SUPPORTED_RULE_TYPES = {"list_explode", "strip_emoji"}
+_VALID_LIST_EXPLODE_TARGETS = {"entity", "literal"}
 
 logger = structlog.stdlib.get_logger("cograph.normalization.routes")
 
@@ -49,6 +69,97 @@ def _spawn(coro) -> None:
 
 def _store(client: NeptuneClient) -> NormalizationRuleStore:
     return NormalizationRuleStore(client)
+
+
+class CreateRuleRequest(BaseModel):
+    """Body for the user-authored rule create endpoint.
+
+    A user supplies the full rule shape directly (no inference). ``params`` is
+    rule-type-specific (see :class:`NormalizationRule`); validation below enforces
+    the per-type minimums so a malformed rule never reaches the store.
+    ``status`` defaults to ``"suggested"`` (matching inferred rules) but may be
+    ``"confirmed"`` so the rule can be applied without a separate confirm step.
+    """
+
+    kg_name: str
+    type_name: str
+    predicate: str
+    target_kind: Literal["attribute", "relationship"]
+    rule_type: str
+    params: dict = Field(default_factory=dict)
+    confidence: float = 1.0
+    rationale: str = "user-authored"
+    status: Literal["suggested", "confirmed"] = "suggested"
+
+
+def _validate_create_request(req: CreateRuleRequest) -> None:
+    """Reject malformed create requests with a 422. Mirrors the per-rule-type
+    invariants inference applies, but enforced as hard validation since there is
+    no LLM to fall back on defaults for a user-authored rule."""
+    if not req.kg_name.strip():
+        raise HTTPException(status_code=422, detail="kg_name must be non-empty")
+    if not req.type_name.strip():
+        raise HTTPException(status_code=422, detail="type_name must be non-empty")
+    if not req.predicate.strip():
+        raise HTTPException(status_code=422, detail="predicate must be non-empty")
+    if req.rule_type not in _SUPPORTED_RULE_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"unknown rule_type {req.rule_type!r}; "
+                f"supported: {sorted(_SUPPORTED_RULE_TYPES)}"
+            ),
+        )
+    if req.rule_type == "list_explode":
+        delimiters = req.params.get("delimiters")
+        if not isinstance(delimiters, list) or not delimiters:
+            raise HTTPException(
+                status_code=422,
+                detail="list_explode requires params.delimiters (non-empty list)",
+            )
+        target = req.params.get("target")
+        if target not in _VALID_LIST_EXPLODE_TARGETS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "list_explode requires params.target in "
+                    f"{sorted(_VALID_LIST_EXPLODE_TARGETS)}"
+                ),
+            )
+    # strip_emoji: params may be empty — the executor defaults targets to
+    # attribute literals, so no required keys to validate.
+
+
+@router.post("/rules", response_model=NormalizationRule)
+async def create_rule(
+    req: CreateRuleRequest,
+    tenant: TenantContext = Depends(get_tenant),
+    client: NeptuneClient = Depends(get_neptune_client),
+):
+    """Create a USER-AUTHORED normalization rule directly (no inference).
+
+    The id is derived from ``(kg, type, predicate, rule_type)`` via
+    :func:`make_rule_id`, so it shares ids with inferred rules of the same shape:
+    creating one whose id already exists UPSERTs (the store clears prior triples
+    before re-writing), never duplicates. ``created_at`` is stamped by the
+    :class:`NormalizationRule` model's default_factory. Persists with the
+    requested ``status`` and returns the persisted rule.
+    """
+    _validate_create_request(req)
+    rule = NormalizationRule(
+        id=make_rule_id(req.kg_name, req.type_name, req.predicate, req.rule_type),
+        kg_name=req.kg_name,
+        type_name=req.type_name,
+        predicate=req.predicate,
+        target_kind=req.target_kind,
+        rule_type=req.rule_type,
+        params=req.params,
+        confidence=req.confidence,
+        rationale=req.rationale,
+        status=req.status,
+    )
+    await _store(client).save(tenant.tenant_id, rule)
+    return rule
 
 
 @router.post("/suggest", response_model=list[NormalizationRule])

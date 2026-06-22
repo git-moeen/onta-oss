@@ -1128,3 +1128,146 @@ def test_route_apply_missing_rule_404(route_client):
     h = {"X-API-Key": "test-key"}
     res = client.post("/graphs/test-tenant/normalize/rules/does-not-exist/apply", headers=h)
     assert res.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 5. Route surface — user-authored rule create (POST /rules).
+# --------------------------------------------------------------------------- #
+def _create_body(**overrides) -> dict:
+    body = {
+        "kg_name": "june-16",
+        "type_name": "Mentor",
+        "predicate": "name",
+        "target_kind": "attribute",
+        "rule_type": "strip_emoji",
+        "params": {},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_route_create_strip_emoji_rule_persists_and_retrievable(route_client):
+    client, _ = route_client
+    h = {"X-API-Key": "test-key"}
+
+    res = client.post("/graphs/test-tenant/normalize/rules", json=_create_body(), headers=h)
+    assert res.status_code == 200
+    created = res.json()
+    # id folds in (kg, type, predicate, rule_type); strip_emoji carries suffix.
+    assert created["id"] == make_rule_id("june-16", "Mentor", "name", "strip_emoji")
+    assert created["id"].endswith("__name__strip_emoji")
+    assert created["rule_type"] == "strip_emoji"
+    assert created["predicate"] == "name"
+    assert created["status"] == "suggested"  # default
+    assert created["rationale"] == "user-authored"  # default
+    assert created["confidence"] == pytest.approx(1.0)  # default
+    assert created["created_at"]  # stamped by the model default_factory
+    rule_id = created["id"]
+
+    # Retrievable via list.
+    listed = client.get(
+        "/graphs/test-tenant/normalize/rules?kg=june-16&status=suggested", headers=h
+    )
+    assert listed.status_code == 200
+    assert [r["id"] for r in listed.json()] == [rule_id]
+
+
+def test_route_create_confirmed_status_is_stored_confirmed(route_client):
+    client, _ = route_client
+    h = {"X-API-Key": "test-key"}
+
+    res = client.post(
+        "/graphs/test-tenant/normalize/rules",
+        json=_create_body(status="confirmed"),
+        headers=h,
+    )
+    assert res.status_code == 200
+    assert res.json()["status"] == "confirmed"
+
+    # Stored confirmed → shows up under the confirmed filter (apply-ready without
+    # a separate confirm step).
+    listed = client.get(
+        "/graphs/test-tenant/normalize/rules?status=confirmed", headers=h
+    )
+    assert listed.status_code == 200
+    assert [r["status"] for r in listed.json()] == ["confirmed"]
+
+
+def test_route_create_unknown_rule_type_422(route_client):
+    client, _ = route_client
+    h = {"X-API-Key": "test-key"}
+    res = client.post(
+        "/graphs/test-tenant/normalize/rules",
+        json=_create_body(rule_type="trim"),
+        headers=h,
+    )
+    assert res.status_code == 422
+
+
+def test_route_create_list_explode_without_delimiters_422(route_client):
+    client, _ = route_client
+    h = {"X-API-Key": "test-key"}
+    # list_explode with no params.delimiters is rejected (no LLM to default them).
+    res = client.post(
+        "/graphs/test-tenant/normalize/rules",
+        json=_create_body(
+            predicate="skills",
+            rule_type="list_explode",
+            params={"target": "literal"},
+        ),
+        headers=h,
+    )
+    assert res.status_code == 422
+
+
+def test_route_create_list_explode_valid(route_client):
+    client, _ = route_client
+    h = {"X-API-Key": "test-key"}
+    res = client.post(
+        "/graphs/test-tenant/normalize/rules",
+        json=_create_body(
+            predicate="skills",
+            rule_type="list_explode",
+            params={"delimiters": ["; "], "target": "literal"},
+        ),
+        headers=h,
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["rule_type"] == "list_explode"
+    assert body["params"] == {"delimiters": ["; "], "target": "literal"}
+    # list_explode id keeps the historical (no-suffix) shape.
+    assert body["id"] == make_rule_id("june-16", "Mentor", "skills", "list_explode")
+
+
+def test_route_create_is_upsert_no_duplicate(route_client):
+    """Creating the SAME (kg, type, predicate, rule_type) twice yields ONE rule
+    (the store clears prior triples before re-writing), not two."""
+    client, neptune = route_client
+    h = {"X-API-Key": "test-key"}
+
+    first = client.post("/graphs/test-tenant/normalize/rules", json=_create_body(), headers=h)
+    assert first.status_code == 200
+    rule_id = first.json()["id"]
+
+    # Re-create with a changed field (confidence) → same id, overwrite not dup.
+    second = client.post(
+        "/graphs/test-tenant/normalize/rules",
+        json=_create_body(confidence=0.5),
+        headers=h,
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == rule_id
+
+    # Exactly one rule in the store for this predicate.
+    listed = client.get("/graphs/test-tenant/normalize/rules?kg=june-16", headers=h)
+    assert listed.status_code == 200
+    matching = [r for r in listed.json() if r["id"] == rule_id]
+    assert len(matching) == 1
+    assert matching[0]["confidence"] == pytest.approx(0.5)  # latest write wins
+
+    # And no stale rdf:type triple duplication in the underlying store.
+    graph = neptune.graphs["https://cograph.tech/graphs/test-tenant"]
+    uri = "https://cograph.tech/entities/NormalizationRule/" + rule_id
+    type_triples = [t for t in graph if t[0] == uri and t[1] == RDF_TYPE]
+    assert len(type_triples) == 1
