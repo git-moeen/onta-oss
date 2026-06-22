@@ -824,6 +824,197 @@ async def test_orphan_sweep_rerunnable_clears_leftover_orphan():
     assert (atomic, RDF_TYPE, TYPES + "Language") in quads
 
 
+# --------------------------------------------------------------------------- #
+# COG-118: single-value composites carrying a JUNK delimiter (leading/trailing/
+# doubled "__") must be re-pointed to the clean atomic node, even though the
+# split yields a SINGLE atom. The old skip (`len(atoms) <= 1`) treated these as
+# "already atomic" and left malformed `…/Industry/__Agriculture` nodes referenced
+# (so the sweep couldn't remove them). The fix skips ONLY when the single atom's
+# canonical IRI equals the composite's own IRI (genuinely clean + atomic).
+# --------------------------------------------------------------------------- #
+def _worksin_rule() -> NormalizationRule:
+    return NormalizationRule(
+        id=make_rule_id(KG, "Mentor", "worksin"),
+        kg_name=KG,
+        type_name="Mentor",
+        predicate="worksin",
+        target_kind="relationship",
+        rule_type="list_explode",
+        params={"delimiters": [", ", "__"], "target": "entity"},
+        confidence=0.9,
+        status="confirmed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_value_leading_delimiter_is_repointed_and_swept():
+    """`…/Industry/__Agriculture` (single value, LEADING junk "__") → subject is
+    re-pointed to the clean `…/Industry/Agriculture`, the `__Agriculture` edge is
+    removed, and `__Agriculture` (now with no inbound worksin edge) is swept."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    worksin = ONTO + "worksin"
+
+    junk = ENTITY + "Industry/__Agriculture"   # leading delimiter
+    clean = ENTITY + "Industry/Agriculture"    # canonical atomic node
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", worksin, junk),
+            # Composite-named node WITH a label that still carries the junk "__"
+            # (mirrors live data: label "__Agriculture", local-name "__Agriculture").
+            (junk, RDF_TYPE, TYPES + "Industry"),
+            (junk, RDFS_LABEL, "__Agriculture"),
+        }
+    )
+
+    summary = await apply_rule(neptune, TENANT, _worksin_rule())
+    quads = neptune.graphs[kg]
+
+    # Subject now points at the CLEAN atomic Industry node.
+    assert (ENTITY + "Mentor/A", worksin, clean) in quads
+    assert (clean, RDF_TYPE, TYPES + "Industry") in quads
+    assert (clean, RDFS_LABEL, "Agriculture") in quads
+    # The malformed edge is gone …
+    assert (ENTITY + "Mentor/A", worksin, junk) not in quads
+    # … and the malformed node, now orphaned, is swept entirely.
+    assert not [t for t in quads if t[0] == junk]
+
+    assert summary["edges_rewritten"] == 1
+    assert summary["atomic_created"] == 1
+    assert summary["orphans_dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_single_value_trailing_delimiter_is_repointed_and_swept():
+    """`…/Industry/Automotive__` (single value, TRAILING junk "__") → re-pointed
+    to the clean `…/Industry/Automotive` and the junk node is swept. Uses the
+    LOCAL-NAME fallback (no rdfs:label) for the split source."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    worksin = ONTO + "worksin"
+
+    junk = ENTITY + "Industry/Automotive__"     # trailing delimiter, NO label
+    clean = ENTITY + "Industry/Automotive"
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", worksin, junk),
+            (junk, RDF_TYPE, TYPES + "Industry"),
+            # no rdfs:label -> split falls back to the (decoded) local name.
+        }
+    )
+
+    summary = await apply_rule(neptune, TENANT, _worksin_rule())
+    quads = neptune.graphs[kg]
+
+    assert (ENTITY + "Mentor/A", worksin, clean) in quads
+    assert (clean, RDF_TYPE, TYPES + "Industry") in quads
+    assert (clean, RDFS_LABEL, "Automotive") in quads
+    assert (ENTITY + "Mentor/A", worksin, junk) not in quads
+    assert not [t for t in quads if t[0] == junk]
+
+    assert summary["edges_rewritten"] == 1
+    assert summary["atomic_created"] == 1
+    assert summary["orphans_dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_doubled_delimiter_single_node_splits_into_two_atoms():
+    """`…/Industry/A____B` (DOUBLED "__" between two real tokens) → splits to two
+    atoms A and B, re-points the subject at both clean nodes, and sweeps the
+    malformed source node."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    worksin = ONTO + "worksin"
+
+    junk = ENTITY + "Industry/A____B"
+    clean_a = ENTITY + "Industry/A"
+    clean_b = ENTITY + "Industry/B"
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", worksin, junk),
+            (junk, RDF_TYPE, TYPES + "Industry"),
+            (junk, RDFS_LABEL, "A____B"),
+        }
+    )
+
+    summary = await apply_rule(neptune, TENANT, _worksin_rule())
+    quads = neptune.graphs[kg]
+
+    assert (ENTITY + "Mentor/A", worksin, clean_a) in quads
+    assert (ENTITY + "Mentor/A", worksin, clean_b) in quads
+    assert (clean_a, RDFS_LABEL, "A") in quads
+    assert (clean_b, RDFS_LABEL, "B") in quads
+    assert (ENTITY + "Mentor/A", worksin, junk) not in quads
+    assert not [t for t in quads if t[0] == junk]
+
+    assert summary["edges_rewritten"] == 1
+    assert summary["atomic_created"] == 2  # A and B
+    assert summary["orphans_dropped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_clean_atomic_target_is_not_repointed_idempotent():
+    """A genuinely-clean atomic target (`…/Industry/Agriculture`, whose single
+    atom's canonical IRI == its own IRI) is NOT re-pointed and is left intact —
+    the skip-condition's idempotency guarantee. Re-running is a pure no-op."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    worksin = ONTO + "worksin"
+
+    clean = ENTITY + "Industry/Agriculture"
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", worksin, clean),
+            (clean, RDF_TYPE, TYPES + "Industry"),
+            (clean, RDFS_LABEL, "Agriculture"),
+        }
+    )
+    before = set(neptune.graphs[kg])
+
+    summary = await apply_rule(neptune, TENANT, _worksin_rule())
+    quads = neptune.graphs[kg]
+
+    # Untouched: the clean node and its edge survive exactly as seeded …
+    assert (ENTITY + "Mentor/A", worksin, clean) in quads
+    assert (clean, RDF_TYPE, TYPES + "Industry") in quads
+    assert (clean, RDFS_LABEL, "Agriculture") in quads
+    # … and nothing was rewritten or swept (it has no delimiter, so the sweep
+    # never considers it an orphan either).
+    assert quads == before
+    assert summary == {"edges_rewritten": 0, "atomic_created": 0, "orphans_dropped": 0}
+
+
+@pytest.mark.asyncio
+async def test_single_value_junk_repoint_is_idempotent_on_rerun():
+    """After the junk single-value node is re-pointed + swept, a SECOND apply is a
+    no-op: the clean `Agriculture` node's atom IRI == its own IRI, so it is
+    skipped and nothing changes."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    worksin = ONTO + "worksin"
+
+    junk = ENTITY + "Industry/__Agriculture"
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", worksin, junk),
+            (junk, RDF_TYPE, TYPES + "Industry"),
+            (junk, RDFS_LABEL, "__Agriculture"),
+        }
+    )
+
+    await apply_rule(neptune, TENANT, _worksin_rule())
+    after_first = set(neptune.graphs[kg])
+
+    summary2 = await apply_rule(neptune, TENANT, _worksin_rule())
+    assert neptune.graphs[kg] == after_first
+    assert summary2 == {"edges_rewritten": 0, "atomic_created": 0, "orphans_dropped": 0}
+
+
 @pytest.mark.asyncio
 async def test_rerun_sweep_resolves_target_type_from_ontology_range():
     """COG-118: on a re-run where NOTHING is rewritten (edges_rewritten == 0),

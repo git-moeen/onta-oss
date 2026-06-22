@@ -230,6 +230,18 @@ def _slug(value: str) -> str:
     return safe[:200] if safe else "unknown"
 
 
+def _atom_uri(target_type: str, atom: str) -> str:
+    """Canonical atomic entity IRI for ``atom`` of ``target_type``.
+
+    Single source of truth for how atomic IRIs are minted: ``…/entities/
+    <TargetType>/<slug>``. Used both to RE-POINT an edge at the clean atomic node
+    and to decide idempotency — the skip check compares an atom's canonical IRI
+    to the composite's own IRI, so they MUST be minted the same way for the
+    equality to be exact (COG-118).
+    """
+    return f"{ENTITY_URI_PREFIX}{target_type}/{_slug(atom)}"
+
+
 def _target_type_from_uri(composite_uri: str) -> str | None:
     """``…/entities/<TargetType>/<slug>`` → ``<TargetType>``."""
     if not composite_uri.startswith(ENTITY_URI_PREFIX):
@@ -291,8 +303,19 @@ async def _explode_relationship(
         clabel = r.get("clabel", "")
         source = clabel or _decode_local_name(composite)
         atoms = _split(source, delimiters)
-        if len(atoms) <= 1:
-            # Already atomic for this composite — nothing to do (idempotency).
+        if not atoms:
+            # Nothing to split (empty/whitespace-only source) — nothing to do.
+            continue
+        # Skip ONLY when the target is already a clean atomic node: a single atom
+        # whose CANONICAL IRI is the composite's own IRI. That is the genuine
+        # idempotency case (re-running on `…/Language/English` is a no-op). A
+        # single atom whose canonical IRI DIFFERS from the composite's IRI means
+        # the target carries a junk delimiter (leading/trailing/doubled, e.g.
+        # `…/Industry/__Agriculture` → atom "Agriculture" → `…/Industry/Agriculture`)
+        # and MUST be re-pointed to the clean node — same as the multi-atom path —
+        # so the malformed node becomes a sweepable orphan (COG-118). The equality
+        # uses the SAME minting helper as the re-point below, so the check is exact.
+        if len(atoms) == 1 and _atom_uri(target_type, atoms[0]) == composite:
             continue
         composites_touched.add(composite)
         # Re-point the edge to one CANONICAL atomic entity per atom; the canonical
@@ -300,7 +323,7 @@ async def _explode_relationship(
         # maps to the SAME node. Always re-point using the onto/<leaf> predicate
         # (the proper relationship form) regardless of the predicate as-used.
         for atom in atoms:
-            atom_uri = f"{ENTITY_URI_PREFIX}{target_type}/{_slug(atom)}"
+            atom_uri = _atom_uri(target_type, atom)
             edges_to_add.append((s, onto_pred, atom_uri))
             if atom_uri not in atomic_seen:
                 atomic_seen.add(atom_uri)
