@@ -79,10 +79,29 @@ class PostgresJobStore:
 
     _TABLE = "cograph_jobs"
 
-    def __init__(self, dsn: Optional[str] = None) -> None:
+    def __init__(
+        self, dsn: Optional[str] = None, acquire_timeout: Optional[float] = None
+    ) -> None:
         self._dsn = dsn if dsn is not None else settings.database_url
         self._pool: Any = None
         self._lock = asyncio.Lock()
+        # Per-acquire timeout (seconds). asyncpg's pool.acquire() blocks FOREVER
+        # by default; a saturated/cold/unreachable pool would otherwise turn
+        # every read/write into a silent infinite hang (COG-112: the enrichment
+        # executor stalled on its first post-select jobs.update with no
+        # exception, no completion). Bounding it makes the stall raise
+        # asyncio.TimeoutError, which the executor logs as enrichment_job_failed.
+        # <= 0 means "no timeout" (restore the asyncpg default).
+        t = acquire_timeout if acquire_timeout is not None else settings.db_acquire_timeout
+        self._acquire_timeout: Optional[float] = t if t and t > 0 else None
+
+    def _acquire(self) -> Any:
+        """``pool.acquire()`` with a bounded wait so a saturated/cold pool fails
+        fast (asyncio.TimeoutError) instead of hanging forever (COG-112)."""
+        # NOTE: ``self._pool`` is guaranteed set by ``_ensure_pool`` before any
+        # caller reaches here. asyncpg's PoolAcquireContext takes ``timeout`` as
+        # its argument; None preserves the unbounded default.
+        return self._pool.acquire(timeout=self._acquire_timeout)
 
     async def _ensure_pool(self) -> Any:
         """Lazily create the asyncpg pool + table on first use."""
@@ -94,7 +113,9 @@ class PostgresJobStore:
             import asyncpg  # imported lazily so the dependency is optional
 
             pool = await asyncpg.create_pool(dsn=self._dsn)
-            async with pool.acquire() as conn:
+            # Bound the DDL acquire too, so a cold/saturated pool fails fast at
+            # first-use instead of hanging the very first job-store call.
+            async with pool.acquire(timeout=self._acquire_timeout) as conn:
                 await conn.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {self._TABLE} (
@@ -140,8 +161,8 @@ class PostgresJobStore:
         )
 
     async def create(self, job: EnrichJob) -> None:
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
+        await self._ensure_pool()
+        async with self._acquire() as conn:
             await conn.execute(
                 f"""
                 INSERT INTO {self._TABLE}
@@ -163,8 +184,8 @@ class PostgresJobStore:
             )
 
     async def get(self, job_id: str) -> Optional[EnrichJob]:
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
+        await self._ensure_pool()
+        async with self._acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT payload FROM {self._TABLE} WHERE id = $1", job_id
             )
@@ -184,8 +205,8 @@ class PostgresJobStore:
         await self.create(job)
 
     async def list_for_tenant(self, tenant_id: str) -> list[JobSummary]:
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
+        await self._ensure_pool()
+        async with self._acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT payload FROM {self._TABLE} WHERE tenant_id = $1 "
                 f"ORDER BY created_at DESC",
@@ -205,8 +226,8 @@ class PostgresJobStore:
         return out
 
     async def delete(self, job_id: str) -> None:
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
+        await self._ensure_pool()
+        async with self._acquire() as conn:
             await conn.execute(
                 f"DELETE FROM {self._TABLE} WHERE id = $1", job_id
             )

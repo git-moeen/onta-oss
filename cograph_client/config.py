@@ -21,6 +21,17 @@ class Settings(BaseSettings):
     # Supabase, ...) — and intentionally carries no cloud-provider identifiers.
     database_url: str = ""
 
+    # Seconds to wait for a connection from the PostgresJobStore pool before
+    # giving up (env OMNIX_DB_ACQUIRE_TIMEOUT). asyncpg's pool.acquire() blocks
+    # FOREVER by default (timeout=None), so a saturated/cold/unreachable pool
+    # turns every job-store read/write into a silent, unrecoverable hang — the
+    # COG-112 enrichment-executor hang (the first post-select `jobs.update`
+    # stalled here with no exception). Bounding the acquire converts that into a
+    # visible asyncio.TimeoutError that the executor's try/except logs as
+    # `enrichment_job_failed`, so the job ends (and can be retried) instead of
+    # hanging. 0 or negative restores the unbounded asyncpg default.
+    db_acquire_timeout: float = 30.0
+
     # Optional auth plugin: a dotted "module.path:callable" that will be
     # imported at app startup. The callable is invoked with no arguments
     # and is expected to register an external API key verifier via
