@@ -239,6 +239,26 @@ class FakeNeptune:
                     out.append({"s": s, "p": p, "o": o})
             return out
 
+        # Sweep target-type lookup (COG-118): SELECT ?range FROM <onto>
+        #   WHERE { <prop> rdfs:range ?range }. Bounded single-subject read of the
+        #   relationship property's declared range from the ontology graph.
+        if "SELECT ?range" in sparql and "?attr" not in sparql:
+            prop_m = re.search(
+                r"<([^>]+)> <{0}#range> \?range".format(
+                    re.escape("http://www.w3.org/2000/01/rdf-schema")
+                ),
+                sparql,
+            )
+            if not prop_m:
+                return []
+            prop = prop_m.group(1)
+            rng_pred = "http://www.w3.org/2000/01/rdf-schema#range"
+            return [
+                {"range": o}
+                for (s, p, o) in quads
+                if s == prop and p == rng_pred
+            ]
+
         # Inference._list_predicates: SELECT ?attr ?range ... ?attr a Property ; domain <t>
         if "SELECT ?attr ?range" in sparql:
             dom_m = re.search(r"<{0}#domain> <([^>]+)>".format(re.escape("http://www.w3.org/2000/01/rdf-schema")), sparql)
@@ -750,11 +770,17 @@ async def test_orphan_sweep_is_complete_keeps_referenced_and_atomic():
 @pytest.mark.asyncio
 async def test_orphan_sweep_rerunnable_clears_leftover_orphan():
     """A leftover composite node (rdf:type + label, NO inbound edge, nothing to
-    rewrite) is swept on a SUBSEQUENT apply — the sweep keys on graph state, so
-    a second run cleans up what a buggy first run left behind."""
+    rewrite) is swept on a SUBSEQUENT apply — the sweep resolves the target type
+    from the ONTOLOGY (the predicate's rdfs:range), so a second run with
+    edges_rewritten == 0 still cleans up what a buggy first run left behind,
+    independent of any full-graph scan (COG-118)."""
     neptune = FakeNeptune()
     kg = "https://cograph.tech/graphs/t1/kg/june-16"
     speaks = ONTO + "speaks"
+
+    # Ontology declares speaks -> Language so the sweep can resolve the target
+    # type WITHOUT any rewrite this pass (the re-run / leftover-orphan case).
+    _seed_mentor_ontology(neptune, rng=TYPES + "Language")
 
     leftover = ENTITY + "Language/English__Russian"
     atomic = ENTITY + "Language/English"
@@ -796,6 +822,117 @@ async def test_orphan_sweep_rerunnable_clears_leftover_orphan():
     # The real atomic node + its edge survive.
     assert (ENTITY + "Mentor/A", speaks, atomic) in quads
     assert (atomic, RDF_TYPE, TYPES + "Language") in quads
+
+
+@pytest.mark.asyncio
+async def test_rerun_sweep_resolves_target_type_from_ontology_range():
+    """COG-118: on a re-run where NOTHING is rewritten (edges_rewritten == 0),
+    the sweep resolves the relationship's target type from the ONTOLOGY range
+    (speaks -> Language) and deletes lingering orphan composites — WITHOUT the
+    old unbounded full-graph `SELECT DISTINCT ?t` scan, and WITHOUT silently
+    skipping the sweep."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    speaks = ONTO + "speaks"
+
+    # Spy on every query so we can prove the expensive full-graph type scan is
+    # gone and the bounded ontology-range lookup is what resolves the type.
+    seen_queries: list[str] = []
+    orig_query = neptune.query
+
+    async def spy_query(sparql: str):
+        seen_queries.append(sparql)
+        return await orig_query(sparql)
+
+    neptune.query = spy_query  # type: ignore[assignment]
+
+    # Ontology declares speaks -> Language. No KG edge exists for speaks at all,
+    # so the explode SELECT returns nothing and edges_rewritten == 0 — the pure
+    # re-run / leftover-orphan case.
+    _seed_mentor_ontology(neptune, rng=TYPES + "Language")
+
+    orphan_a = ENTITY + "Language/English__Russian"
+    orphan_b = ENTITY + "Language/German__Polish"
+    atomic = ENTITY + "Language/Spanish"  # no delimiter -> must survive
+    neptune._g(kg).update(
+        {
+            # Two lingering orphan composites: typed + labelled, no inbound edge,
+            # nothing to rewrite this pass.
+            (orphan_a, RDF_TYPE, TYPES + "Language"),
+            (orphan_a, RDFS_LABEL, "English, Russian"),
+            (orphan_b, RDF_TYPE, TYPES + "Language"),
+            (orphan_b, RDFS_LABEL, "German, Polish"),
+            # Atomic node (no delimiter) must NOT be touched.
+            (atomic, RDF_TYPE, TYPES + "Language"),
+            (atomic, RDFS_LABEL, "Spanish"),
+        }
+    )
+    rule = NormalizationRule(
+        id=make_rule_id(KG, "Mentor", "speaks"),
+        kg_name=KG,
+        type_name="Mentor",
+        predicate="speaks",
+        target_kind="relationship",
+        rule_type="list_explode",
+        params={"delimiters": [", ", "__"], "target": "entity"},
+        confidence=0.9,
+        status="confirmed",
+    )
+
+    summary = await apply_rule(neptune, TENANT, rule)
+    quads = neptune.graphs[kg]
+
+    # Nothing rewritten, but BOTH orphans swept (type resolved from ontology).
+    assert summary["edges_rewritten"] == 0
+    assert summary["orphans_dropped"] == 2
+    assert not [t for t in quads if t[0] == orphan_a]
+    assert not [t for t in quads if t[0] == orphan_b]
+
+    # Atomic node survives (it is not composite-named).
+    assert (atomic, RDF_TYPE, TYPES + "Language") in quads
+
+    # The target type came from the bounded ontology-range lookup, keyed on the
+    # fully-known property URI — NOT a full-graph scan.
+    range_lookups = [
+        q for q in seen_queries
+        if "SELECT ?range" in q and TYPES + "Mentor/attrs/speaks" in q
+    ]
+    assert range_lookups, "expected a bounded ontology rdfs:range lookup"
+    # The old unbounded full-graph type scan must NOT be emitted any more.
+    assert not [q for q in seen_queries if "SELECT DISTINCT ?t" in q]
+
+
+@pytest.mark.asyncio
+async def test_rerun_sweep_falls_back_to_touched_composites_without_range():
+    """If the ontology declares NO types/ range for the predicate (un-upgraded
+    attribute), the first-pass split still resolves the target type from the
+    composites it re-points this pass — the graceful fallback. No silent skip."""
+    neptune = FakeNeptune()
+    kg = _seed_speaks_composites(neptune)
+    # Deliberately seed an XSD (non-relationship) range so the ontology path
+    # yields no target type and the fallback (composites touched) kicks in.
+    _seed_mentor_ontology(neptune, rng="http://www.w3.org/2001/XMLSchema#string")
+
+    rule = NormalizationRule(
+        id=make_rule_id(KG, "Mentor", "speaks"),
+        kg_name=KG,
+        type_name="Mentor",
+        predicate="speaks",
+        target_kind="relationship",
+        rule_type="list_explode",
+        params={"delimiters": [", ", "__"], "target": "entity"},
+        confidence=0.9,
+        status="confirmed",
+    )
+
+    summary = await apply_rule(neptune, TENANT, rule)
+    quads = neptune.graphs[kg]
+
+    # The first-pass split + sweep still works via the touched-composites fallback.
+    assert summary["edges_rewritten"] == 2
+    assert summary["orphans_dropped"] == 2
+    assert not [t for t in quads if t[0] == ENTITY + "Language/English__Russian"]
+    assert not [t for t in quads if t[0] == ENTITY + "Language/English__Persian"]
 
 
 @pytest.mark.asyncio

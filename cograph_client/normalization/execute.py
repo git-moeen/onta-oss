@@ -15,6 +15,11 @@
   sweep is keyed on graph state (not the edges this pass touched), so it is
   complete (catches composites an inline per-edge drop would miss) and
   re-runnable (a later apply still sweeps leftovers from a buggy earlier run).
+  The sweep's target type is resolved from the ONTOLOGY — the predicate's
+  declared ``rdfs:range`` (``speaks → Language``), a bounded single-subject
+  lookup — so a pure re-run with ``edges_rewritten == 0`` still resolves the type
+  and sweeps lingering orphans to zero, with no unbounded full-graph scan
+  (COG-118).
 
 * **attribute, target=literal** (the skills/disciplines case): a literal packs
   several items with a delimiter. We split into atomic literals, write N triples,
@@ -42,18 +47,20 @@ import re
 import structlog
 
 from cograph_client.graph.client import NeptuneClient
-from cograph_client.graph.ontology_queries import RDF, RDFS, type_uri
+from cograph_client.graph.ontology_queries import RDF, RDFS, attr_uri, type_uri
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import (
     batched_insert_triples,
     delete_triples,
     kg_graph_uri,
+    tenant_graph_uri,
 )
 
 logger = structlog.stdlib.get_logger("cograph.normalization.execute")
 
 RDF_TYPE = f"{RDF}#type"
 RDFS_LABEL = f"{RDFS}#label"
+RDFS_RANGE = f"{RDFS}#range"
 ENTITY_URI_PREFIX = "https://cograph.tech/entities/"
 ATTRS_INFIX = "/attrs/"
 ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
@@ -112,15 +119,18 @@ async def apply_rule(neptune: NeptuneClient, tenant_id: str, rule) -> dict:
         )
 
     kg_graph = kg_graph_uri(tenant_id, rule.kg_name)
+    onto_graph = tenant_graph_uri(tenant_id)
 
-    summary = await _dispatch(neptune, kg_graph, rule)
+    summary = await _dispatch(neptune, kg_graph, onto_graph, rule)
 
     if _summary_mutated(summary):
         _schedule_stats_recompute(neptune, tenant_id, rule.kg_name)
     return summary
 
 
-async def _dispatch(neptune: NeptuneClient, kg_graph: str, rule) -> dict:
+async def _dispatch(
+    neptune: NeptuneClient, kg_graph: str, onto_graph: str, rule
+) -> dict:
     """Route to the rule-type handler and return its summary."""
     if rule.rule_type == "strip_emoji":
         return await _strip_emoji(neptune, kg_graph, rule)
@@ -139,7 +149,9 @@ async def _dispatch(neptune: NeptuneClient, kg_graph: str, rule) -> dict:
                 note="promotion of attribute literals to atomic entities is a follow-up",
             )
             return {"edges_rewritten": 0, "atomic_created": 0, "orphans_dropped": 0}
-        return await _explode_relationship(neptune, kg_graph, pred_leaf, delimiters)
+        return await _explode_relationship(
+            neptune, kg_graph, onto_graph, rule.type_name, pred_leaf, delimiters
+        )
     return await _explode_literal(neptune, kg_graph, pred_leaf, delimiters)
 
 
@@ -228,7 +240,12 @@ def _target_type_from_uri(composite_uri: str) -> str | None:
 
 
 async def _explode_relationship(
-    neptune: NeptuneClient, kg_graph: str, pred_leaf: str, delimiters: list[str]
+    neptune: NeptuneClient,
+    kg_graph: str,
+    onto_graph: str,
+    domain_type: str,
+    pred_leaf: str,
+    delimiters: list[str],
 ) -> dict:
     """Split composite relationship targets into canonical atomic entities."""
     onto_pred = ONTO_PRED_PREFIX + pred_leaf
@@ -315,8 +332,11 @@ async def _explode_relationship(
     #    complete (one DELETE/WHERE per type catches the ones a per-edge drop
     #    misses) and re-runnable (a second apply still sweeps leftover orphans
     #    from a buggy earlier run, even when nothing was rewritten this pass).
+    #    The target type comes from the ONTOLOGY (the predicate's rdfs:range), a
+    #    cheap single-subject lookup that works on a pure re-run regardless of
+    #    whether any edge was rewritten this pass (COG-118).
     target_types = await _composite_target_types(
-        neptune, kg_graph, onto_pred, attr_pred_suffix, composites_touched, delimiters
+        neptune, onto_graph, domain_type, pred_leaf, composites_touched
     )
     orphans_dropped = await _sweep_orphan_composites(
         neptune, kg_graph, onto_pred, attr_pred_suffix, target_types, delimiters
@@ -333,55 +353,84 @@ async def _explode_relationship(
 
 async def _composite_target_types(
     neptune: NeptuneClient,
-    kg_graph: str,
-    onto_pred: str,
-    attr_pred_suffix: str,
+    onto_graph: str,
+    domain_type: str,
+    pred_leaf: str,
     composites: set[str],
-    delimiters: list[str],
 ) -> set[str]:
     """The relationship's target type(s), for scoping the final orphan sweep.
 
-    Derived first from the composites we re-pointed this pass (their IRI carries
-    ``…/entities/<TargetType>/…``). On a re-run where nothing was rewritten
-    (``composites`` empty — the leftover-orphan case) we instead query the graph
-    for entity types whose members are composite-named and have NO inbound edge
-    for this predicate, so the sweep still finds a type to scope to. Keeping it
-    scoped to real target types means we never touch unrelated types.
+    PRIMARY path (COG-118): resolve the type from the ONTOLOGY — the predicate's
+    declared ``rdfs:range``. The relationship property is
+    ``<types/<domain_type>/attrs/<pred_leaf>>`` and its range is the target type's
+    ``types/<TargetType>`` URI (the same range the Explorer summary / type-edges
+    read). This is a bounded single-subject lookup in the tenant ontology graph —
+    cheap, reliable, and INDEPENDENT of whether any edge was rewritten this pass,
+    so a pure re-run (``edges_rewritten == 0``) still resolves the type and sweeps
+    lingering orphans to zero. It replaces the old unbounded full-graph
+    ``SELECT DISTINCT ?t`` scan that timed out on live data and silently skipped
+    the sweep (logged ``composite_target_type_query_failed``).
+
+    FALLBACK: if the ontology declares no ``types/`` range for the predicate
+    (un-upgraded attribute, or range missing), derive the type(s) from the
+    composites we re-pointed this pass — their IRI carries ``…/entities/
+    <TargetType>/…``. This keeps the first-pass split path working even before the
+    range is upgraded. Scoping to a real target type means the sweep never touches
+    unrelated types.
     """
+    onto_types = await _range_target_types(neptune, onto_graph, domain_type, pred_leaf)
+    if onto_types:
+        return onto_types
+
+    # No usable ontology range — derive from this pass's re-pointed composites.
     types: set[str] = set()
     for composite in composites:
         t = _target_type_from_uri(composite)
         if t:
             types.add(t)
-    if types:
-        return types
+    if not types:
+        # Nothing rewritten this pass AND no ontology range: we cannot scope a
+        # sweep. Surface it (not a silent skip) so a missing range is visible.
+        logger.warning(
+            "sweep_target_type_unresolved",
+            domain_type=domain_type,
+            predicate=pred_leaf,
+            note="no ontology rdfs:range and no composites re-pointed this pass",
+        )
+    return types
 
-    # No fresh rewrites this pass: ask the graph which composite-named, orphaned
-    # entities exist and what type they are. This is what makes the sweep
-    # re-runnable after a buggy first run left composites behind.
-    delim_filter = " || ".join(
-        f'CONTAINS(?cname, "{_sparql_str(d)}")' for d in delimiters
-    )
+
+async def _range_target_types(
+    neptune: NeptuneClient, onto_graph: str, domain_type: str, pred_leaf: str
+) -> set[str]:
+    """Read the predicate's ``rdfs:range`` from the ontology → its target type(s).
+
+    Bounded single-subject query: the relationship property's URI is fully known
+    (``attr_uri(domain_type, pred_leaf)``), so this never scans the KG data graph.
+    Returns the set of target type NAMES whose range URI is a ``types/`` URI
+    (a relationship range); XSD/primitive ranges are ignored (not entity targets).
+    A query error is logged and treated as "no range" so the caller falls back
+    rather than crashing.
+    """
+    prop_uri = attr_uri(domain_type, pred_leaf)
     q = (
-        f"SELECT DISTINCT ?t FROM <{kg_graph}> WHERE {{\n"
-        f"  ?c <{RDF_TYPE}> ?t .\n"
-        f'  FILTER(STRSTARTS(STR(?c), "{ENTITY_URI_PREFIX}"))\n'
-        f'  FILTER(STRSTARTS(STR(?t), "{type_uri("")}"))\n'
-        f"  OPTIONAL {{ ?c <{RDFS_LABEL}> ?clabel }}\n"
-        f'  BIND(COALESCE(?clabel, REPLACE(STR(?c), "^.*/", "")) AS ?cname)\n'
-        f"  FILTER({delim_filter})\n"
-        f"  FILTER NOT EXISTS {{ ?s <{onto_pred}> ?c }}\n"
-        f"  FILTER NOT EXISTS {{ ?s2 ?p2 ?c . "
-        f"FILTER(STRENDS(STR(?p2), \"{_sparql_str(attr_pred_suffix)}\")) }}\n"
+        f"SELECT ?range FROM <{onto_graph}> WHERE {{\n"
+        f"  <{prop_uri}> <{RDFS_RANGE}> ?range .\n"
         f"}}"
     )
     try:
         _, rows = parse_sparql_results(await neptune.query(q))
     except Exception:
-        logger.warning("composite_target_type_query_failed", exc_info=True)
+        logger.warning(
+            "sweep_range_lookup_failed",
+            domain_type=domain_type,
+            predicate=pred_leaf,
+            exc_info=True,
+        )
         return set()
+    types: set[str] = set()
     for r in rows:
-        t = _target_type_from_type_uri(r.get("t", ""))
+        t = _target_type_from_type_uri(r.get("range", ""))
         if t:
             types.add(t)
     return types
