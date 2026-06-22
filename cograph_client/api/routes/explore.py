@@ -1082,12 +1082,23 @@ async def get_type_records(
     )
 
     _, attr_def_rows = parse_sparql_results(attr_def_raw)
-    # predicate URI → display name  (cap at 12 attributes for column stability)
-    _MAX_COLS = 12
+    # Column budget.  Ontology-DECLARED attributes are always shown (they are the
+    # type's schema — including enriched attrs like ``company`` that may sit on
+    # only a handful of entities), so they are exempt from this cap.  The cap
+    # only bounds the *extra* non-declared predicates discovered on the page, so
+    # one rogue entity with dozens of ad-hoc predicates can't blow up the table.
+    # Raised from 12 → 24 so a wide-but-legitimate declared schema isn't crowded
+    # out and there's still headroom for a few observed-but-undeclared columns.
+    _MAX_COLS = 24
     # Map ONTO pred URI → label.  We also need the instance predicate URI which
-    # is `…/onto/<predLeaf>`.  Build both directions.
+    # is `…/onto/<predLeaf>`.  Build both directions.  ``declared_display`` is the
+    # ordered list of declared-attribute display labels that ALWAYS become
+    # columns (deduped, alphabetical for a stable order — coverage isn't carried
+    # by the attr-def query, so we don't pay an extra round-trip to rank by it).
     attr_label_by_onto: dict[str, str] = {}  # onto attr URI → label
     attr_label_by_pred: dict[str, str] = {}  # onto pred URI → label (instance triples)
+    declared_display: list[str] = []
+    declared_display_set: set[str] = set()
     for r in attr_def_rows:
         a_uri = r.get("attr", "")
         label = r.get("attrLabel") or a_uri.rstrip("/").split("/")[-1]
@@ -1099,6 +1110,12 @@ async def get_type_records(
         pred_leaf = a_uri.rstrip("/").split("/")[-1]
         inst_pred = ONTO_PRED_PREFIX + pred_leaf
         attr_label_by_pred[inst_pred] = label
+        # ``name`` is rendered from rdfs:label as the first column; never let a
+        # declared attribute literally named "name" duplicate it.
+        if label != "name" and label not in declared_display_set:
+            declared_display_set.add(label)
+            declared_display.append(label)
+    declared_display.sort()
 
     _, entity_rows = parse_sparql_results(entity_raw)
     entity_uris = [r.get("e", "") for r in entity_rows if r.get("e")]
@@ -1153,9 +1170,12 @@ async def get_type_records(
     # Collect per-entity: label + attribute values keyed by display name
     LABEL_PRED = f"{RDFS}#label"
     entity_data: dict[str, dict] = {u: {"_label": None, "_attrs": {}} for u in entity_uris}
-    # Track which display-name columns appear across the page (for stable ordering)
-    seen_col_display: list[str] = []
-    seen_col_set: set[str] = set()
+    # Column order: declared attributes ALWAYS first (schema columns, not subject
+    # to the frequency cap), then any extra non-declared predicates observed on
+    # the page — bounded by _MAX_COLS so a stray entity can't inflate the table.
+    col_display: list[str] = list(declared_display)
+    col_set: set[str] = set(declared_display)
+    extra_count = 0
 
     for r in values_rows:
         e_uri = r.get("e", "")
@@ -1175,18 +1195,23 @@ async def get_type_records(
             or attr_label_by_onto.get(p_uri)
             or p_uri.rstrip("/").split("/")[-1]
         )
-        if display not in seen_col_set and len(seen_col_set) < _MAX_COLS:
-            seen_col_set.add(display)
-            seen_col_display.append(display)
-        entity_data[e_uri]["_attrs"][display] = o_val
+        # "name" is rendered from rdfs:label; an instance predicate named "name"
+        # must not collide with that first column.
+        if display != "name" and display not in col_set and extra_count < _MAX_COLS:
+            col_set.add(display)
+            col_display.append(display)
+            extra_count += 1
+        if display != "name":
+            entity_data[e_uri]["_attrs"][display] = o_val
 
-    columns = ["name"] + seen_col_display
+    columns = ["name"] + col_display
     rows = []
     for u in entity_uris:
         d = entity_data[u]
         label = d["_label"] or u.rstrip("/").split("/")[-1]
         row: dict = {"id": u, "name": label}
-        for col in seen_col_display:
+        for col in col_display:
+            # Declared columns with no value on this entity render blank.
             row[col] = d["_attrs"].get(col, "")
         rows.append(row)
 

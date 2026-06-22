@@ -365,3 +365,105 @@ def test_records_total_fallback_count(client, mock_neptune, auth_headers):
     assert resp.status_code == 200
     data = resp.json()
     assert data["total"] == 42
+
+
+# ---------------------------------------------------------------------------
+# 6. Ontology-DECLARED attributes are always columns, even when rare
+#    (COG-112/COG-100: enriched attrs like `company` present on 1-of-N entities)
+# ---------------------------------------------------------------------------
+
+def test_records_declared_rare_attribute_is_column(client, mock_neptune, auth_headers):
+    """A declared-but-rare attribute is a column and its value shows on the one
+    entity that has it; entities without it render blank for that column."""
+
+    COMPANY_ATTR = ONTO + "types/Movie/attrs/company"   # declared in ontology
+    COMPANY_PRED = ONTO + "company"                       # instance predicate
+
+    def route(sparql, *a, **k):
+        # Ontology declares title (common) AND company (enriched, rare)
+        if "attrLabel" in sparql:
+            return _rows(
+                {"attr": ONTO + "types/Movie/attrs/title", "attrLabel": "title", "range": ""},
+                {"attr": COMPANY_ATTR, "attrLabel": "company", "range": ""},
+            )
+        if "DISTINCT ?e" in sparql and "ORDER BY ?e" in sparql:
+            return _rows({"e": E1}, {"e": E2}, {"e": E3})
+        if "entityCount" in sparql:
+            return _rows({"ec": "3"})
+        if "VALUES ?e" in sparql:
+            # title on all three; company ONLY on E2 (the rare case)
+            return _rows(
+                {"e": E1, "p": LABEL_PRED, "o": "Film One"},
+                {"e": E1, "p": TITLE_PRED, "o": "Film One"},
+                {"e": E2, "p": LABEL_PRED, "o": "Film Two"},
+                {"e": E2, "p": TITLE_PRED, "o": "Film Two"},
+                {"e": E2, "p": COMPANY_PRED, "o": "Acme Studios"},
+                {"e": E3, "p": LABEL_PRED, "o": "Film Three"},
+                {"e": E3, "p": TITLE_PRED, "o": "Film Three"},
+            )
+        return _empty()
+
+    mock_neptune.query.side_effect = route
+
+    resp = client.get(
+        f"/graphs/{TENANT}/explore/kgs/{KG}/types/{TYPE}/records",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Declared rare attribute MUST be a column even though only 1/3 entities have it
+    assert "company" in data["columns"], data["columns"]
+    assert data["columns"][0] == "name"
+
+    by_name = {r["name"]: r for r in data["rows"]}
+    # The entity that has it shows the value
+    assert by_name["Film Two"]["company"] == "Acme Studios"
+    # Entities without it render blank (key present, empty string) — not missing
+    assert by_name["Film One"]["company"] == ""
+    assert by_name["Film Three"]["company"] == ""
+    # Every row carries every column key
+    for r in data["rows"]:
+        for col in data["columns"]:
+            assert col in r
+
+
+def test_records_declared_attribute_exempt_from_cap(client, mock_neptune, auth_headers):
+    """Declared attributes beyond the old 12-cap are still all shown; only
+    non-declared observed predicates are bounded by the cap."""
+
+    # 20 declared attributes (> the old _MAX_COLS of 12)
+    declared = [f"attr{i:02d}" for i in range(20)]
+
+    def route(sparql, *a, **k):
+        if "attrLabel" in sparql:
+            return _rows(*[
+                {"attr": ONTO + f"types/Movie/attrs/{n}", "attrLabel": n, "range": ""}
+                for n in declared
+            ])
+        if "DISTINCT ?e" in sparql and "ORDER BY ?e" in sparql:
+            return _rows({"e": E1})
+        if "entityCount" in sparql:
+            return _rows({"ec": "1"})
+        if "VALUES ?e" in sparql:
+            # E1 has a value for only one declared attr; the rest must still be cols
+            return _rows(
+                {"e": E1, "p": LABEL_PRED, "o": "Solo"},
+                {"e": E1, "p": ONTO + "attr05", "o": "v5"},
+            )
+        return _empty()
+
+    mock_neptune.query.side_effect = route
+
+    resp = client.get(
+        f"/graphs/{TENANT}/explore/kgs/{KG}/types/{TYPE}/records",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    cols = data["columns"]
+    # All 20 declared attributes present (not truncated at 12)
+    for n in declared:
+        assert n in cols, f"declared {n} missing from columns {cols}"
+    assert data["rows"][0]["attr05"] == "v5"
+    assert data["rows"][0]["attr00"] == ""
