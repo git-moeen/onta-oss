@@ -234,11 +234,44 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
 
     v_lower = _esc_lit(scope.value.lower())
     pred_path = _pred_path(safe_iris)
+
+    # COG-112 literal-attribute fix. The REAL data (resolver/schema_resolver.py)
+    # stores a literal attribute's value under the `…/types/<Type>/attrs/<attr>`
+    # (attr_uri) namespace, while `rdfs:label` carries the opaque ENTITY-ID slug
+    # (set at ingest) — NOT the human name. So PR #37's rdfs:label arm could never
+    # match a literal scope like name="Jane Doe" (label = the slug), and the
+    # value lives only on the attrs/<attr> literal.
+    #
+    # The pre-existing predicate-bound arm DOES list the attr IRI inside the
+    # property-path ALTERNATION `(<…/attrs/name>|<…/onto/name>)`. In a standards
+    # engine that matches; on Neptune, mixing the literal-attribute namespace
+    # with the (zero-triple) relationship `…/onto/<attr>` alternative inside a
+    # path that then feeds `FILTER(isLiteral(?sv))` is exactly the shape that
+    # silently bound nothing in production. So we add a DEDICATED, single-bound-
+    # predicate literal arm per attr_uri IRI (POS-indexed, no alternation, no
+    # downstream isLiteral on a path-bound object) so the literal-attribute value
+    # match is unambiguous and reliable. The original alternation arms and PR
+    # #37's rdfs:label arm are kept (belt-and-suspenders); relationship behavior
+    # is byte-for-byte unchanged. The caller's SELECT DISTINCT ?e collapses an
+    # entity matched by more than one arm to a single row.
+    attr_value_arms = "".join(
+        # Dedicated literal arm: ?e <…/attrs/<attr>> ?av (single bound predicate,
+        # POS-indexed) → match its literal value case-insensitively. The IRI is a
+        # concrete, _safe_iri-checked, ontology-derived term; the value stays
+        # _esc_lit-escaped + lower-cased → injection-safe.
+        f" UNION {{\n"
+        f"    ?e <{iri}> ?av .\n"
+        f"    FILTER(isLiteral(?av) && LCASE(STR(?av)) = \"{v_lower}\")\n"
+        f"  }}"
+        for iri in safe_iris
+        if "/attrs/" in iri  # only the literal-attribute namespace, not …/onto/
+    )
+
     return (
         # Top-level UNION: predicate-bound arms (attribute literal / relationship)
-        # on one side, a direct rdfs:label match on the other. The label branch is
-        # INDEPENDENT of the predicate triple so it still matches an entity whose
-        # displayed name lives ONLY on rdfs:label (no attrs/<attr> literal).
+        # on one side, a direct rdfs:label match + dedicated attrs/<attr> literal
+        # arm(s) on the other. The latter branches are INDEPENDENT of the
+        # property-path triple so they match even when the alternation arm doesn't.
         f"  {{\n"
         # Match the predicate by a BOUND property path (POS-indexed, no scan).
         # Inlined directly into the WHERE — the planner drives from this selective
@@ -261,14 +294,16 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
         f"      FILTER(isIRI(?sv) && LCASE(REPLACE(STR(?sv), \"^.*[/#]\", \"\")) = \"{v_lower}\")\n"
         f"    }}\n"
         f"  }} UNION {{\n"
-        # Displayed-name arm: the entity's rdfs:label IS the value the user sees in
-        # the Explorer. Match it directly (bound predicate, POS-indexed) so a scope
-        # on a name/title attribute matches even when the entity carries that name
-        # ONLY as rdfs:label and not as an attrs/<attr> literal. ?lbl is a fresh
-        # var; the value stays _esc_lit-escaped → injection-safe.
+        # Displayed-name arm: PR #37's rdfs:label match. Kept as belt-and-
+        # suspenders — for the real ADP-style data rdfs:label is the entity-id
+        # slug, so this rarely matches a name VALUE, but it is harmless and covers
+        # any KG that did set rdfs:label to the human name. ?lbl is a fresh var;
+        # the value stays _esc_lit-escaped → injection-safe.
         f"    ?e <{RDFS_LABEL}> ?lbl .\n"
         f"    FILTER(isLiteral(?lbl) && LCASE(STR(?lbl)) = \"{v_lower}\")\n"
         f"  }}"
+        # Dedicated attrs/<attr> literal arm(s) — the actual COG-112 fix.
+        f"{attr_value_arms}"
     )
 
 

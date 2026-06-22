@@ -1496,6 +1496,105 @@ def test_executor_scope_literal_name_value_matches_via_rdfs_label():
     asyncio.run(run())
 
 
+def test_executor_scope_literal_attribute_value_emits_dedicated_attrs_arm():
+    """COG-112 literal-attribute fix: a scope on the `name` attribute by its VALUE
+    must emit a DEDICATED single-bound-predicate `attrs/<attr>` literal arm (the
+    namespace the resolver actually writes literal attribute values under —
+    `…/types/<Type>/attrs/<attr>`), so the match doesn't depend on the property-
+    path alternation that mixes the literal namespace with the zero-triple
+    `…/onto/<attr>` (the shape that silently bound nothing on Neptune)."""
+    async def run():
+        scoped_rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Jane Doe", "vals": ""},
+        ]
+        neptune, captured = _capturing_neptune(scoped_rows)
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {("Jane Doe", "bio"): [Verdict(value="bio", confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            scope=EnrichScope(predicate="name", value="Jane Doe"),
+        )
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        sel = captured["select"]
+        # Dedicated attrs/<attr> literal arm: a single BOUND predicate (no
+        # alternation), the value lower-cased + escaped (case-insensitive).
+        assert (
+            "?e <https://cograph.tech/types/Mentor/attrs/name> ?av .\n"
+            in sel
+        )
+        assert 'isLiteral(?av) && LCASE(STR(?av)) = "jane doe"' in sel
+        # PR #37's rdfs:label arm is kept (belt-and-suspenders).
+        assert "?e <http://www.w3.org/2000/01/rdf-schema#label> ?lbl ." in sel
+        # The original alternation arm is preserved too.
+        assert (
+            "?e (<https://cograph.tech/types/Mentor/attrs/name>|"
+            "<https://cograph.tech/onto/name>) ?sv ." in sel
+        )
+        assert "FILTER(false)" not in sel
+        assert "FILTER EXISTS" not in sel
+
+        final = await store.get(job.id)
+        assert final is not None
+        assert final.progress.total == 1
+        assert final.progress.processed == 1
+
+    asyncio.run(run())
+
+
+def test_scope_block_literal_attribute_matches_attrs_name_value():
+    """COG-112 literal-attribute fix, executed against a real SPARQL engine: a
+    literal scope `name="Jane Doe"` selects the entity whose `attrs/name` literal
+    is "Jane Doe" (case-insensitively), even though its `rdfs:label` is the opaque
+    entity-id slug (how resolver/schema_resolver.py actually stores the data).
+
+    Skipped when rdflib (not a project dependency) is unavailable; when present it
+    proves the generated SELECT really matches, not just that the SPARQL is shaped
+    right."""
+    rdflib = pytest.importorskip("rdflib")
+    from rdflib import Graph, Literal, RDF, URIRef
+    from rdflib.namespace import XSD
+
+    T = "https://cograph.tech/types/Mentor"
+    g = Graph()
+    # Entity whose name lives ONLY on attrs/name; rdfs:label is the id slug.
+    e1 = URIRef("https://cograph.tech/entities/Mentor/4akvVWgTcS")
+    g.add((e1, RDF.type, URIRef(T)))
+    g.add((e1, URIRef("http://www.w3.org/2000/01/rdf-schema#label"), Literal("4akvVWgTcS")))
+    g.add((e1, URIRef(f"{T}/attrs/name"), Literal("Jane Doe", datatype=XSD.string)))
+    # A different mentor — must NOT match.
+    e2 = URIRef("https://cograph.tech/entities/Mentor/xY9")
+    g.add((e2, RDF.type, URIRef(T)))
+    g.add((e2, URIRef(f"{T}/attrs/name"), Literal("John Smith")))
+
+    pred_iris = [f"{T}/attrs/name", "https://cograph.tech/onto/name"]
+
+    def _matches(value: str) -> list[str]:
+        q = _build_select_query(
+            "urn:g", "Mentor", ["bio"], 50,
+            scope=EnrichScope(predicate="name", value=value),
+            scope_pred_iris=pred_iris,
+        ).replace("FROM <urn:g> ", "")  # rdflib: query the default graph
+        return sorted(str(r[0]).rsplit("/", 1)[-1] for r in g.query(q))
+
+    # Exact + case-insensitive match selects ONLY the Jane Doe entity by its
+    # attrs/name literal — not the slug, not the other mentor.
+    assert _matches("Jane Doe") == ["4akvVWgTcS"]
+    assert _matches("jane doe") == ["4akvVWgTcS"]
+    assert _matches("JANE DOE") == ["4akvVWgTcS"]
+    assert _matches("John Smith") == ["xY9"]
+    # A value matching nothing selects nothing (and injection-y input is escaped,
+    # not executed — the query still parses and returns empty).
+    assert _matches('no\"such') == []
+
+
 def test_executor_entity_uris_subset_only_those_enriched():
     """entity_uris restricts the run to exactly those URIs via a VALUES block."""
     async def run():
