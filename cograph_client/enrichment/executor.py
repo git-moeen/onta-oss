@@ -59,7 +59,10 @@ RDFS_DOMAIN = "http://www.w3.org/2000/01/rdf-schema#domain"
 # nlp/pipeline.py + resolver/schema_resolver.py); literal-attribute instance
 # triples use the `…/types/<Type>/attrs/<name>` (attr_uri) namespace. A scope
 # predicate's ontology declaration doesn't tell us which the data uses, so a
-# resolved local-name maps to BOTH candidate instance IRIs.
+# resolved local-name maps to BOTH candidate instance IRIs. NOTE: the name the
+# Explorer DISPLAYS comes from the entity's `rdfs:label` (set at ingest), which
+# may differ from — or exist WITHOUT — an `…/attrs/name` literal, so a scope on a
+# name/title VALUE must also match `rdfs:label` (see `_scope_block`).
 ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
 NAME_FALLBACK_ATTRS = ["name", "title", "headline"]
 WORKER_POOL_SIZE = 8
@@ -154,7 +157,10 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
     """INLINE SPARQL graph patterns restricting ``?e`` (already typed) to a
     value-scope — emitted directly into the WHERE next to ``?e a <Type>`` so the
     planner can drive from the selective bound-predicate triple, NOT wrapped in a
-    ``FILTER EXISTS``.
+    ``FILTER EXISTS``. The patterns are a top-level UNION of (a) the predicate-bound
+    arms (attribute literal / relationship target) and (b) a direct ``rdfs:label``
+    match, so a name/title scope matches the value the user SEES even when it is
+    carried only as ``rdfs:label`` and not as an ``…/attrs/<attr>`` literal.
 
     ``scope.predicate`` is an attribute OR relationship **local-name** (e.g.
     ``hasLevel``, ``property_type``). It has already been resolved (case-
@@ -203,6 +209,19 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
         ``?slp`` is a variable (not interpolated) and the value stays
         ``_esc_lit``-escaped, so this is injection-safe; ``?sv`` is bounded so the
         open ``?slp`` carries no perf cost.
+      - **literal attribute carried only as rdfs:label** — the entity's displayed
+        name comes from ``rdfs:label`` (set at ingest), while attribute values
+        live under ``…/attrs/<attr>``. A name/title scope on the value the user
+        SEES (the label) must therefore also match the entity's ``rdfs:label``,
+        because the entity may carry its name ONLY as ``rdfs:label`` and NOT as an
+        ``attrs/name`` literal — in which case the predicate triple above binds
+        nothing and the literal arm matches ZERO (COG-112 literal-attribute bug).
+        This is an INDEPENDENT branch (it must not require ``?e {pred_path} ?sv``
+        to bind first), so the whole block is a top-level UNION: the
+        predicate-bound arms on one side, the direct ``rdfs:label`` match on the
+        other. ``rdfs:label`` is a single bound predicate (POS-indexed), so the
+        extra branch stays cheap; the caller's ``SELECT DISTINCT ?e`` collapses an
+        entity matched by more than one branch to a single row.
 
     If ``pred_iris`` is empty (predicate not declared on the type) the block
     emits ``FILTER(false)`` so the scope matches NOTHING fast — never the old
@@ -216,25 +235,39 @@ def _scope_block(type_name: str, scope: EnrichScope, pred_iris: list[str]) -> st
     v_lower = _esc_lit(scope.value.lower())
     pred_path = _pred_path(safe_iris)
     return (
+        # Top-level UNION: predicate-bound arms (attribute literal / relationship)
+        # on one side, a direct rdfs:label match on the other. The label branch is
+        # INDEPENDENT of the predicate triple so it still matches an entity whose
+        # displayed name lives ONLY on rdfs:label (no attrs/<attr> literal).
+        f"  {{\n"
         # Match the predicate by a BOUND property path (POS-indexed, no scan).
         # Inlined directly into the WHERE — the planner drives from this selective
         # triple instead of evaluating an EXISTS once per type instance.
-        f"  ?e {pred_path} ?sv .\n"
-        f"  {{\n"
+        f"    ?e {pred_path} ?sv .\n"
+        f"    {{\n"
         # Literal-attribute arm.
-        f"    FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
-        f"  }} UNION {{\n"
+        f"      FILTER(isLiteral(?sv) && LCASE(STR(?sv)) = \"{v_lower}\")\n"
+        f"    }} UNION {{\n"
         # Relationship arm: ?sv is the target node, already bounded to the handful
         # of related nodes by the predicate triple above. Match ANY literal value
         # on it case-insensitively (its display name lives on the TARGET type's
         # namespace, e.g. …/types/Level/attrs/name — NOT the scope source type's,
         # so we must not pin the predicate to <sourceType>/attrs/* here). ?slp is a
         # variable (no interpolation); the value stays escaped → injection-safe.
-        f"    ?sv ?slp ?stl .\n"
-        f"    FILTER(isLiteral(?stl) && LCASE(STR(?stl)) = \"{v_lower}\")\n"
-        f"  }} UNION {{\n"
+        f"      ?sv ?slp ?stl .\n"
+        f"      FILTER(isLiteral(?stl) && LCASE(STR(?stl)) = \"{v_lower}\")\n"
+        f"    }} UNION {{\n"
         # … or the target IRI's local-name as a fallback.
-        f"    FILTER(isIRI(?sv) && LCASE(REPLACE(STR(?sv), \"^.*[/#]\", \"\")) = \"{v_lower}\")\n"
+        f"      FILTER(isIRI(?sv) && LCASE(REPLACE(STR(?sv), \"^.*[/#]\", \"\")) = \"{v_lower}\")\n"
+        f"    }}\n"
+        f"  }} UNION {{\n"
+        # Displayed-name arm: the entity's rdfs:label IS the value the user sees in
+        # the Explorer. Match it directly (bound predicate, POS-indexed) so a scope
+        # on a name/title attribute matches even when the entity carries that name
+        # ONLY as rdfs:label and not as an attrs/<attr> literal. ?lbl is a fresh
+        # var; the value stays _esc_lit-escaped → injection-safe.
+        f"    ?e <{RDFS_LABEL}> ?lbl .\n"
+        f"    FILTER(isLiteral(?lbl) && LCASE(STR(?lbl)) = \"{v_lower}\")\n"
         f"  }}"
     )
 

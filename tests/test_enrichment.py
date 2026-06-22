@@ -568,6 +568,33 @@ def test_build_select_query_scope_single_iri_no_alternation():
     assert "?e ?p ?sv" not in q
 
 
+def test_build_select_query_literal_attribute_scope_matches_rdfs_label():
+    """COG-112: a literal-attribute (name) scope's SELECT must ALSO carry an
+    ``rdfs:label`` arm so an entity whose displayed name lives only on
+    ``rdfs:label`` (not as an ``attrs/name`` literal) is still selected — without
+    regressing the bound-predicate attrs/<attr> literal arm."""
+    scope = EnrichScope(predicate="name", value="Jane Doe")
+    pred_iris = [
+        "https://cograph.tech/types/Mentor/attrs/name",
+        "https://cograph.tech/onto/name",
+    ]
+    q = _build_select_query(
+        "https://g/x", "Mentor", ["bio"], None, scope=scope, scope_pred_iris=pred_iris
+    )
+    # attrs/<attr> literal arm (bound predicate, case-insensitive).
+    assert (
+        "?e (<https://cograph.tech/types/Mentor/attrs/name>|"
+        "<https://cograph.tech/onto/name>) ?sv ." in q
+    )
+    assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "jane doe"' in q
+    # Displayed-name arm: the entity's rdfs:label matched directly.
+    assert "?e <http://www.w3.org/2000/01/rdf-schema#label> ?lbl ." in q
+    assert 'isLiteral(?lbl) && LCASE(STR(?lbl)) = "jane doe"' in q
+    # No unbounded scan or EXISTS machinery snuck in.
+    assert "FILTER EXISTS" not in q
+    assert "?e ?p ?sv" not in q
+
+
 def test_build_select_query_entity_uris_uses_values_block():
     """entity_uris → a VALUES ?e block; still constrained to the type."""
     uris = [
@@ -609,8 +636,14 @@ def test_scope_block_is_pure_helper():
     )
     # No EXISTS wrapper — the patterns are inlined directly into the WHERE.
     assert "FILTER EXISTS" not in block
-    # The very first pattern is the selective bound-predicate triple.
-    assert block.lstrip().startswith("?e <https://cograph.tech/onto/haslevel> ?sv .")
+    # The patterns are a top-level UNION (predicate-bound arms | rdfs:label arm).
+    assert block.lstrip().startswith("{")
+    # The FIRST triple is the selective bound-predicate triple (the predicate-bound
+    # branch leads, so the planner still drives from it — POS-indexed).
+    first_branch = block.split("} UNION {")[0]
+    assert first_branch.lstrip(" {\n").startswith(
+        "?e <https://cograph.tech/onto/haslevel> ?sv ."
+    )
     # Predicate matched by a BOUND property path (single IRI → bare term) — no
     # variable predicate, no scan.
     assert "?e <https://cograph.tech/onto/haslevel> ?sv ." in block
@@ -642,6 +675,34 @@ def test_scope_block_empty_pred_iris_matches_nothing():
     """No concrete IRIs → FILTER(false) (fast matched-0), not an unbounded scan."""
     block = _scope_block("Mentor", EnrichScope(predicate="haslevel", value="x"), [])
     assert block.strip() == "FILTER(false)"
+
+
+def test_scope_block_literal_attribute_also_matches_rdfs_label():
+    """COG-112 literal-attribute bug: the value the user SEES in the Explorer is the
+    entity's ``rdfs:label`` (set at ingest), which may exist WITHOUT a matching
+    ``…/attrs/<attr>`` literal. A name/title scope must therefore ALSO match
+    ``rdfs:label`` directly — as an INDEPENDENT branch (not gated on the predicate
+    triple binding) — so the entity is selected even when it carries that name only
+    as ``rdfs:label``. Previously the literal arm matched the ``attrs/name`` triple
+    only, so such an entity matched 0."""
+    block = _scope_block(
+        "Mentor",
+        EnrichScope(predicate="name", value="Irina Igoshkina"),
+        [
+            "https://cograph.tech/types/Mentor/attrs/name",
+            "https://cograph.tech/onto/name",
+        ],
+    )
+    # The attrs/<attr> literal arm is preserved (case-insensitive, lower-cased).
+    assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "irina igoshkina"' in block
+    # The displayed-name arm matches the entity's rdfs:label directly — a SEPARATE
+    # `?e <rdfs:label> ?lbl` triple, NOT a property on the predicate's object ?sv
+    # (so it binds even when `?e <attrs/name> ?sv` matches nothing).
+    assert "?e <http://www.w3.org/2000/01/rdf-schema#label> ?lbl ." in block
+    assert 'isLiteral(?lbl) && LCASE(STR(?lbl)) = "irina igoshkina"' in block
+    # The label arm is reached via a top-level UNION (its own branch), so it does
+    # not require the bound-predicate triple to have produced a binding.
+    assert "} UNION {" in block
 
 
 def test_scope_subselect_dedups_and_caps():
@@ -1375,6 +1436,62 @@ def test_executor_scope_literal_attribute_constraint_in_sparql():
         final = await store.get(job.id)
         assert final.progress.total == 1
         assert final.progress.processed == 1
+
+    asyncio.run(run())
+
+
+def test_executor_scope_literal_name_value_matches_via_rdfs_label():
+    """COG-112 literal-attribute bug end-to-end: a scope on the `name` attribute by
+    the value the user SEES (the entity's displayed name, i.e. its `rdfs:label`)
+    must reach the SELECT with an `rdfs:label` arm so the entity is selected even
+    when it carries that name ONLY as `rdfs:label` and NOT as an `attrs/name`
+    literal. Mocked Neptune returns the matching mentor (as a real Neptune would
+    given the rdfs:label arm); the assertion is on the generated SPARQL + that the
+    entity was processed (not matched-0)."""
+    async def run():
+        scoped_rows = [
+            {
+                "uri": "https://cograph.tech/entities/Mentor/m1",
+                "label": "Irina Igoshkina",
+                "vals": "",
+            },
+        ]
+        neptune, captured = _capturing_neptune(scoped_rows)
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Irina Igoshkina", "bio"): [
+                    Verdict(value="Irina bio", confidence=0.95, source="wikidata")
+                ]
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            scope=EnrichScope(predicate="name", value="Irina Igoshkina"),
+        )
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        sel = captured["select"]
+        # attrs/<attr> literal arm (value lower-cased, case-insensitive).
+        assert 'isLiteral(?sv) && LCASE(STR(?sv)) = "irina igoshkina"' in sel
+        # Displayed-name arm: the entity's rdfs:label matched directly — this is the
+        # fix that lets a name carried ONLY on rdfs:label be selected.
+        assert "?e <http://www.w3.org/2000/01/rdf-schema#label> ?lbl ." in sel
+        assert 'isLiteral(?lbl) && LCASE(STR(?lbl)) = "irina igoshkina"' in sel
+        assert "FILTER(false)" not in sel
+        assert "FILTER EXISTS" not in sel
+
+        # The matched mentor was actually processed (not matched-0 — the bug).
+        final = await store.get(job.id)
+        assert final is not None
+        assert final.progress.total == 1
+        assert final.progress.processed == 1
+        assert [lbl for lbl, _ in wikidata.calls] == ["Irina Igoshkina"]
 
     asyncio.run(run())
 
