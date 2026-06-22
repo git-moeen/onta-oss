@@ -727,8 +727,28 @@ class EnrichmentExecutor:
                     selected_count=len(entities),
                 )
 
+            # TEMP diag (COG-112): resolve the adapter chain for the FIRST attribute
+            # and log which names are registered, so we can tell whether the chain is
+            # empty / paid adapters are unregistered (vs process_entity never running).
+            _diag_chain = get_chain(job.tier)
+            logger.info(
+                "enrich_diag_chain",
+                job_id=job.id,
+                tier=str(job.tier),
+                attributes=job.attributes,
+                job_store_class=type(self._jobs).__name__,
+                resolved=[
+                    {"name": n, "registered": (n == "cache" or get_adapter(n) is not None)}
+                    for n in _diag_chain
+                ],
+            )
+
             job.progress.total = len(entities) * len(job.attributes)
+            # TEMP diag (COG-112): bracket the post-select jobs.update to prove
+            # whether it returns (a hung job-store update would stall here).
+            logger.info("enrich_diag_pre_update", job_id=job.id)
             await self._jobs.update(job)
+            logger.info("enrich_diag_post_update", job_id=job.id)
 
             sem = asyncio.Semaphore(WORKER_POOL_SIZE)
             counter = {"n": 0}
@@ -736,6 +756,13 @@ class EnrichmentExecutor:
 
             async def process_entity(ent: dict) -> list[RowResult]:
                 results: list[RowResult] = []
+                # TEMP diag (COG-112): prove process_entity actually runs per entity.
+                logger.info(
+                    "enrich_diag_process_entity_enter",
+                    job_id=job.id,
+                    entity=ent.get("uri"),
+                    label=ent.get("label"),
+                )
                 async with sem:
                     for attribute in job.attributes:
                         # Cooperative cancellation
@@ -763,6 +790,15 @@ class EnrichmentExecutor:
                         else:
                             chain = get_chain(job.tier)
 
+                        # TEMP diag (COG-112): bracket the chain lookup to see if it
+                        # is entered and what it returns (or whether it stalls here).
+                        logger.info(
+                            "enrich_diag_pre_lookup_chain",
+                            job_id=job.id,
+                            attribute=attribute,
+                            entity=ent.get("label"),
+                            chain=chain,
+                        )
                         verdicts = await self._lookup_chain(
                             ent["label"],
                             attribute,
@@ -771,6 +807,12 @@ class EnrichmentExecutor:
                             missing_adapter_names,
                             effective_confidence,
                             strategy_version,
+                        )
+                        logger.info(
+                            "enrich_diag_post_lookup_chain",
+                            job_id=job.id,
+                            attribute=attribute,
+                            n_verdicts=len(verdicts),
                         )
                         best = self._pick_best(verdicts, effective_confidence)
 
@@ -846,6 +888,15 @@ class EnrichmentExecutor:
                 # in the background so the panels refresh without waiting for the
                 # summary-cache TTL. Only fire when something was actually applied.
                 self._schedule_stats_recompute(tenant_id, job.kg_name)
+            # TEMP diag (COG-112): the job reached the apply phase — log the result
+            # counts so we can confirm completion vs a silent 0-result finish.
+            logger.info(
+                "enrich_diag_applying",
+                job_id=job.id,
+                n_results=len(job.results),
+                policy=str(job.conflict_policy),
+                n_triples=len(triples),
+            )
             job.status = JobStatus.applied
             job.completed_at = _now()
             await self._jobs.update(job)
@@ -925,6 +976,13 @@ class EnrichmentExecutor:
                     cache_hit_counted = True
                 verdicts = cached
             else:
+                # TEMP diag (COG-112): bracket the actual adapter HTTP call so we can
+                # see which adapter is reached and whether it returns or stalls.
+                logger.info(
+                    "enrich_diag_pre_adapter",
+                    adapter=name,
+                    attribute=attribute,
+                )
                 try:
                     # Bound every adapter call so one stalled lookup (e.g. a
                     # hung network call whose own client lacks a total-operation
@@ -932,6 +990,13 @@ class EnrichmentExecutor:
                     verdicts = await asyncio.wait_for(
                         adapter.lookup(entity_label, attribute, {}),
                         timeout=ADAPTER_LOOKUP_TIMEOUT_S,
+                    )
+                    # TEMP diag (COG-112): adapter returned (not stalled/timed out).
+                    logger.info(
+                        "enrich_diag_post_adapter",
+                        adapter=name,
+                        attribute=attribute,
+                        n=len(verdicts),
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
