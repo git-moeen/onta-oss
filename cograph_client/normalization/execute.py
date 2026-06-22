@@ -10,7 +10,11 @@
   it, mint a CANONICAL atomic entity IRI per atomic value (slug-derived, so
   "Russian" from any composite maps to the SAME node — free dedup, no ER pass),
   re-point the edge at the atomic entities, drop the composite edge, and finally
-  drop any composite entity left with no inbound edge for this predicate.
+  run a single graph-state-keyed orphan sweep that deletes EVERY composite
+  entity of the target type left with no inbound edge for this predicate. The
+  sweep is keyed on graph state (not the edges this pass touched), so it is
+  complete (catches composites an inline per-edge drop would miss) and
+  re-runnable (a later apply still sweeps leftovers from a buggy earlier run).
 
 * **attribute, target=literal** (the skills/disciplines case): a literal packs
   several items with a delimiter. We split into atomic literals, write N triples,
@@ -94,7 +98,13 @@ _WS_PATTERN = re.compile(r"\s+")
 
 
 async def apply_rule(neptune: NeptuneClient, tenant_id: str, rule) -> dict:
-    """Apply a confirmed rule (``list_explode`` or ``strip_emoji``). Returns a summary."""
+    """Apply a confirmed rule (``list_explode`` or ``strip_emoji``). Returns a summary.
+
+    On any apply that actually mutates the graph, fire the same fire-and-forget
+    type-stats recompute enrichment uses (``schedule_recompute``) so the
+    Explorer's precomputed counts don't go stale (COG-118). A pure no-op
+    (idempotent re-run that changed nothing) skips it.
+    """
     if rule.rule_type not in ("list_explode", "strip_emoji"):
         raise ValueError(
             f"unsupported rule_type {rule.rule_type!r} "
@@ -103,6 +113,15 @@ async def apply_rule(neptune: NeptuneClient, tenant_id: str, rule) -> dict:
 
     kg_graph = kg_graph_uri(tenant_id, rule.kg_name)
 
+    summary = await _dispatch(neptune, kg_graph, rule)
+
+    if _summary_mutated(summary):
+        _schedule_stats_recompute(neptune, tenant_id, rule.kg_name)
+    return summary
+
+
+async def _dispatch(neptune: NeptuneClient, kg_graph: str, rule) -> dict:
+    """Route to the rule-type handler and return its summary."""
     if rule.rule_type == "strip_emoji":
         return await _strip_emoji(neptune, kg_graph, rule)
 
@@ -122,6 +141,37 @@ async def apply_rule(neptune: NeptuneClient, tenant_id: str, rule) -> dict:
             return {"edges_rewritten": 0, "atomic_created": 0, "orphans_dropped": 0}
         return await _explode_relationship(neptune, kg_graph, pred_leaf, delimiters)
     return await _explode_literal(neptune, kg_graph, pred_leaf, delimiters)
+
+
+def _summary_mutated(summary: dict) -> bool:
+    """True iff this apply actually changed the graph (so a recompute is worth it).
+
+    Covers both summary shapes: list_explode's counters and strip_emoji's. A
+    purely idempotent re-run reports all-zero and we skip the recompute.
+    """
+    return any(
+        int(summary.get(k, 0))
+        for k in (
+            "edges_rewritten",
+            "atomic_created",
+            "orphans_dropped",
+            "triples_rewritten",
+            "literals_cleaned",
+        )
+    )
+
+
+def _schedule_stats_recompute(neptune: NeptuneClient, tenant_id: str, kg_name: str) -> None:
+    """Fire-and-forget a type-stats recompute after a mutating apply.
+
+    Lazy-imported from the explore route to avoid a module-load import cycle (the
+    enrichment executor + ingest hook use the same lazy pattern).
+    ``schedule_recompute`` is best-effort — it swallows Neptune errors internally
+    — so this never affects the apply's outcome.
+    """
+    from cograph_client.api.routes.explore import schedule_recompute
+
+    schedule_recompute(neptune, tenant_id, kg_name)
 
 
 def _delimiters(rule) -> list[str]:
@@ -258,9 +308,18 @@ async def _explode_relationship(
         for i in range(0, len(edges_to_delete), 500):
             await neptune.update(delete_triples(kg_graph, edges_to_delete[i : i + 500]))
 
-    # 3) Drop now-orphaned composite entities (no inbound edge for this predicate).
-    orphans_dropped = await _drop_orphan_composites(
-        neptune, kg_graph, onto_pred, attr_pred_suffix, composites_touched
+    # 3) Final orphan sweep. After ALL edges for this predicate are re-pointed,
+    #    delete EVERY composite node of the relationship's target type(s) that has
+    #    no inbound onto/<pred> (or attrs/<pred>) edge left — keyed on graph state,
+    #    not on the composites we happened to touch this pass. That makes it both
+    #    complete (one DELETE/WHERE per type catches the ones a per-edge drop
+    #    misses) and re-runnable (a second apply still sweeps leftover orphans
+    #    from a buggy earlier run, even when nothing was rewritten this pass).
+    target_types = await _composite_target_types(
+        neptune, kg_graph, onto_pred, attr_pred_suffix, composites_touched, delimiters
+    )
+    orphans_dropped = await _sweep_orphan_composites(
+        neptune, kg_graph, onto_pred, attr_pred_suffix, target_types, delimiters
     )
 
     summary = {
@@ -272,42 +331,148 @@ async def _explode_relationship(
     return summary
 
 
-async def _drop_orphan_composites(
+async def _composite_target_types(
     neptune: NeptuneClient,
     kg_graph: str,
     onto_pred: str,
     attr_pred_suffix: str,
     composites: set[str],
-) -> int:
-    """Delete composite entities with no remaining inbound edge for the predicate.
+    delimiters: list[str],
+) -> set[str]:
+    """The relationship's target type(s), for scoping the final orphan sweep.
 
-    Removes ALL triples of each orphan (its rdf:type, labels, attrs). Only the
-    composites we actually re-pointed are candidates; each is re-checked live so
-    a composite still referenced elsewhere is kept.
+    Derived first from the composites we re-pointed this pass (their IRI carries
+    ``…/entities/<TargetType>/…``). On a re-run where nothing was rewritten
+    (``composites`` empty — the leftover-orphan case) we instead query the graph
+    for entity types whose members are composite-named and have NO inbound edge
+    for this predicate, so the sweep still finds a type to scope to. Keeping it
+    scoped to real target types means we never touch unrelated types.
     """
-    dropped = 0
+    types: set[str] = set()
     for composite in composites:
-        ask = (
-            f"ASK FROM <{kg_graph}> WHERE {{\n"
-            f"  {{ ?s <{onto_pred}> <{composite}> }}\n"
-            f"  UNION\n"
-            f"  {{ ?s ?p2 <{composite}> . FILTER(STRENDS(STR(?p2), \"{_sparql_str(attr_pred_suffix)}\")) }}\n"
+        t = _target_type_from_uri(composite)
+        if t:
+            types.add(t)
+    if types:
+        return types
+
+    # No fresh rewrites this pass: ask the graph which composite-named, orphaned
+    # entities exist and what type they are. This is what makes the sweep
+    # re-runnable after a buggy first run left composites behind.
+    delim_filter = " || ".join(
+        f'CONTAINS(?cname, "{_sparql_str(d)}")' for d in delimiters
+    )
+    q = (
+        f"SELECT DISTINCT ?t FROM <{kg_graph}> WHERE {{\n"
+        f"  ?c <{RDF_TYPE}> ?t .\n"
+        f'  FILTER(STRSTARTS(STR(?c), "{ENTITY_URI_PREFIX}"))\n'
+        f'  FILTER(STRSTARTS(STR(?t), "{type_uri("")}"))\n'
+        f"  OPTIONAL {{ ?c <{RDFS_LABEL}> ?clabel }}\n"
+        f'  BIND(COALESCE(?clabel, REPLACE(STR(?c), "^.*/", "")) AS ?cname)\n'
+        f"  FILTER({delim_filter})\n"
+        f"  FILTER NOT EXISTS {{ ?s <{onto_pred}> ?c }}\n"
+        f"  FILTER NOT EXISTS {{ ?s2 ?p2 ?c . "
+        f"FILTER(STRENDS(STR(?p2), \"{_sparql_str(attr_pred_suffix)}\")) }}\n"
+        f"}}"
+    )
+    try:
+        _, rows = parse_sparql_results(await neptune.query(q))
+    except Exception:
+        logger.warning("composite_target_type_query_failed", exc_info=True)
+        return set()
+    for r in rows:
+        t = _target_type_from_type_uri(r.get("t", ""))
+        if t:
+            types.add(t)
+    return types
+
+
+async def _sweep_orphan_composites(
+    neptune: NeptuneClient,
+    kg_graph: str,
+    onto_pred: str,
+    attr_pred_suffix: str,
+    target_types: set[str],
+    delimiters: list[str],
+) -> int:
+    """Final, graph-state-keyed sweep of orphaned composite nodes.
+
+    For each target type, delete ALL triples of every entity that is (a) of that
+    type, (b) composite-named (local-name or rdfs:label contains a rule
+    delimiter), and (c) has ZERO inbound ``onto/<pred>`` (or ``…/attrs/<pred>``)
+    edges. One DELETE/WHERE per type — not a per-node loop — so it catches every
+    orphan in a single pass (complete) and re-deletes leftovers on a later run
+    (idempotent / re-runnable). Atomic nodes (no delimiter) and still-referenced
+    composites are left untouched.
+
+    Returns the number of orphan composite nodes deleted (counted before the
+    DELETE so the summary reflects what was removed).
+    """
+    if not target_types:
+        return 0
+
+    delim_filter = " || ".join(
+        f'CONTAINS(?cname, "{_sparql_str(d)}")' for d in delimiters
+    )
+    dropped = 0
+    for target_type in sorted(target_types):
+        t_uri = type_uri(target_type)
+        # The shared WHERE: an orphaned composite ?c of this type. Both the count
+        # and the delete key on exactly this pattern, so the count matches what
+        # the DELETE removes.
+        orphan_where = (
+            f"  ?c <{RDF_TYPE}> <{t_uri}> .\n"
+            f'  FILTER(STRSTARTS(STR(?c), "{ENTITY_URI_PREFIX}"))\n'
+            f"  OPTIONAL {{ ?c <{RDFS_LABEL}> ?clabel }}\n"
+            f'  BIND(COALESCE(?clabel, REPLACE(STR(?c), "^.*/", "")) AS ?cname)\n'
+            f"  FILTER({delim_filter})\n"
+            f"  FILTER NOT EXISTS {{ ?s <{onto_pred}> ?c }}\n"
+            f"  FILTER NOT EXISTS {{ ?s2 ?p2 ?c . "
+            f"FILTER(STRENDS(STR(?p2), \"{_sparql_str(attr_pred_suffix)}\")) }}\n"
+        )
+        count_q = (
+            f"SELECT (COUNT(DISTINCT ?c) AS ?n) FROM <{kg_graph}> WHERE {{\n"
+            f"{orphan_where}"
             f"}}"
         )
         try:
-            still_referenced = await neptune.ask(ask)
+            _, rows = parse_sparql_results(await neptune.query(count_q))
+            n = int(rows[0].get("n", 0)) if rows else 0
         except Exception:
-            logger.warning("orphan_check_failed", composite=composite, exc_info=True)
+            logger.warning(
+                "orphan_count_failed", target_type=target_type, exc_info=True
+            )
+            n = 0
+        if n == 0:
             continue
-        if still_referenced:
-            continue
-        # No inbound predicate edge — delete the composite node entirely.
-        await neptune.update(
-            f"DELETE {{ GRAPH <{kg_graph}> {{ <{composite}> ?p ?o }} }}\n"
-            f"WHERE {{ GRAPH <{kg_graph}> {{ <{composite}> ?p ?o }} }}"
+        # Delete EVERY triple of EVERY orphan of this type in one DELETE/WHERE.
+        # The orphan set is identified by the same predicate as the count, then
+        # we sweep all of its outbound triples (rdf:type, label, attrs).
+        delete_q = (
+            f"DELETE {{ GRAPH <{kg_graph}> {{ ?c ?dp ?do }} }}\n"
+            f"WHERE {{ GRAPH <{kg_graph}> {{\n"
+            f"{orphan_where}"
+            f"  ?c ?dp ?do .\n"
+            f"}} }}"
         )
-        dropped += 1
+        try:
+            await neptune.update(delete_q)
+        except Exception:
+            logger.warning(
+                "orphan_sweep_failed", target_type=target_type, exc_info=True
+            )
+            continue
+        dropped += n
     return dropped
+
+
+def _target_type_from_type_uri(t_uri: str) -> str | None:
+    """``https://cograph.tech/types/<TargetType>`` → ``<TargetType>``."""
+    prefix = type_uri("")
+    if not t_uri.startswith(prefix):
+        return None
+    tail = t_uri[len(prefix):].strip("/")
+    return tail or None
 
 
 async def _explode_literal(

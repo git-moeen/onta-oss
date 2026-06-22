@@ -37,6 +37,19 @@ KG = "june-16"
 
 
 # --------------------------------------------------------------------------- #
+# apply_rule fires explore.schedule_recompute (a fire-and-forget asyncio task)
+# after a mutating apply. Stub it for ALL tests so no real background recompute
+# task is spawned against the FakeNeptune; the dedicated recompute test installs
+# its own spy on top of this.
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _stub_schedule_recompute(monkeypatch):
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+
+# --------------------------------------------------------------------------- #
 # Fake Neptune: a tiny in-memory quad store that understands the specific SPARQL
 # shapes our store + executor emit. Not a general SPARQL engine — just enough.
 # --------------------------------------------------------------------------- #
@@ -123,7 +136,10 @@ class FakeNeptune:
             self._g(graph).discard(t)
 
     def _apply_delete_where(self, op: str) -> None:
-        # Forms: DELETE { GRAPH <g> { <subj> ?p ?o } } WHERE { ... }
+        # Two forms:
+        #  (a) legacy single-subject: DELETE { GRAPH <g> { <subj> ?p ?o } } WHERE …
+        #  (b) the orphan sweep: DELETE { GRAPH <g> { ?c ?dp ?do } } WHERE { …
+        #      ?c rdf:type <t> ; (composite-named) ; no inbound onto/attr edge … }
         graph = self._graph_in(op)
         subj_m = re.search(r"DELETE \{ GRAPH <[^>]+> \{ <([^>]+)> \?p \?o", op)
         if subj_m:
@@ -131,9 +147,79 @@ class FakeNeptune:
             for t in list(self._g(graph)):
                 if t[0] == subj:
                     self._g(graph).discard(t)
+            return
+        if re.search(r"DELETE \{ GRAPH <[^>]+> \{ \?c \?dp \?do", op):
+            for c in self._orphan_composites(op, self._g(graph)):
+                for t in list(self._g(graph)):
+                    if t[0] == c:
+                        self._g(graph).discard(t)
+
+    def _orphan_composites(self, sparql: str, quads: set) -> set:
+        """Evaluate the orphan-sweep WHERE: composite-named entities of the given
+        type with no inbound onto/<pred> (or …/attrs/<pred>) edge."""
+        t_m = re.search(r"\?c <[^>]+#type> <([^>]+)>", sparql)
+        t_uri = t_m.group(1) if t_m else None
+        onto_m = re.search(r"NOT EXISTS \{ \?s <([^>]+)> \?c \}", sparql)
+        onto_pred = onto_m.group(1) if onto_m else None
+        suffix_m = re.search(r'STRENDS\(STR\(\?p2\), "([^"]+)"\)', sparql)
+        suffix = suffix_m.group(1) if suffix_m else None
+        delims = re.findall(r'CONTAINS\(\?cname, "([^"]+)"\)', sparql)
+        candidates = {s for (s, p, o) in quads if p == RDF_TYPE and o == t_uri}
+        out = set()
+        for c in candidates:
+            if not c.startswith(ENTITY):
+                continue
+            clabel = next((oo for (ss, pp, oo) in quads if ss == c and pp == RDFS_LABEL), None)
+            cname = clabel if clabel is not None else c.rstrip("/").split("/")[-1]
+            if not any(_unescape(d) in cname for d in delims):
+                continue
+            inbound = False
+            for (s, p, o) in quads:
+                if o != c:
+                    continue
+                if onto_pred and p == onto_pred:
+                    inbound = True
+                    break
+                if suffix and p.endswith(suffix):
+                    inbound = True
+                    break
+            if not inbound:
+                out.add(c)
+        return out
 
     # -- select impl (only the shapes we emit) --
     def _eval_select(self, sparql: str, quads: set) -> list[dict]:
+        # Orphan-sweep count: SELECT (COUNT(DISTINCT ?c) AS ?n) … orphan WHERE.
+        if "COUNT(DISTINCT ?c)" in sparql:
+            n = len(self._orphan_composites(sparql, quads))
+            return [{"n": str(n)}]
+
+        # Composite target-type discovery (re-run path): SELECT DISTINCT ?t … of
+        # composite-named, orphaned entities. Returns the distinct types.
+        if "SELECT DISTINCT ?t" in sparql:
+            onto_m = re.search(r"NOT EXISTS \{ \?s <([^>]+)> \?c \}", sparql)
+            onto_pred = onto_m.group(1) if onto_m else None
+            suffix_m = re.search(r'STRENDS\(STR\(\?p2\), "([^"]+)"\)', sparql)
+            suffix = suffix_m.group(1) if suffix_m else None
+            delims = re.findall(r'CONTAINS\(\?cname, "([^"]+)"\)', sparql)
+            types = set()
+            for (s, p, o) in quads:
+                if p != RDF_TYPE or not o.startswith(TYPES):
+                    continue
+                if not s.startswith(ENTITY):
+                    continue
+                clabel = next((oo for (ss, pp, oo) in quads if ss == s and pp == RDFS_LABEL), None)
+                cname = clabel if clabel is not None else s.rstrip("/").split("/")[-1]
+                if not any(_unescape(d) in cname for d in delims):
+                    continue
+                inbound = any(
+                    oo == s and (pp == onto_pred or (suffix and pp.endswith(suffix)))
+                    for (ss, pp, oo) in quads
+                )
+                if not inbound:
+                    types.add(o)
+            return [{"t": t} for t in sorted(types)]
+
         # Store.get: SELECT ?p ?o WHERE { <uri> ?p ?o }
         m = re.search(r"SELECT \?p \?o FROM <[^>]+> WHERE \{\s*<([^>]+)> \?p \?o", sparql)
         if m:
@@ -582,6 +668,172 @@ async def test_execute_explode_relationship_and_idempotent():
     summary2 = await apply_rule(neptune, TENANT, rule)
     assert neptune.graphs[kg] == before
     assert summary2 == {"edges_rewritten": 0, "atomic_created": 0, "orphans_dropped": 0}
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_is_complete_keeps_referenced_and_atomic():
+    """Final sweep deletes ALL composite Language nodes with no inbound edge —
+    including one that a naive per-edge drop would miss — while keeping atomic
+    nodes and a composite still referenced by another subject."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    speaks = ONTO + "speaks"
+
+    comp_er = ENTITY + "Language/English__Russian"   # shared by A and B
+    comp_eu = ENTITY + "Language/English__Ukrainian"  # only C → ends orphaned
+    comp_kept = ENTITY + "Language/German__Polish"     # NOT pointed at speaks
+    atomic_pre = ENTITY + "Language/Spanish"           # pre-existing atomic node
+
+    neptune._g(kg).update(
+        {
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/B", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/C", RDF_TYPE, TYPES + "Mentor"),
+            # A and B both speak the SAME composite (referenced by multiple subjects)
+            (ENTITY + "Mentor/A", speaks, comp_er),
+            (ENTITY + "Mentor/B", speaks, comp_er),
+            # C speaks a composite referenced by nobody else
+            (ENTITY + "Mentor/C", speaks, comp_eu),
+            (comp_er, RDF_TYPE, TYPES + "Language"),
+            (comp_er, RDFS_LABEL, "English, Russian"),
+            (comp_eu, RDF_TYPE, TYPES + "Language"),
+            (comp_eu, RDFS_LABEL, "English, Ukrainian"),
+            # A composite node that is NOT a speaks target — still composite-named
+            # AND has no inbound speaks edge, so the sweep should remove it too
+            # (it is an orphan of the target type with no inbound predicate edge).
+            (comp_kept, RDF_TYPE, TYPES + "Language"),
+            (comp_kept, RDFS_LABEL, "German, Polish"),
+            # An atomic node that must survive (no delimiter in its name/label).
+            (atomic_pre, RDF_TYPE, TYPES + "Language"),
+            (atomic_pre, RDFS_LABEL, "Spanish"),
+        }
+    )
+    rule = NormalizationRule(
+        id=make_rule_id(KG, "Mentor", "speaks"),
+        kg_name=KG,
+        type_name="Mentor",
+        predicate="speaks",
+        target_kind="relationship",
+        rule_type="list_explode",
+        params={"delimiters": [", ", "__"], "target": "entity"},
+        confidence=0.9,
+        status="confirmed",
+    )
+
+    summary = await apply_rule(neptune, TENANT, rule)
+    quads = neptune.graphs[kg]
+
+    # Every composite node (delimiter in name) with no inbound speaks edge is gone.
+    assert not [t for t in quads if t[0] == comp_er]
+    assert not [t for t in quads if t[0] == comp_eu]
+    assert not [t for t in quads if t[0] == comp_kept]
+
+    # Atomic node is untouched.
+    assert (atomic_pre, RDF_TYPE, TYPES + "Language") in quads
+    assert (atomic_pre, RDFS_LABEL, "Spanish") in quads
+
+    # Edges re-pointed to atomic entities.
+    eng = ENTITY + "Language/English"
+    rus = ENTITY + "Language/Russian"
+    ukr = ENTITY + "Language/Ukrainian"
+    assert (ENTITY + "Mentor/A", speaks, eng) in quads
+    assert (ENTITY + "Mentor/A", speaks, rus) in quads
+    assert (ENTITY + "Mentor/B", speaks, eng) in quads
+    assert (ENTITY + "Mentor/B", speaks, rus) in quads
+    assert (ENTITY + "Mentor/C", speaks, eng) in quads
+    assert (ENTITY + "Mentor/C", speaks, ukr) in quads
+
+    # 3 composites swept: English__Russian, English__Ukrainian, German__Polish.
+    assert summary["orphans_dropped"] == 3
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_rerunnable_clears_leftover_orphan():
+    """A leftover composite node (rdf:type + label, NO inbound edge, nothing to
+    rewrite) is swept on a SUBSEQUENT apply — the sweep keys on graph state, so
+    a second run cleans up what a buggy first run left behind."""
+    neptune = FakeNeptune()
+    kg = "https://cograph.tech/graphs/t1/kg/june-16"
+    speaks = ONTO + "speaks"
+
+    leftover = ENTITY + "Language/English__Russian"
+    atomic = ENTITY + "Language/English"
+    neptune._g(kg).update(
+        {
+            # A real mentor already pointing at the ATOMIC node (already exploded).
+            (ENTITY + "Mentor/A", RDF_TYPE, TYPES + "Mentor"),
+            (ENTITY + "Mentor/A", speaks, atomic),
+            (atomic, RDF_TYPE, TYPES + "Language"),
+            (atomic, RDFS_LABEL, "English"),
+            # Leftover composite: typed + labelled, but NO inbound speaks edge and
+            # no composite edge to rewrite (a buggy earlier run dropped its edges
+            # but failed to delete the node).
+            (leftover, RDF_TYPE, TYPES + "Language"),
+            (leftover, RDFS_LABEL, "English, Russian"),
+            (leftover, TYPES + "Language/attrs/name", "English, Russian"),
+        }
+    )
+    rule = NormalizationRule(
+        id=make_rule_id(KG, "Mentor", "speaks"),
+        kg_name=KG,
+        type_name="Mentor",
+        predicate="speaks",
+        target_kind="relationship",
+        rule_type="list_explode",
+        params={"delimiters": [", ", "__"], "target": "entity"},
+        confidence=0.9,
+        status="confirmed",
+    )
+
+    summary = await apply_rule(neptune, TENANT, rule)
+    quads = neptune.graphs[kg]
+
+    # Nothing to rewrite (the only edge already points at an atomic node), but the
+    # leftover composite is swept entirely.
+    assert summary["edges_rewritten"] == 0
+    assert summary["orphans_dropped"] == 1
+    assert not [t for t in quads if t[0] == leftover]
+    # The real atomic node + its edge survive.
+    assert (ENTITY + "Mentor/A", speaks, atomic) in quads
+    assert (atomic, RDF_TYPE, TYPES + "Language") in quads
+
+
+@pytest.mark.asyncio
+async def test_apply_triggers_stats_recompute_on_mutation(monkeypatch):
+    """A mutating apply fires explore.schedule_recompute(tenant_id, kg_name); a
+    pure no-op re-run does not."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        explore_mod,
+        "schedule_recompute",
+        lambda client, tenant_id, kg_name: calls.append((tenant_id, kg_name)),
+    )
+
+    neptune = FakeNeptune()
+    kg = _seed_speaks_composites(neptune)
+    rule = NormalizationRule(
+        id=make_rule_id(KG, "Mentor", "speaks"),
+        kg_name=KG,
+        type_name="Mentor",
+        predicate="speaks",
+        target_kind="relationship",
+        rule_type="list_explode",
+        params={"delimiters": [", ", "__"], "target": "entity"},
+        confidence=0.9,
+        status="confirmed",
+    )
+
+    summary = await apply_rule(neptune, TENANT, rule)
+    assert summary["edges_rewritten"] == 2
+    # Recompute fired exactly once, with the rule's tenant + kg_name.
+    assert calls == [(TENANT, KG)]
+
+    # Second run is a pure no-op → no further recompute.
+    calls.clear()
+    await apply_rule(neptune, TENANT, rule)
+    assert calls == []
 
 
 @pytest.mark.asyncio
