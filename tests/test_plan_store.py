@@ -185,8 +185,26 @@ def test_make_plan_store_postgres_when_db_set(monkeypatch):
     from cograph_client.config import settings
 
     monkeypatch.setattr(settings, "database_url", "postgresql://x/y")
+    reset_plan_store()
     store = make_plan_store()
     assert isinstance(store, PostgresPlanStore)
+
+
+def test_make_plan_store_postgres_memoized_across_calls(monkeypatch):
+    """The durable backend is a process-level singleton: two calls return the
+    SAME instance (one asyncpg pool per process, not one per agent turn), and
+    ``reset_plan_store`` clears it so the next call builds a fresh one."""
+    from cograph_client.config import settings
+
+    monkeypatch.setattr(settings, "database_url", "postgresql://x/y")
+    reset_plan_store()
+    first = make_plan_store()
+    second = make_plan_store()
+    assert isinstance(first, PostgresPlanStore)
+    assert first is second  # memoized — not a fresh pool every call
+    reset_plan_store()
+    third = make_plan_store()
+    assert third is not first  # reset rebuilt the durable singleton
 
 
 def test_reset_plan_store_clears_singleton(monkeypatch):

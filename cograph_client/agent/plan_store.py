@@ -295,6 +295,7 @@ def _sorted_newest_first(plans: list[StoredPlan]) -> list[StoredPlan]:
 
 
 _store: Optional[InMemoryPlanStore] = None
+_durable_store: Optional[PostgresPlanStore] = None
 
 
 def get_plan_store() -> InMemoryPlanStore:
@@ -309,18 +310,25 @@ def make_plan_store() -> PlanStore:
 
     Returns a :class:`PostgresPlanStore` when ``settings.database_url`` is set
     (durable, shared across ECS tasks), else an :class:`InMemoryPlanStore`
-    (zero-config default). The Postgres store creates its pool/table lazily, so
-    calling this never touches the network.
+    (zero-config default). Both backends are process-level singletons, so each
+    call returns the SAME instance — the durable store owns one asyncpg pool per
+    process instead of building (and never closing) a fresh pool on every agent
+    turn. The Postgres store creates its pool/table lazily, so calling this never
+    touches the network.
     """
+    global _durable_store
     if settings.database_url:
-        return PostgresPlanStore()
+        if _durable_store is None:
+            _durable_store = PostgresPlanStore()
+        return _durable_store
     return get_plan_store()
 
 
 def reset_plan_store() -> None:
-    """Test helper — clear the singleton."""
-    global _store
+    """Test helper — clear both singletons."""
+    global _store, _durable_store
     _store = None
+    _durable_store = None
 
 
 __all__ = [
