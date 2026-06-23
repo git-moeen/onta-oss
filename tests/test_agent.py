@@ -57,6 +57,7 @@ class FakeNeptune:
 class FakeJobStore:
     def __init__(self):
         self.created = []
+        self.updated = []
 
     async def create(self, job):
         self.created.append(job)
@@ -66,6 +67,9 @@ class FakeJobStore:
             if j.id == job_id:
                 return j
         return None
+
+    async def update(self, job):
+        self.updated.append(job)
 
 
 class FakeExecutor:
@@ -112,6 +116,7 @@ def _track_bg_tasks(monkeypatch):
     nothing leaks. We replace ``_spawn`` with one that creates a real task and
     keeps a strong ref — the underlying apply/run is itself stubbed per-test.
     """
+    import cograph_client.agent.capabilities.dedup_cap as dedup_cap
     import cograph_client.agent.capabilities.enrich_cap as enrich_cap
     import cograph_client.agent.capabilities.normalize_cap as norm_cap
 
@@ -124,6 +129,7 @@ def _track_bg_tasks(monkeypatch):
 
     monkeypatch.setattr(norm_cap, "_spawn", tracking_spawn)
     monkeypatch.setattr(enrich_cap, "_spawn", tracking_spawn)
+    monkeypatch.setattr(dedup_cap, "_spawn", tracking_spawn)
     return spawned
 
 
@@ -266,9 +272,10 @@ async def test_ambiguous_routes_to_clarify(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unregistered_intent_clarifies(monkeypatch):
-    # dedup is recognized by the classifier but no capability is registered in A1.
-    _stub_classifier(monkeypatch, "dedup")
-    out = await asyncio.wait_for(handle(_ctx(), "merge the duplicates"), TIMEOUT)
+    # 'ontology' is recognized by the classifier but no capability is registered
+    # yet (A2) → clarify. (dedup IS registered now; see the dedup tests below.)
+    _stub_classifier(monkeypatch, "ontology")
+    out = await asyncio.wait_for(handle(_ctx(), "rename the type"), TIMEOUT)
     assert out["kind"] == "clarify"
 
 
@@ -1012,3 +1019,207 @@ async def test_plan_limit_carried_into_enrich_job(monkeypatch, _adapters_and_tie
     job = job_store.created[0]
     assert job.limit == 200
     assert abs(job.confidence_min - 0.4) < 1e-9  # web floor carried through
+
+
+# --------------------------------------------------------------------------- #
+# 8. Dedup capability (COG-122) — registered → plans + drives the ER engine
+# --------------------------------------------------------------------------- #
+from cograph_client.agent.capabilities.dedup_cap import DedupCapability  # noqa: E402
+from cograph_client.enrichment.models import JobCategory, JobStatus  # noqa: E402
+
+
+def test_dedup_capability_is_registered_by_default():
+    """register_default_capabilities() appends DedupCapability → the single
+    endpoint can dispatch 'dedup' with no route change."""
+    names = {c.name for c in get_capabilities()}
+    assert "dedup" in names
+    cap = get_capability("dedup")
+    assert isinstance(cap, DedupCapability)
+
+
+class _TypedNeptune(FakeNeptune):
+    """Neptune fake whose query() returns the given rdf:type URIs so the dedup
+    plan can enumerate ER-enabled types for its preview."""
+
+    def __init__(self, type_uris: list[str]):
+        super().__init__()
+        self._type_uris = type_uris
+
+    async def query(self, q):
+        return {
+            "head": {"vars": ["t"]},
+            "results": {"bindings": [{"t": {"value": u}} for u in self._type_uris]},
+        }
+
+
+@pytest.mark.asyncio
+async def test_dedup_routes_to_plan_with_er_types(monkeypatch):
+    """'merge the duplicates' → a dedup PLAN (not clarify), grounded in the KG's
+    real ER-enabled types. 'Person' resolves to an ERConfig (kept); 'Skill' does
+    not (filtered out)."""
+    _stub_classifier(monkeypatch, "dedup")
+    prefix = "https://cograph.tech/types/"
+    neptune = _TypedNeptune([f"{prefix}Person", f"{prefix}Skill"])
+
+    out = await asyncio.wait_for(
+        handle(_ctx(neptune=neptune), "merge the duplicate people"), TIMEOUT
+    )
+    assert out["kind"] == "plan"
+    assert len(out["steps"]) == 1
+    step = out["steps"][0]
+    assert step["capability"] == "dedup"
+    assert step["action"] == "run_dedup"
+    assert step["params"]["kg_name"] == "kg1"
+    # Only ER-enabled types are previewed; 'Skill' has no ERConfig → dropped.
+    assert step["params"]["er_types"] == ["Person"]
+    # Dedup is compute, not paid web calls.
+    assert step["cost"]["paid_calls"] == 0
+    assert step["cost"]["estimated_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_dedup_plan_degrades_when_type_enum_fails(monkeypatch):
+    """If type enumeration raises (Neptune down), the plan still proposes a dedup
+    step with an empty er_types list rather than failing."""
+    _stub_classifier(monkeypatch, "dedup")
+
+    class _BoomNeptune(FakeNeptune):
+        async def query(self, q):
+            raise RuntimeError("neptune down")
+
+    out = await asyncio.wait_for(
+        handle(_ctx(neptune=_BoomNeptune()), "find and merge duplicates"), TIMEOUT
+    )
+    assert out["kind"] == "plan"
+    step = out["steps"][0]
+    assert step["capability"] == "dedup"
+    assert step["params"]["er_types"] == []
+    assert "all ER-enabled types" in step["preview"]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_dedup_execute_drives_rebuild_engine(monkeypatch):
+    """execute() creates a dedupe-category job and drives the EXISTING ER engine
+    (rebuild_kg) as a tracked background worker, then records the merge volume."""
+    captured: dict = {}
+
+    async def fake_rebuild_kg(client, instance_graph):
+        captured["instance_graph"] = instance_graph
+        return {
+            "types": [{"type": "Person", "fragments_absorbed": 7}],
+            "fragments_absorbed_total": 7,
+        }
+
+    # Patch the engine entry point + the recompute hook the worker imports
+    # lazily from the route module.
+    monkeypatch.setattr(
+        "cograph_client.resolver.er.rebuild.rebuild_kg", fake_rebuild_kg
+    )
+
+    recompute_calls: list = []
+    monkeypatch.setattr(
+        "cograph_client.api.routes.explore.schedule_recompute",
+        lambda client, tenant_id, kg_name: recompute_calls.append((tenant_id, kg_name)),
+    )
+
+    job_store = FakeJobStore()
+    ctx = _ctx(job_store=job_store)
+    cap = get_capability("dedup")
+
+    plan = await asyncio.wait_for(cap.plan(ctx, "merge duplicates"), TIMEOUT)
+    ack = await asyncio.wait_for(cap.execute(ctx, plan[0]), TIMEOUT)
+
+    assert ack["kind"] == "ack"
+    assert ack["capability"] == "dedup"
+    assert ack["job_id"]
+    # A dedupe-category job was created in the queued state.
+    assert len(job_store.created) == 1
+    job = job_store.created[0]
+    assert job.category == JobCategory.dedupe
+    assert job.type_name == ""  # KG-wide, not type-scoped
+
+    # Let the spawned background rebuild worker run.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # The engine ran against the KG's instance graph (the same primitive the
+    # er-rebuild route uses), the job landed in 'applied' with the merge volume
+    # recorded, and a type-stats recompute was scheduled.
+    assert captured["instance_graph"] == "https://cograph.tech/graphs/t1/kg/kg1"
+    assert job.status == JobStatus.applied
+    assert job.progress.processed == 7
+    assert "merged 7 duplicate fragment" in (job.error or "")
+    assert recompute_calls == [("t1", "kg1")]
+
+
+@pytest.mark.asyncio
+async def test_dedup_execute_records_failure(monkeypatch):
+    """If the rebuild engine raises, the worker records a failed job (detached —
+    the error is captured on the job, never propagated)."""
+
+    async def boom_rebuild(client, instance_graph):
+        raise RuntimeError("merge blew up")
+
+    monkeypatch.setattr(
+        "cograph_client.resolver.er.rebuild.rebuild_kg", boom_rebuild
+    )
+    monkeypatch.setattr(
+        "cograph_client.api.routes.explore.schedule_recompute",
+        lambda *a, **k: None,
+    )
+
+    job_store = FakeJobStore()
+    ctx = _ctx(job_store=job_store)
+    cap = get_capability("dedup")
+    plan = await asyncio.wait_for(cap.plan(ctx, "dedupe"), TIMEOUT)
+    await asyncio.wait_for(cap.execute(ctx, plan[0]), TIMEOUT)
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    job = job_store.created[0]
+    assert job.status == JobStatus.failed
+    assert "dedup failed" in (job.error or "")
+
+
+@pytest.mark.asyncio
+async def test_dedup_execute_requires_job_store():
+    """execute() raises a clear error when the job store isn't in the context."""
+    ctx = AgentContext(
+        tenant_id="t1", kg_name="kg1", neptune=FakeNeptune(), type_name="Person",
+        extras={},
+    )
+    cap = get_capability("dedup")
+    step = PlanStep(capability="dedup", action="run_dedup", params={"kg_name": "kg1"})
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(cap.execute(ctx, step), TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_dedup_execute_via_plan_store(monkeypatch):
+    """End-to-end through the planner: handle → dedup plan, confirm → result with
+    an 'ok' step that drove the engine (the only mutating path)."""
+    _stub_classifier(monkeypatch, "dedup")
+
+    async def fake_rebuild_kg(client, instance_graph):
+        return {"types": [], "fragments_absorbed_total": 0}
+
+    monkeypatch.setattr(
+        "cograph_client.resolver.er.rebuild.rebuild_kg", fake_rebuild_kg
+    )
+    monkeypatch.setattr(
+        "cograph_client.api.routes.explore.schedule_recompute",
+        lambda *a, **k: None,
+    )
+
+    job_store = FakeJobStore()
+    ctx = _ctx(job_store=job_store)
+    plan_out = await asyncio.wait_for(handle(ctx, "merge duplicates"), TIMEOUT)
+    assert plan_out["kind"] == "plan"
+    result = await asyncio.wait_for(execute_plan(ctx, plan_out["plan_id"]), TIMEOUT)
+    assert result["kind"] == "result"
+    assert [s["status"] for s in result["steps"]] == ["ok"]
+    assert result["steps"][0]["capability"] == "dedup"
+    await asyncio.sleep(0)
+    assert len(job_store.created) == 1
+    assert job_store.created[0].category == JobCategory.dedupe
