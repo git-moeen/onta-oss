@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Client, CographError } from "cograph";
-import type { ResolvedChange } from "cograph";
+import type { AgentResult, ResolvedChange } from "cograph";
 import { z } from "zod";
 
 const VERSION = "0.1.0";
@@ -270,6 +270,134 @@ server.registerTool(
       lines.push("", `Operations applied: ${result.operations}`);
       lines.push(describeChange(result.applied));
       return textResult(lines.join("\n"));
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+/**
+ * Render a kind-tagged agent result (the shape returned by `/agent`) as readable
+ * text plus the raw JSON, so an MCP client can both read a summary and act on the
+ * machine-readable fields (e.g. carry a `plan_id` back into a confirm call).
+ */
+function describeAgentResult(r: AgentResult): string {
+  const lines: string[] = [];
+  switch (r.kind) {
+    case "answer": {
+      const answer = (r.answer as string | undefined) ?? "(no answer)";
+      lines.push(`Answer: ${answer}`);
+      if (r.narrative) lines.push(`\n${String(r.narrative)}`);
+      if (r.sparql) lines.push(`\nSPARQL:\n${String(r.sparql)}`);
+      break;
+    }
+    case "clarify":
+      lines.push(
+        `Clarification needed: ${String(r.question ?? "Could you clarify?")}`,
+      );
+      break;
+    case "plan": {
+      const steps = Array.isArray(r.steps) ? r.steps : [];
+      lines.push(
+        `Proposed plan (${steps.length} step${steps.length === 1 ? "" : "s"}) — ` +
+          `NOT yet executed. Review, then confirm by calling agent again with ` +
+          `confirm_plan_id="${String(r.plan_id ?? "")}".`,
+      );
+      for (const s of steps as Array<Record<string, unknown>>) {
+        const cap = String(s.capability ?? "?");
+        const action = String(s.action ?? "?");
+        const rationale = s.rationale ? ` — ${String(s.rationale)}` : "";
+        lines.push(`  • [${cap}] ${action}${rationale}`);
+        const cost = s.cost as Record<string, unknown> | undefined;
+        if (cost?.note) lines.push(`      cost: ${String(cost.note)}`);
+      }
+      break;
+    }
+    case "result": {
+      const steps = Array.isArray(r.steps) ? r.steps : [];
+      lines.push(`Executed plan ${String(r.plan_id ?? "")}:`);
+      for (const s of steps as Array<Record<string, unknown>>) {
+        const status = String(s.status ?? "?");
+        const msg = s.message ? ` — ${String(s.message)}` : "";
+        lines.push(`  • [${String(s.capability ?? "?")}] ${status}${msg}`);
+      }
+      break;
+    }
+    case "error":
+      lines.push(`Agent error: ${String(r.error ?? "unknown error")}`);
+      break;
+    default:
+      lines.push(`Agent returned: ${String(r.kind)}`);
+  }
+  // Always append the raw JSON so the caller can read structured fields
+  // (plan_id, steps, rows, …) it needs to drive the next turn.
+  lines.push("", "Raw result:", JSON.stringify(r, null, 2));
+  return lines.join("\n");
+}
+
+server.registerTool(
+  "agent",
+  {
+    description:
+      "Talk to the Cograph Ask-AI agent — the single conversational front door " +
+      "to a knowledge graph. Send a natural-language message and the agent " +
+      "classifies your intent and either ANSWERS a question directly, asks a " +
+      "CLARIFYing question, or proposes a PLAN of actions (enrich attributes, " +
+      "clean/normalize values, merge duplicates, inspect/extend the ontology). " +
+      "A plan is NOT executed until you confirm it: call this tool again with " +
+      "the returned plan_id as `confirm_plan_id`. Planning is free; any paid " +
+      "step a plan contains (e.g. web enrichment) is authorized server-side at " +
+      "execute time, so confirming honors your tenant's entitlements. Prefer " +
+      "this over the lower-level tools for conversational, multi-step work.",
+    inputSchema: {
+      message: z
+        .string()
+        .optional()
+        .describe(
+          "Your natural-language message to the agent (e.g. 'how many mentors " +
+            "speak Persian?' or 'enrich the company for managers'). Optional " +
+            "when confirm_plan_id is set (a confirm turn carries no new message).",
+        ),
+      kg_name: z
+        .string()
+        .optional()
+        .describe(
+          "Knowledge graph to operate within. Use list_knowledge_graphs to see " +
+            "available KGs.",
+        ),
+      type_name: z
+        .string()
+        .optional()
+        .describe(
+          "Optional active type to scope the turn to (needed for enrich / clean " +
+            "/ dedup planning, e.g. 'Mentor').",
+        ),
+      session_id: z
+        .string()
+        .optional()
+        .describe(
+          "Optional conversation id to keep multi-turn context across calls.",
+        ),
+      confirm_plan_id: z
+        .string()
+        .optional()
+        .describe(
+          "When set, CONFIRM and EXECUTE the previously-proposed plan with this " +
+            "id (the only mutating path) instead of sending a new message. Use " +
+            "the plan_id from a prior 'plan' result.",
+        ),
+    },
+  },
+  async ({ message, kg_name, type_name, session_id, confirm_plan_id }) => {
+    try {
+      const result = await client().agent({
+        message,
+        kgName: kg_name,
+        typeName: type_name,
+        sessionId: session_id,
+        confirmPlanId: confirm_plan_id,
+      });
+      return textResult(describeAgentResult(result));
     } catch (err) {
       return errorResult(err);
     }

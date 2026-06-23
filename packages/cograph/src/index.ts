@@ -3,6 +3,8 @@ export type {
   ClientOptions,
   IngestOptions,
   AskOptions,
+  AgentTurnOptions,
+  AgentResult,
   ResolvedChange,
   OntologyResolveResult,
   OntologyApplyResult,
