@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 
 import structlog
 
+from cograph_client.agent.capabilities.dedup_cap import DedupCapability
 from cograph_client.agent.capabilities.enrich_cap import EnrichCapability
 from cograph_client.agent.capabilities.normalize_cap import NormalizeCapability
 from cograph_client.agent.capabilities.ontology_cap import OntologyCapability
@@ -50,7 +51,7 @@ logger = structlog.stdlib.get_logger("cograph.agent.planner")
 _INTENT_TO_CAPABILITY = {
     "enrich": "enrich",
     "clean": "normalize",
-    "dedup": "dedup",  # A2 — capability not registered yet → clarify
+    "dedup": "dedup",  # registered (DedupCapability) → plans an ER rebuild
     "ontology": "ontology",  # registered (OntologyCapability) → inspect/declare
 }
 
@@ -185,14 +186,15 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
     cap_name = _INTENT_TO_CAPABILITY.get(intent)
     cap = get_capability(cap_name) if cap_name else None
     if cap is None:
-        # Recognized intent but no registered capability (e.g. dedup in A1) → ask
-        # for clarification rather than fail.
+        # Recognized intent but no registered capability (a downstream deployment
+        # may map an intent to a capability it hasn't registered) → ask for
+        # clarification rather than fail.
         return {
             "kind": "clarify",
             "question": (
                 f"I can't yet handle '{intent}' requests. I can answer questions, "
-                "enrich attributes, clean up values, and inspect or extend the "
-                "ontology — what would you like?"
+                "enrich attributes, clean up values, merge duplicates, and inspect "
+                "or extend the ontology — what would you like?"
             ),
         }
 
@@ -307,4 +309,5 @@ def register_default_capabilities() -> None:
     register_capability(QueryCapability())
     register_capability(normalize)
     register_capability(EnrichCapability(normalize=normalize))
+    register_capability(DedupCapability())
     register_capability(OntologyCapability())
