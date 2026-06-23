@@ -30,8 +30,10 @@ import json
 
 import structlog
 
+from cograph_client.agent.capabilities.dedup_cap import DedupCapability
 from cograph_client.agent.capabilities.enrich_cap import EnrichCapability
 from cograph_client.agent.capabilities.normalize_cap import NormalizeCapability
+from cograph_client.agent.capabilities.ontology_cap import OntologyCapability
 from cograph_client.agent.capabilities.query import QueryCapability
 from cograph_client.agent.plan_store import (  # noqa: F401  (re-exported for back-compat)
     InMemoryPlanStore,
@@ -57,8 +59,8 @@ logger = structlog.stdlib.get_logger("cograph.agent.planner")
 _INTENT_TO_CAPABILITY = {
     "enrich": "enrich",
     "clean": "normalize",
-    "dedup": "dedup",  # A2 — capability not registered yet → clarify
-    "ontology": "ontology",  # A2 — not registered yet → clarify
+    "dedup": "dedup",  # registered (DedupCapability) → plans an ER rebuild
+    "ontology": "ontology",  # registered (OntologyCapability) → inspect/declare
 }
 
 
@@ -150,13 +152,15 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
     cap_name = _INTENT_TO_CAPABILITY.get(intent)
     cap = get_capability(cap_name) if cap_name else None
     if cap is None:
-        # Recognized intent but no registered capability (e.g. dedup/ontology in
-        # A1) → ask for clarification rather than fail.
+        # Recognized intent but no registered capability (a downstream deployment
+        # may map an intent to a capability it hasn't registered) → ask for
+        # clarification rather than fail.
         return {
             "kind": "clarify",
             "question": (
                 f"I can't yet handle '{intent}' requests. I can answer questions, "
-                "enrich attributes, and clean up values — what would you like?"
+                "enrich attributes, clean up values, merge duplicates, and inspect "
+                "or extend the ontology — what would you like?"
             ),
         }
 
@@ -170,6 +174,17 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
                 "field/attribute and value). Could you be more specific?"
             ),
         }
+
+    # Read-only answer step: a capability may answer a question-like request
+    # directly (e.g. the ontology capability's INSPECT op renders the schema)
+    # instead of proposing a mutation. Such a step carries action="answer" and an
+    # ``answer_payload``; surface it as {kind:"answer"} (no confirm round-trip),
+    # exactly like the question fast-path. Only a SINGLE no-write answer step
+    # short-circuits — a mutation plan always goes through confirm.
+    if len(steps) == 1 and steps[0].action == "answer":
+        payload = steps[0].params.get("answer_payload")
+        if payload is not None:
+            return {"kind": "answer", **payload}
 
     steps = order_steps(steps)
     plan_id = _new_plan_id()
@@ -265,3 +280,5 @@ def register_default_capabilities() -> None:
     register_capability(QueryCapability())
     register_capability(normalize)
     register_capability(EnrichCapability(normalize=normalize))
+    register_capability(DedupCapability())
+    register_capability(OntologyCapability())
