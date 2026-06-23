@@ -15,27 +15,35 @@ Contract (the single conversational surface):
   execute_plan(plan_id) →
     {kind:"result",  steps:[summaries]}           # the only mutating path
 
-Plan persistence (A1): an in-memory, tenant-scoped store keyed by plan_id —
-the same simplicity tier as :class:`InMemoryJobStore`. Plans do not survive a
-process restart; that's acceptable for A1 (a user confirms within one session).
-A durable store (tenant graph, like NormalizationRuleStore) is the A2 follow-up
-and is noted in the PR.
+Plan persistence (A2, COG-124): a swappable, tenant-scoped store keyed by
+plan_id, mirroring the dual-backend :class:`JobStore` pattern. ``make_plan_store``
+returns a :class:`PostgresPlanStore` when ``settings.database_url`` is set
+(durable, shared across ECS tasks — so a confirm→execute survives a process
+restart or a different task than the one that planned), else an
+:class:`InMemoryPlanStore` (zero-config default). See
+:mod:`cograph_client.agent.plan_store`.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 import structlog
 
 from cograph_client.agent.capabilities.enrich_cap import EnrichCapability
 from cograph_client.agent.capabilities.normalize_cap import NormalizeCapability
 from cograph_client.agent.capabilities.query import QueryCapability
+from cograph_client.agent.plan_store import (  # noqa: F401  (re-exported for back-compat)
+    InMemoryPlanStore,
+    PlanStore,
+    PostgresPlanStore,
+    StoredPlan,
+    get_plan_store,
+    make_plan_store,
+    reset_plan_store,
+)
 from cograph_client.agent.registry import (
     AgentContext,
-    PlanStep,
     get_capabilities,
     get_capability,
     order_steps,
@@ -52,48 +60,6 @@ _INTENT_TO_CAPABILITY = {
     "dedup": "dedup",  # A2 — capability not registered yet → clarify
     "ontology": "ontology",  # A2 — not registered yet → clarify
 }
-
-
-@dataclass
-class StoredPlan:
-    plan_id: str
-    tenant_id: str
-    kg_name: str
-    type_name: str | None
-    message: str
-    steps: list[PlanStep]
-    status: str = "proposed"  # proposed | executing | done | failed
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class InMemoryPlanStore:
-    """Tenant-scoped in-memory plan store (A1). Mirrors InMemoryJobStore."""
-
-    def __init__(self) -> None:
-        self._plans: dict[str, StoredPlan] = {}
-
-    def save(self, plan: StoredPlan) -> None:
-        self._plans[plan.plan_id] = plan
-
-    def get(self, plan_id: str, tenant_id: str) -> StoredPlan | None:
-        p = self._plans.get(plan_id)
-        if p is None or p.tenant_id != tenant_id:
-            return None
-        return p
-
-
-# Module-level singleton store (same pattern as get_job_store()).
-_plan_store = InMemoryPlanStore()
-
-
-def get_plan_store() -> InMemoryPlanStore:
-    return _plan_store
-
-
-def reset_plan_store() -> None:
-    """For tests."""
-    global _plan_store
-    _plan_store = InMemoryPlanStore()
 
 
 _CLASSIFY_SYSTEM = """\
@@ -207,7 +173,8 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
 
     steps = order_steps(steps)
     plan_id = _new_plan_id()
-    _plan_store.save(
+    session_id = (session or {}).get("id")
+    await make_plan_store().save(
         StoredPlan(
             plan_id=plan_id,
             tenant_id=ctx.tenant_id,
@@ -215,6 +182,7 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
             type_name=ctx.type_name,
             message=message,
             steps=steps,
+            session_id=session_id,
         )
     )
     return {
@@ -232,11 +200,13 @@ async def execute_plan(ctx: AgentContext, plan_id: str) -> dict:
     (re-running a done plan re-issues the acks — the underlying applies are
     themselves idempotent / staged).
     """
-    plan = _plan_store.get(plan_id, ctx.tenant_id)
+    store = make_plan_store()
+    plan = await store.get(plan_id, ctx.tenant_id)
     if plan is None:
         return {"kind": "error", "error": "plan not found", "plan_id": plan_id}
 
     plan.status = "executing"
+    await store.save(plan)
     ordered = order_steps(plan.steps)
     summaries: list[dict] = []
     for step in ordered:
@@ -271,6 +241,7 @@ async def execute_plan(ctx: AgentContext, plan_id: str) -> dict:
                 }
             )
     plan.status = "done"
+    await store.save(plan)
     return {"kind": "result", "plan_id": plan_id, "steps": summaries}
 
 
