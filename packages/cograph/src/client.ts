@@ -460,6 +460,43 @@ export class Client {
     return this.request("POST", `${this.base()}/ask`, body, 60_000);
   }
 
+  /**
+   * One turn of the unified Ask-AI agent — the SINGLE conversational surface
+   * (`POST /graphs/{tenant}/agent`, COG-118). Mirrors the HTTP contract exactly:
+   *
+   *  - `confirmPlanId` set → the server runs `execute_plan` (the only mutating
+   *    path) and returns `{kind:"result", steps}`.
+   *  - otherwise → the server runs `planner.handle(message)` and returns one of
+   *    `{kind:"answer"}` / `{kind:"clarify"}` / `{kind:"plan"}`.
+   *
+   * The agent classifies intent server-side and drives the underlying engines
+   * through its capability registry — the client never talks to `/ask`,
+   * `/enrich/*` etc. for an agent turn. ENTITLEMENT for any paid step a plan
+   * contains is enforced server-side at execute time (the same authorization the
+   * direct paid routes apply), so confirming a plan here cannot bypass a gate the
+   * direct path enforces — the gate lives behind the endpoint, not in this client.
+   */
+  async agent(opts: AgentTurnOptions): Promise<AgentResult> {
+    const body: Record<string, unknown> = {
+      message: opts.message ?? "",
+      context: {
+        kg_name: opts.kgName ?? "",
+        type_name: opts.typeName ?? null,
+      },
+    };
+    if (opts.sessionId) body.session_id = opts.sessionId;
+    // confirm.plan_id present → the server routes to execute_plan (mutating).
+    if (opts.confirmPlanId) body.confirm = { plan_id: opts.confirmPlanId };
+    return this.request<AgentResult>(
+      "POST",
+      `${this.base()}/agent`,
+      body,
+      // Generous: a confirmed plan can kick off enrichment/dedup work, and a
+      // question turn runs an LLM round-trip server-side.
+      120_000,
+    );
+  }
+
   /** List the tenants the authenticated user can access (GET /v1/me/tenants).
    *  Keyed by the API key (X-API-Key → user), so it's independent of the active
    *  tenant. Throws CographError with status 501 on deployments without a tenant
@@ -864,4 +901,38 @@ export interface ConflictReview {
   existing_value: string;
   proposed: Verdict;
   decision?: ReviewDecision | null;
+}
+
+// --- Unified Ask-AI agent (COG-118 / COG-125) -------------------------------- #
+
+/** Inputs to {@link Client.agent} — mirror the `/agent` HTTP body. */
+export interface AgentTurnOptions {
+  /** The user's natural-language message. Optional when `confirmPlanId` is set
+   *  (a confirm turn carries no new message). */
+  message?: string;
+  /** Knowledge graph the turn operates within. */
+  kgName?: string;
+  /** Optional active type scope (needed for enrich/clean/dedup planning). */
+  typeName?: string;
+  /** Optional conversation/session id for multi-turn continuity. */
+  sessionId?: string;
+  /** When set, the server CONFIRMS + EXECUTES this previously-proposed plan
+   *  (the only mutating path) instead of classifying a new message. */
+  confirmPlanId?: string;
+}
+
+/**
+ * The kind-tagged result of one agent turn. The server returns exactly one of:
+ *  - `answer`  — a read-only answer (questions; an ontology INSPECT) with SPARQL.
+ *  - `clarify` — the agent needs more detail; ask the user `question`.
+ *  - `plan`    — a proposed (un-executed) plan with `plan_id` + `steps`; confirm
+ *                by calling `agent({ confirmPlanId: plan_id })`.
+ *  - `result`  — the outcome of executing a confirmed plan, per-step.
+ *  - `error`   — e.g. an unknown/expired plan_id on confirm.
+ * Extra fields vary by kind (answer/sparql/rows; question; plan_id/steps;
+ * steps), so this is intentionally open beyond the discriminant.
+ */
+export interface AgentResult {
+  kind: "answer" | "clarify" | "plan" | "result" | "error";
+  [key: string]: unknown;
 }

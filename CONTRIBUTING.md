@@ -26,6 +26,18 @@ The canonical, fuller table with reasoning lives in the parent repo at
 [`docs/oss_proprietary_boundary.md`](https://github.com/git-moeen/cograph/blob/main/docs/oss_proprietary_boundary.md).
 When in doubt, surface the question before writing code.
 
+**Entitlement gating is NOT done in OSS (incl. the MCP server).** The MCP server
+and its `agent` tool are OSS and are advertised freely — planning a turn is free.
+A plan the agent executes may contain a *paid* step (e.g. web enrichment), but the
+authorization for that step is enforced **server-side, behind the HTTP API**, by
+the proprietary backend (a 4xx on `POST /graphs/{tenant}/agent` confirm, the same
+way the direct paid routes are gated). The MCP `agent` tool reaches the backend
+through the exact same authenticated HTTP client (`X-API-Key` → tenant) as every
+other tool, so confirming a plan via the agent **cannot bypass** a gate the direct
+path enforces — there is deliberately no entitlement check to duplicate in OSS
+(per the proprietary list above). Do **not** add billing/entitlement logic here to
+"gate" the agent: that belongs in the parent repo.
+
 **This is mechanically enforced** (MOE-21). Run the same checks CI runs:
 
 ```bash

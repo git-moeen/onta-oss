@@ -29,6 +29,7 @@ npx -y cograph-mcp
 
 ## Tools exposed
 
+- `agent` — the single conversational front door to the Ask-AI agent. Send a natural-language message; the agent classifies intent and either answers a question, asks a clarifying question, or proposes a multi-step plan (enrich attributes, clean/normalize values, merge duplicates, inspect/extend the ontology). A plan is **not executed** until you confirm it by calling `agent` again with the returned `plan_id` as `confirm_plan_id`. Planning is free; any paid step a plan contains (e.g. web enrichment) is authorized server-side at execute time, so confirming honors your tenant's entitlements.
 - `list_knowledge_graphs` — list available KGs and descriptions
 - `ask` — ask a natural language question; returns the answer
 - `ingest_csv` — ingest a CSV file by absolute path into a named KG
