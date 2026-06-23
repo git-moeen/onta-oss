@@ -164,6 +164,96 @@ async def suggest_rules(
     return rules
 
 
+async def suggest_rules_for_predicates(
+    neptune: NeptuneClient,
+    tenant_id: str,
+    kg_name: str,
+    type_name: str,
+    predicate_leaves: list[str],
+) -> list[NormalizationRule]:
+    """Infer rules for ONLY the named predicate(s) of ``type_name``.
+
+    A TARGETED variant of :func:`suggest_rules`: the unified agent must NOT scan
+    every predicate of a type (that is the slow whole-type path that timed out
+    before — COG-118). The agent names the predicate(s) the instruction refers to
+    (e.g. "speaks") and we sample + ask the LLM for just those, reusing the exact
+    same per-predicate machinery (``_sample_values`` / ``_ask_llm`` /
+    ``_rule_from_recommendation``) so there is no logic duplication.
+
+    Matching is by leaf name, case-insensitively, against the type's declared
+    predicates. An unknown leaf is simply skipped (no rule), never an unbounded
+    scan. Returns ``suggested`` rules ranked by confidence (desc); persists
+    nothing (the caller decides).
+    """
+    wanted = {p.strip().lower() for p in predicate_leaves if p and p.strip()}
+    if not wanted:
+        return []
+    declared = await _list_predicates(neptune, tenant_id, type_name)
+    if not declared:
+        return []
+    api_key = _openrouter_key()
+    kg_graph = kg_graph_uri(tenant_id, kg_name)
+    t_uri = type_uri(type_name)
+
+    rules: list[NormalizationRule] = []
+    for pred_uri, target_kind in declared:
+        pred_leaf = _predicate_leaf(pred_uri)
+        if pred_leaf.lower() not in wanted:
+            continue
+        samples = await _sample_values(
+            neptune, kg_graph, t_uri, pred_uri, target_kind
+        )
+        if not samples:
+            continue
+        recommendations = await _ask_llm(
+            api_key, type_name, pred_uri, target_kind, samples
+        )
+        if not recommendations:
+            continue
+        seen_types: set[str] = set()
+        for rec in recommendations:
+            rule = _rule_from_recommendation(
+                rec, kg_name, type_name, pred_leaf, target_kind, samples
+            )
+            if rule is None or rule.rule_type in seen_types:
+                continue
+            seen_types.add(rule.rule_type)
+            rules.append(rule)
+
+    rules.sort(key=lambda r: r.confidence, reverse=True)
+    return rules
+
+
+async def sample_predicate_values(
+    neptune: NeptuneClient,
+    tenant_id: str,
+    kg_name: str,
+    type_name: str,
+    predicate_leaf: str,
+) -> tuple[list[str], str]:
+    """Sample current distinct values for ONE predicate (for cheap composite
+    detection + dry-run previews). Returns ``(samples, target_kind)``.
+
+    Reuses :func:`_list_predicates` + :func:`_sample_values` so the sampling
+    query shape stays identical to inference. ``target_kind`` is "attribute" if
+    the predicate is unknown/declared as an attribute, "relationship" otherwise.
+    A bounded, predicate-targeted read — never a whole-type scan.
+    """
+    leaf = predicate_leaf.strip().lower()
+    if not leaf:
+        return [], "attribute"
+    declared = await _list_predicates(neptune, tenant_id, type_name)
+    kg_graph = kg_graph_uri(tenant_id, kg_name)
+    t_uri = type_uri(type_name)
+    for pred_uri, target_kind in declared:
+        if _predicate_leaf(pred_uri).lower() == leaf:
+            samples = await _sample_values(
+                neptune, kg_graph, t_uri, pred_uri, target_kind
+            )
+            return samples, target_kind
+    return [], "attribute"
+
+
 _SUPPORTED_RULE_TYPES = {"list_explode", "strip_emoji"}
 _DEFAULT_DELIMITERS = [", ", "; ", " / ", " | ", "__"]
 

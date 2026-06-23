@@ -8,7 +8,7 @@ from slowapi.errors import RateLimitExceeded
 
 from cograph_client.api.middleware import RequestLoggingMiddleware
 from cograph_client.api.rate_limit import limiter
-from cograph_client.api.routes import actions, ask, enrich, explore, functions, health, ingest, jobs, knowledge_graphs, lambda_functions, normalize, ontology, query, tenants, triples
+from cograph_client.api.routes import actions, agent, ask, enrich, explore, functions, health, ingest, jobs, knowledge_graphs, lambda_functions, normalize, ontology, query, tenants, triples
 from cograph_client.config import settings
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.logging import setup_logging
@@ -162,8 +162,27 @@ def create_app() -> FastAPI:
     app.include_router(explore.router, tags=["explore"])
     app.include_router(normalize.router, tags=["normalize"])
     app.include_router(tenants.router, tags=["tenants"])
+    app.include_router(agent.router, tags=["agent"])
+    _register_agent_capabilities()
     _load_router_plugins(app)
     return app
+
+
+def _register_agent_capabilities() -> None:
+    """Register the default OSS agent capabilities (query, normalize, enrich).
+
+    The single agent endpoint dispatches through the capability registry, so
+    capabilities must be registered for it to work. Import-safe + idempotent;
+    a proprietary deployment registers additional capabilities the same way a
+    router/enrichment plugin does, with no route change.
+    """
+    try:
+        from cograph_client.agent.planner import register_default_capabilities
+
+        register_default_capabilities()
+        logger.info("agent_capabilities_registered")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("agent_capability_registration_failed", error=str(exc))
 
 
 app = create_app()
