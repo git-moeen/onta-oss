@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 
 import structlog
 
+from cograph_client.agent.capabilities.dedup_cap import DedupCapability
 from cograph_client.agent.capabilities.enrich_cap import EnrichCapability
 from cograph_client.agent.capabilities.normalize_cap import NormalizeCapability
 from cograph_client.agent.capabilities.query import QueryCapability
@@ -49,7 +50,7 @@ logger = structlog.stdlib.get_logger("cograph.agent.planner")
 _INTENT_TO_CAPABILITY = {
     "enrich": "enrich",
     "clean": "normalize",
-    "dedup": "dedup",  # A2 — capability not registered yet → clarify
+    "dedup": "dedup",  # registered (DedupCapability) → plans an ER rebuild
     "ontology": "ontology",  # A2 — not registered yet → clarify
 }
 
@@ -184,13 +185,14 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
     cap_name = _INTENT_TO_CAPABILITY.get(intent)
     cap = get_capability(cap_name) if cap_name else None
     if cap is None:
-        # Recognized intent but no registered capability (e.g. dedup/ontology in
-        # A1) → ask for clarification rather than fail.
+        # Recognized intent but no registered capability (e.g. ontology, still
+        # unregistered in A2) → ask for clarification rather than fail.
         return {
             "kind": "clarify",
             "question": (
                 f"I can't yet handle '{intent}' requests. I can answer questions, "
-                "enrich attributes, and clean up values — what would you like?"
+                "enrich attributes, clean up values, and merge duplicates — what "
+                "would you like?"
             ),
         }
 
@@ -294,3 +296,4 @@ def register_default_capabilities() -> None:
     register_capability(QueryCapability())
     register_capability(normalize)
     register_capability(EnrichCapability(normalize=normalize))
+    register_capability(DedupCapability())
