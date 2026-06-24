@@ -240,7 +240,9 @@ export class Client {
   /** @internal */ pOntologyResolve(): string {
     return `${this.base()}/ontology/resolve`;
   }
-  /** @internal */ pOntologyRecommend(): string {
+  /** @internal Targets the premium ontology-recommender route, mounted only on
+   *  deployments with the proprietary layer — 404s on bare OSS. */
+  pOntologyRecommend(): string {
     return `${this.base()}/ontology/recommend`;
   }
   /** @internal */ pOntologyApply(): string {
@@ -985,7 +987,11 @@ export class Client {
   }
 
   /** Recommend ontology relationships/changes for the active KG
-   *  (`POST /ontology/recommend`). Body shape is passed through unchanged. */
+   *  (`POST /ontology/recommend`). Body shape is passed through unchanged.
+   *
+   *  NOTE: this targets the *premium* ontology-recommender route, which is only
+   *  mounted on deployments carrying the proprietary layer. It 404s on a bare
+   *  OSS deployment. */
   async ontologyRecommend(
     body: Record<string, unknown> = {},
   ): Promise<Record<string, unknown>> {
@@ -1361,7 +1367,9 @@ export class RawApi {
     return this.client.requestRaw("POST", this.client.pOntologyResolve(), { body, ...init });
   }
 
-  /** `POST /graphs/{tenant}/ontology/recommend` — recommend ontology changes. */
+  /** `POST /graphs/{tenant}/ontology/recommend` — recommend ontology changes.
+   *  Premium route: only mounted on deployments with the proprietary layer,
+   *  404s on bare OSS. */
   ontologyRecommend(body: unknown, init?: RawInit): Promise<Response> {
     return this.client.requestRaw("POST", this.client.pOntologyRecommend(), { body, ...init });
   }

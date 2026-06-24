@@ -138,6 +138,28 @@ describe("non-throwing + non-reshaping passthrough", () => {
     const client = makeClient();
     await expect(client.raw.kgs()).rejects.toBeInstanceOf(CographError);
   });
+
+  it("maps an abort/timeout to CographError (no Response to return)", async () => {
+    // When the timeout fires, the AbortController aborts the fetch and the
+    // platform rejects with a DOMException/Error named "AbortError". requestRaw
+    // surfaces that one case as a thrown CographError (there is no Response).
+    const spy = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const signal = init?.signal;
+      throw await new Promise<never>((_resolve, reject) => {
+        const fail = () => {
+          const err = new Error("The operation was aborted");
+          err.name = "AbortError";
+          reject(err);
+        };
+        if (signal?.aborted) fail();
+        else signal?.addEventListener("abort", fail, { once: true });
+      });
+    });
+    vi.stubGlobal("fetch", spy);
+    const client = makeClient();
+    // 0ms timeout → controller aborts on the next tick → fetch rejects AbortError.
+    await expect(client.raw.kgs({ timeoutMs: 0 })).rejects.toBeInstanceOf(CographError);
+  });
 });
 
 describe("canonical paths + methods for every covered op", () => {
