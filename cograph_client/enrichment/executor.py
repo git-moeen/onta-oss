@@ -754,12 +754,18 @@ class EnrichmentExecutor:
             async def process_entity(ent: dict) -> list[RowResult]:
                 results: list[RowResult] = []
                 async with sem:
-                    for attribute in job.attributes:
-                        # Cooperative cancellation
-                        latest = await self._jobs.get(job.id)
-                        if latest and latest.status == JobStatus.cancelled:
-                            return results
+                    # Cooperative cancellation: check ONCE per entity, not once per
+                    # attribute. The per-attribute check meant `len(attributes)`
+                    # job-store reads per entity; under the durable PostgresJobStore
+                    # each is a pooled-connection round-trip, so a wide job fanned
+                    # `WORKER_POOL_SIZE`-way could exhaust the (max_size=10) asyncpg
+                    # pool and stall the next write indefinitely (COG-112). One read
+                    # per entity keeps cancellation responsive without that pressure.
+                    latest = await self._jobs.get(job.id)
+                    if latest and latest.status == JobStatus.cancelled:
+                        return results
 
+                    for attribute in job.attributes:
                         existing = ent["vals"].get(_attr_uri(job.type_name, attribute))
                         attr_strategy = strategy.attributes.get(attribute)
 

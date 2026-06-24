@@ -170,10 +170,17 @@ class _FakeConn:
 
 
 class _AcquireCtx:
-    def __init__(self, conn: _FakeConn):
+    def __init__(self, conn: _FakeConn, pool: "_FakePool", timeout):
         self._conn = conn
+        self._pool = pool
+        self._timeout = timeout
 
     async def __aenter__(self):
+        # Mimic asyncpg: a saturated pool waits up to `timeout`, then raises
+        # asyncio.TimeoutError. The bounded acquire (COG-112) is what converts
+        # that wait from "forever" into a surfaced failure.
+        if self._pool.block_forever:
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=self._timeout)
         return self._conn
 
     async def __aexit__(self, *exc):
@@ -183,18 +190,28 @@ class _AcquireCtx:
 class _FakePool:
     def __init__(self, conn: _FakeConn):
         self._conn = conn
+        # When True, acquire() never hands out a connection (saturated pool) and
+        # relies on the caller's `timeout` to break the wait.
+        self.block_forever = False
+        # Records the `timeout` value passed to each acquire() call so tests can
+        # assert the store bounds its acquires (COG-112).
+        self.acquire_timeouts: list = []
 
-    def acquire(self):
-        return _AcquireCtx(self._conn)
+    def acquire(self, timeout=None):
+        self.acquire_timeouts.append(timeout)
+        return _AcquireCtx(self._conn, self, timeout)
 
 
-def _patch_asyncpg(monkeypatch, conn: _FakeConn):
+def _patch_asyncpg(monkeypatch, conn: _FakeConn) -> "_FakePool":
     import asyncpg
 
+    pool = _FakePool(conn)
+
     async def fake_create_pool(*args, **kwargs):
-        return _FakePool(conn)
+        return pool
 
     monkeypatch.setattr(asyncpg, "create_pool", fake_create_pool)
+    return pool
 
 
 def test_postgres_store_create_runs_ddl_and_insert(monkeypatch):
@@ -290,6 +307,48 @@ def test_postgres_store_update_and_delete(monkeypatch):
     assert any(r[0] == "execute" and "INSERT INTO cograph_jobs" in r[1] for r in rec)
     delete = next(r for r in rec if r[0] == "execute" and "DELETE FROM cograph_jobs" in r[1])
     assert delete[2] == ("job-1",)
+
+
+def test_postgres_store_bounds_acquire_timeout(monkeypatch):
+    """COG-112: the store must pass a finite ``timeout`` to ``pool.acquire`` so a
+    saturated/cold pool fails fast instead of hanging forever. asyncpg's
+    ``acquire(timeout=None)`` waits indefinitely — the executor's first
+    post-select ``jobs.update`` stalled there, with no exception and no
+    completion (the production hang)."""
+    rec: list[tuple] = []
+    conn = _FakeConn(rec)
+    pool = _patch_asyncpg(monkeypatch, conn)
+
+    async def run():
+        store = PostgresJobStore(dsn="postgresql://fake/db", acquire_timeout=7.5)
+        await store.create(_make_job())
+        await store.get("job-1")
+
+    asyncio.run(run())
+
+    # Every acquire (DDL bootstrap + create + get) carried the finite timeout,
+    # never None (the unbounded asyncpg default).
+    assert pool.acquire_timeouts, "expected at least one acquire"
+    assert all(t == 7.5 for t in pool.acquire_timeouts), pool.acquire_timeouts
+    assert None not in pool.acquire_timeouts
+
+
+def test_postgres_store_saturated_pool_raises_not_hangs(monkeypatch):
+    """COG-112 root-cause guard: a saturated pool (acquire can never be granted)
+    must raise ``asyncio.TimeoutError`` within the bound, NOT hang forever. We
+    wrap in ``wait_for(..., 3s)`` so a regression to the unbounded acquire fails
+    the test (timeout) instead of hanging CI."""
+    rec: list[tuple] = []
+    conn = _FakeConn(rec)
+    pool = _patch_asyncpg(monkeypatch, conn)
+    pool.block_forever = True  # connection is never handed out
+
+    async def run():
+        store = PostgresJobStore(dsn="postgresql://fake/db", acquire_timeout=0.2)
+        with pytest.raises(asyncio.TimeoutError):
+            await store.create(_make_job())
+
+    asyncio.run(asyncio.wait_for(run(), timeout=3))
 
 
 @pytest.mark.integration

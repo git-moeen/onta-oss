@@ -1258,6 +1258,81 @@ def test_executor_scope_relationship_selects_only_scoped_entities():
     asyncio.run(run())
 
 
+class _HangingUpdateJobStore(InMemoryJobStore):
+    """A JobStore whose ``update`` simulates a durable backend (PostgresJobStore)
+    whose connection pool can never hand out a connection — exactly the COG-112
+    production failure mode. asyncpg's ``pool.acquire(timeout=None)`` blocks
+    FOREVER when the pool is saturated/cold, so the executor's first post-select
+    ``await self._jobs.update(job)`` stalled with no exception and no completion
+    (selected_count logged, then nothing, no adapter HTTP, no
+    enrichment_job_failed).
+
+    Here ``update`` waits up to ``acquire_timeout`` seconds and then raises
+    ``asyncio.TimeoutError`` — the behavior of a *bounded* acquire (the fix). With
+    ``acquire_timeout=None`` it would hang forever (the unbounded pre-fix
+    behavior), which the ``wait_for`` wrapper turns into a test failure."""
+
+    def __init__(self, acquire_timeout: float | None) -> None:
+        super().__init__()
+        self._acquire_timeout = acquire_timeout
+
+    async def update(self, job):  # type: ignore[override]
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=self._acquire_timeout)
+        await super().update(job)  # unreached when the acquire "times out"
+
+
+def test_executor_post_select_update_failure_does_not_hang():
+    """COG-112 root-cause regression guard. Reproduces the production hang: a
+    scoped enrich selects entities (selected_count logged), then the first
+    post-select ``jobs.update`` cannot get a DB connection. With the bounded
+    acquire that surfaces as ``asyncio.TimeoutError``, which ``run()``'s
+    try/except logs as ``enrichment_job_failed`` and the job ends as
+    ``failed`` — instead of hanging forever.
+
+    The whole ``run()`` is wrapped in ``asyncio.wait_for(..., 5s)`` so a
+    regression to an unbounded acquire (the pre-fix behavior) fails this test
+    with a timeout rather than hanging CI. Before the fix this hung at
+    executor.py's post-select ``await self._jobs.update(job)``; after the fix it
+    finishes (status=failed) well within the bound."""
+
+    async def run():
+        scoped_rows = [
+            {"uri": "https://cograph.tech/entities/Mentor/m1", "label": "Ada", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Mentor/m2", "label": "Grace", "vals": ""},
+        ]
+        neptune, _captured = _capturing_neptune(scoped_rows)
+
+        # Bounded acquire (0.2s) → update raises TimeoutError instead of hanging.
+        store = _HangingUpdateJobStore(acquire_timeout=0.2)
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {("Ada", "bio"): [Verdict(value="Ada bio", confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(
+            type_name="Mentor",
+            attributes=["bio"],
+            scope=EnrichScope(predicate="haslevel", value="Manager"),
+        )
+        # Seed via the in-memory path (bypass the hanging update) so the executor
+        # can read the job back for the failure write.
+        async with store._lock:  # type: ignore[attr-defined]
+            store._jobs[job.id] = job.model_copy(deep=True)  # type: ignore[attr-defined]
+
+        # The whole run must finish within the bound — never hang. (run() swallows
+        # the TimeoutError into status=failed; the inner failure-path update also
+        # raises, but run() guards that too, so run() returns cleanly.)
+        await asyncio.wait_for(executor.run(job, "test-tenant"), timeout=5)
+
+        # The executor never reached the adapter chain — the hang was BEFORE
+        # per-entity processing, so wikidata was never called (matches the
+        # CloudWatch symptom: zero outbound adapter HTTP).
+        assert wikidata.calls == []
+
+    asyncio.run(run())
+
+
 def test_executor_scope_predicate_casing_matches_via_lcase():
     """A mixed-case request predicate (`hasLevel`) selects entities stored under
     a `haslevel` local-name: the generated SELECT LCASEs the predicate
