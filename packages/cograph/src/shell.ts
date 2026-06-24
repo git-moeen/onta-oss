@@ -1,5 +1,6 @@
 import * as readline from "node:readline";
 import { stdin, stdout } from "node:process";
+import { randomUUID } from "node:crypto";
 import {
   Client,
   CographError,
@@ -8,6 +9,7 @@ import {
   type ConflictReview,
   type JobSummary,
 } from "./client.js";
+import { renderAgentResult } from "./agentRender.js";
 import { writeConfig } from "./config.js";
 
 const CYAN = "\x1b[36m";
@@ -61,6 +63,7 @@ function showCommands(): void {
   const rows: Array<[string, string]> = [
     ["/ingest <file> ...", "Ingest a CSV/JSON/text file"],
     ["/ask <question>", "Ask in natural language"],
+    ["/agent <message>", "Unified Ask-AI agent — answers, plans, runs actions"],
     ["/kg list", "List your knowledge graphs"],
     ["/kg switch <name>", "Switch to a different KG"],
     ["/kg create <name>", "Create a new KG and switch to it"],
@@ -280,6 +283,69 @@ async function cmdAsk(
   } catch (err) {
     if (err instanceof CographError) printError(err.message);
     else printError(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * `/agent <message>` — one turn of the unified Ask-AI agent inside the REPL.
+ *
+ * Sends the message (threading the per-session `sessionId` for multi-turn
+ * continuity), renders the kind-tagged response with the shared renderer, and —
+ * because the shell IS interactive — when the response is a `plan`, prompts
+ * `Confirm & run? [y/N]`. On `y` it confirms the plan (the only mutating path)
+ * and renders the `result`. Mirrors the cli.ts agent command, but the confirm
+ * is an inline prompt rather than --yes/--confirm.
+ */
+async function cmdAgent(
+  client: Client,
+  kg: string,
+  rl: readline.Interface,
+  sessionId: string,
+  message: string,
+): Promise<void> {
+  const msg = message.trim();
+  if (!msg) {
+    stdout.write(`  ${YELLOW}Usage:${RESET} /agent <your message>\n`);
+    return;
+  }
+  const context = { kgName: kg, sessionId };
+  const sp = startSpinner("Thinking...");
+  let result;
+  try {
+    result = await client.agent({ message: msg, ...context });
+  } catch (err) {
+    sp.stop();
+    if (err instanceof CographError) printError(err.message);
+    else printError(err instanceof Error ? err.message : String(err));
+    return;
+  }
+  sp.stop();
+  renderAgentResult(result);
+
+  // Only a plan awaits confirmation. Prompt inline; on "y", confirm + execute.
+  if (result.kind === "plan") {
+    const planId =
+      typeof result.plan_id === "string" ? result.plan_id : undefined;
+    if (!planId) return;
+    const ans = (await ask(rl, `  ${YELLOW}Confirm & run?${RESET} [y/N]: `))
+      .trim()
+      .toLowerCase();
+    if (ans !== "y" && ans !== "yes") {
+      stdout.write(`  ${DIM}Not run. Plan ${planId} kept.${RESET}\n`);
+      return;
+    }
+    const sp2 = startSpinner("Running plan...");
+    let executed;
+    try {
+      executed = await client.agent({ confirmPlanId: planId, ...context });
+    } catch (err) {
+      sp2.stop();
+      if (err instanceof CographError) printError(err.message);
+      else printError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    sp2.stop();
+    renderAgentResult(executed);
   }
 }
 
@@ -1026,6 +1092,10 @@ export async function runShell(opts: {
     );
   }
 
+  // One agent session id per shell session — threaded across every /agent turn
+  // for multi-turn continuity (the server keys conversation state on it).
+  const agentSessionId = randomUUID();
+
   let kg = opts.kg;
   if (!kg) {
     const picked = await selectKg(client, rl);
@@ -1090,6 +1160,17 @@ export async function runShell(opts: {
         await cmdAsk(client, kg, line.slice("/ask ".length));
       } else if (line === "/ask") {
         await cmdAsk(client, kg, "");
+      } else if (line.startsWith("/agent ")) {
+        await cmdAgent(
+          client,
+          kg,
+          rl,
+          agentSessionId,
+          line.slice("/agent ".length),
+        );
+        await refresh();
+      } else if (line === "/agent") {
+        await cmdAgent(client, kg, rl, agentSessionId, "");
       } else if (line === "/types" || line.startsWith("/types ")) {
         const query = line === "/types" ? "" : line.slice("/types ".length);
         await cmdTypes(client, kg, query);
@@ -1292,7 +1373,7 @@ export async function runShell(opts: {
         }
       } else if (line.startsWith("/")) {
         stdout.write(
-          `  ${YELLOW}Unknown command.${RESET} Try /ingest, /ask, /kg, /types, /type, /enrich, /login, /status, /reset, /help, /quit\n`,
+          `  ${YELLOW}Unknown command.${RESET} Try /ingest, /ask, /agent, /kg, /types, /type, /enrich, /login, /status, /reset, /help, /quit\n`,
         );
       } else {
         // Bare line — auto-route to /ask
