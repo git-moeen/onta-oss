@@ -192,6 +192,7 @@ describe("canonical paths + methods for every covered op", () => {
       url: `${PREFIX}/enrich/jobs`,
     },
     { name: "enrichJobs", run: (c) => c.raw.enrichJobs(), method: "GET", url: `${PREFIX}/enrich/jobs` },
+    { name: "jobs", run: (c) => c.raw.jobs(), method: "GET", url: `${PREFIX}/jobs` },
     {
       name: "enrichJob",
       run: (c) => c.raw.enrichJob("job 1"),
@@ -378,6 +379,23 @@ describe("missing methods build URLs incl. query params + encoding", () => {
       expect(calls[0]!.init.method).toBe("POST");
       expect(calls[0]!.url).toBe(`${PREFIX}/normalize/rules/${ENC("r/1")}/${action}`);
       vi.unstubAllGlobals();
+    }
+  });
+
+  it("jobs → GET /jobs?category when filtered, no query when not", async () => {
+    {
+      const { calls } = installFetch(new Response("[]", { status: 200 }));
+      await makeClient().raw.jobs({ category: "dedupe" });
+      const url = new URL(calls[0]!.url);
+      expect(calls[0]!.init.method).toBe("GET");
+      expect(url.pathname.endsWith("/jobs")).toBe(true);
+      expect(url.searchParams.get("category")).toBe("dedupe");
+    }
+    vi.unstubAllGlobals();
+    {
+      const { calls } = installFetch(new Response("[]", { status: 200 }));
+      await makeClient().raw.jobs();
+      expect(calls[0]!.url).toBe(`${PREFIX}/jobs`);
     }
   });
 

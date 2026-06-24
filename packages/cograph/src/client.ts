@@ -248,6 +248,11 @@ export class Client {
   /** @internal */ pOntologyApply(): string {
     return `${this.base()}/ontology/apply`;
   }
+  /** @internal Unified jobs list (dedupe + enrichment + reconciliation),
+   *  newest first. Optional `?category=` filter is baked into `query`. */
+  pJobs(query?: string): string {
+    return `${this.base()}/jobs${query ?? ""}`;
+  }
   /** @internal */ pKgs(): string {
     return `${this.base()}/kgs`;
   }
@@ -794,6 +799,27 @@ export class Client {
     return Array.isArray(data) ? (data as JobSummary[]) : [];
   }
 
+  /**
+   * List ALL of a tenant's tracked jobs — dedupe, enrichment AND reconciliation
+   * — newest first (`GET /graphs/{tenant}/jobs`, COG-101). This is the unified
+   * feed the Jobs page renders; contrast {@link enrichJobs}, which lists only
+   * enrichment jobs (`/enrich/jobs`). Pass `category` to filter to one kind.
+   * Each item carries the unified summary fields (category, trigger, last_run,
+   * next_run, cost(+note), status, progress_pct).
+   */
+  async jobs(opts: { category?: JobCategory } = {}): Promise<JobSummary[]> {
+    const qs = opts.category
+      ? `?category=${encodeURIComponent(opts.category)}`
+      : "";
+    const data = await this.request<unknown>(
+      "GET",
+      this.pJobs(qs),
+      undefined,
+      15_000,
+    );
+    return Array.isArray(data) ? (data as JobSummary[]) : [];
+  }
+
   /** Fetch a single enrichment job (with truncated results). */
   async enrichJob(jobId: string): Promise<EnrichJob> {
     return this.request<EnrichJob>(
@@ -1097,6 +1123,12 @@ export type JobStatus =
   | "applied"
   | "cancelled"
   | "failed";
+/** The kind of work a tracked job performs — the unified `/jobs` feed spans all
+ *  three. Existing enrichment jobs default to `enrichment` server-side. */
+export type JobCategory = "dedupe" | "enrichment" | "reconciliation";
+/** How a job was kicked off. Today everything is `manual` (a user clicked an
+ *  action); `scheduled`/`webhook` are reserved for future automation. */
+export type JobTrigger = "manual" | "scheduled" | "webhook";
 export type ConflictPolicy = "skip" | "verify" | "overwrite" | "stage";
 export type RowAction =
   | "filled"
@@ -1164,6 +1196,17 @@ export interface JobSummary {
   conflict_policy: ConflictPolicy;
   confidence_min: number;
   error?: string | null;
+  // COG-101 unified-jobs fields. Present on the GET /jobs summary across all
+  // categories; optional because the same shape also models a plain enrichment
+  // job (which predates these fields and defaults them server-side).
+  category?: JobCategory;
+  trigger?: JobTrigger;
+  last_run?: string | null;
+  next_run?: string | null;
+  cost?: number | null;
+  cost_note?: string | null;
+  /** Derived 0-100 completion percentage from progress.processed/total. */
+  progress_pct?: number;
 }
 
 export interface EnrichJob extends JobSummary {
@@ -1333,6 +1376,15 @@ export class RawApi {
   /** `GET /graphs/{tenant}/enrich/jobs` — list recent enrichment jobs. */
   enrichJobs(init?: RawInit): Promise<Response> {
     return this.client.requestRaw("GET", this.client.pEnrichJobs(), init);
+  }
+
+  /** `GET /graphs/{tenant}/jobs?category` — unified jobs list across ALL
+   *  categories (dedupe + enrichment + reconciliation), newest first. */
+  jobs(opts: { category?: string } = {}, init?: RawInit): Promise<Response> {
+    const qs = opts.category
+      ? `?category=${encodeURIComponent(opts.category)}`
+      : "";
+    return this.client.requestRaw("GET", this.client.pJobs(qs), init);
   }
 
   /** `GET /graphs/{tenant}/enrich/jobs/{id}` — fetch a single job. */
