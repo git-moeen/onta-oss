@@ -3,7 +3,11 @@
   "compilerOptions": {
     "outDir": "./dist",
     "rootDir": "./src",
-    "types": ["node"]
+    "types": ["node"],
+    // Keep `@internal` members (the canonical path-builders, which must be
+    // non-`private` so `RawApi` can share them) out of the published .d.ts —
+    // they are not part of the supported public SDK surface.
+    "stripInternal": true
   },
   "include": ["src/**/*"]
 }

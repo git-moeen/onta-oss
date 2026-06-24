@@ -20,6 +20,9 @@
   ],
   "scripts": {
     "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "prepack": "node ../../scripts/chmod-bin.js packages/cograph/dist/cli.js"
   },
   "keywords": [

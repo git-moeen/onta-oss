@@ -161,6 +161,17 @@ export class Client {
   baseUrl: string;
   tenant: string;
 
+  /**
+   * Raw / passthrough API — one method per canonical backend operation, with
+   * the path encoded inside the SDK. Each method returns the backend
+   * {@link Response} VERBATIM: it does NOT throw on non-2xx and does NOT reshape
+   * the body. This is the seam the webapp's proxy layer adopts so per-operation
+   * paths live in one place (here) instead of being hand-rolled at each call
+   * site. See {@link RawApi}. The typed methods on this class (which throw on
+   * non-2xx and reshape some payloads) are left unchanged — this is additive.
+   */
+  readonly raw: RawApi;
+
   constructor(opts: ClientOptions = {}) {
     // Resolution order for each field: explicit opts → env var → ~/.cograph/config.json
     // (written by `cograph login`) → built-in default. Reading the config eagerly
@@ -171,6 +182,7 @@ export class Client {
       opts.baseUrl ?? envVar("API_URL") ?? cfg.apiUrl ?? "https://api.cograph.cloud";
     this.baseUrl = url.replace(/\/+$/, "");
     this.tenant = opts.tenant ?? envVar("TENANT") ?? cfg.tenant ?? "demo-tenant";
+    this.raw = new RawApi(this);
   }
 
   private headers(): Record<string, string> {
@@ -181,6 +193,150 @@ export class Client {
 
   private base(): string {
     return `${this.baseUrl}/graphs/${this.tenant}`;
+  }
+
+  // --- Path builders -------------------------------------------------------- #
+  // SINGLE source of truth for every canonical backend path. Both the raw API
+  // and the new typed parsed methods build URLs through these, so a path lives
+  // in exactly one place. Tenant-scoped paths hang off `base()`
+  // (`{baseUrl}/graphs/{tenant}`); the handful of account-level paths
+  // (e.g. tenant CRUD) hang off `baseUrl` directly.
+  //
+  // These are marked `@internal` (not part of the public SDK surface) but are
+  // not `private`, so the sibling {@link RawApi} can build the same canonical
+  // paths without duplicating them.
+
+  /** @internal */
+  pAgent(): string {
+    return `${this.base()}/agent`;
+  }
+  /** @internal */ pAsk(): string {
+    return `${this.base()}/ask`;
+  }
+  /** @internal */ pIngest(): string {
+    return `${this.base()}/ingest`;
+  }
+  /** @internal */ pIngestCsvSchema(): string {
+    return `${this.base()}/ingest/csv/schema`;
+  }
+  /** @internal */ pIngestCsvRows(): string {
+    return `${this.base()}/ingest/csv/rows`;
+  }
+  /** @internal */ pEnrichJobs(): string {
+    return `${this.base()}/enrich/jobs`;
+  }
+  /** @internal */ pEnrichJob(jobId: string): string {
+    return `${this.base()}/enrich/jobs/${encodeURIComponent(jobId)}`;
+  }
+  /** @internal */ pEnrichJobConflicts(jobId: string): string {
+    return `${this.pEnrichJob(jobId)}/conflicts`;
+  }
+  /** @internal */ pEnrichJobApply(jobId: string): string {
+    return `${this.pEnrichJob(jobId)}/apply`;
+  }
+  /** @internal */ pOntologyTypes(): string {
+    return `${this.base()}/ontology/types`;
+  }
+  /** @internal */ pOntologyResolve(): string {
+    return `${this.base()}/ontology/resolve`;
+  }
+  /** @internal Targets the premium ontology-recommender route, mounted only on
+   *  deployments with the proprietary layer — 404s on bare OSS. */
+  pOntologyRecommend(): string {
+    return `${this.base()}/ontology/recommend`;
+  }
+  /** @internal */ pOntologyApply(): string {
+    return `${this.base()}/ontology/apply`;
+  }
+  /** @internal */ pKgs(): string {
+    return `${this.base()}/kgs`;
+  }
+  /** @internal */ pKg(name: string): string {
+    return `${this.base()}/kgs/${encodeURIComponent(name)}`;
+  }
+  /** @internal */ pTypeCounts(kg: string): string {
+    return `${this.pKg(kg)}/type-counts`;
+  }
+  /** @internal */ pExploreSummary(kg: string, typeName: string): string {
+    return `${this.base()}/explore/kgs/${encodeURIComponent(kg)}/types/${encodeURIComponent(typeName)}/summary`;
+  }
+  /** @internal */ pExploreRecords(kg: string, typeName: string, query?: string): string {
+    return `${this.base()}/explore/kgs/${encodeURIComponent(kg)}/types/${encodeURIComponent(typeName)}/records${query ?? ""}`;
+  }
+  /** @internal */ pExploreTypeEdges(kg: string): string {
+    return `${this.base()}/explore/kgs/${encodeURIComponent(kg)}/type-edges`;
+  }
+  /** @internal */ pExploreSearch(query: string): string {
+    return `${this.base()}/explore/search${query}`;
+  }
+  /** @internal */ pNormalizeSuggest(query: string): string {
+    return `${this.base()}/normalize/suggest${query}`;
+  }
+  /** @internal */ pNormalizeRules(query?: string): string {
+    return `${this.base()}/normalize/rules${query ?? ""}`;
+  }
+  /** @internal */ pNormalizeRule(ruleId: string, action: "confirm" | "reject" | "apply"): string {
+    return `${this.base()}/normalize/rules/${encodeURIComponent(ruleId)}/${action}`;
+  }
+  /** @internal */ pTenants(): string {
+    return `${this.baseUrl}/v1/me/tenants`;
+  }
+  /** @internal */ pTenant(tenantId: string): string {
+    return `${this.baseUrl}/v1/me/tenants/${encodeURIComponent(tenantId)}`;
+  }
+
+  /**
+   * Low-level passthrough request. Centralizes the absolute URL (already built
+   * by a path-builder, so it carries the base URL + `/graphs/{tenant}` prefix),
+   * the `X-API-Key` header, JSON content-type, body stringification, and a
+   * timeout/abort — then returns the backend {@link Response} UNCHANGED.
+   *
+   * Unlike {@link request}, this does NOT inspect `res.ok` and does NOT parse or
+   * reshape the body. A 4xx/5xx comes back as a resolved `Response` (the caller
+   * reads `.status`/`.headers`/`.body`), NOT a thrown {@link CographError}. The
+   * only rejection paths are a genuine network failure or a timeout abort —
+   * exactly the cases where there is no HTTP response to hand back.
+   *
+   * `init.headers` is merged last so a caller can add/override headers; `init.body`,
+   * when a non-string is passed, is JSON-stringified for convenience.
+   */
+  async requestRaw(
+    method: string,
+    path: string,
+    init: { body?: unknown; headers?: Record<string, string>; timeoutMs?: number } = {},
+  ): Promise<Response> {
+    const timeoutMs = init.timeoutMs ?? 120_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    // Always a string (or undefined): we stringify non-string bodies here, so we
+    // never depend on the DOM `BodyInit` type (this package builds with the Node
+    // lib only, no `dom` lib).
+    let body: string | undefined;
+    if (init.body !== undefined) {
+      body = typeof init.body === "string" ? init.body : JSON.stringify(init.body);
+    }
+
+    try {
+      return await fetch(path, {
+        method,
+        headers: { ...this.headers(), ...(init.headers ?? {}) },
+        body,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      // A network error or timeout abort means there is NO Response to return,
+      // so this is the one case we surface as a thrown error. A non-2xx HTTP
+      // status is NOT an error here — it resolves above as a Response.
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new CographError(`Request to ${path} timed out after ${timeoutMs}ms`);
+      }
+      throw new CographError(
+        `Network error contacting ${path}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -720,11 +876,131 @@ export class Client {
     const qs = new URLSearchParams({ kg, q, kind }).toString();
     const data = await this.request<unknown>(
       "GET",
-      `${this.base()}/explore/search?${qs}`,
+      this.pExploreSearch(`?${qs}`),
       undefined,
       15_000,
     );
     return Array.isArray(data) ? (data as Array<Record<string, unknown>>) : [];
+  }
+
+  // --- New typed methods (COG-128) ------------------------------------------ #
+  // Parsed/throwing variants of the previously-MISSING ops, sharing the same
+  // path-builders as the raw API. These follow the existing typed-method
+  // contract (throw on non-2xx, light reshape) — the raw equivalents under
+  // `client.raw.*` are the non-throwing, non-reshaping passthrough versions.
+
+  /**
+   * One page of entity instances of a type for the Explorer Data table
+   * (`GET /explore/kgs/{kg}/types/{type}/records`). Keyset-paginated by entity
+   * URI: pass the previous page's `next_cursor` as `cursor`. `limit` is clamped
+   * server-side to 1..200 (default 50).
+   */
+  async exploreRecords(
+    kg: string,
+    typeName: string,
+    opts: { limit?: number; cursor?: string } = {},
+  ): Promise<TypeRecordsPage> {
+    const qs = new URLSearchParams();
+    if (opts.limit != null) qs.set("limit", String(opts.limit));
+    if (opts.cursor) qs.set("cursor", opts.cursor);
+    const query = qs.toString() ? `?${qs.toString()}` : "";
+    return this.request<TypeRecordsPage>(
+      "GET",
+      this.pExploreRecords(kg, typeName, query),
+      undefined,
+      30_000,
+    );
+  }
+
+  /** Undirected type→type edges for the Explorer overview graph
+   *  (`GET /explore/kgs/{kg}/type-edges`). Returns `[{source, target, weight}]`. */
+  async exploreTypeEdges(kg: string): Promise<TypeEdge[]> {
+    const data = await this.request<unknown>(
+      "GET",
+      this.pExploreTypeEdges(kg),
+      undefined,
+      30_000,
+    );
+    return Array.isArray(data) ? (data as TypeEdge[]) : [];
+  }
+
+  /** Infer + persist normalization rules for a type's predicates, returned ranked
+   *  by confidence desc (`POST /normalize/suggest?kg&type`). */
+  async normalizeSuggest(kg: string, type: string): Promise<NormalizationRule[]> {
+    const qs = new URLSearchParams({ kg, type }).toString();
+    const data = await this.request<unknown>(
+      "POST",
+      this.pNormalizeSuggest(`?${qs}`),
+      undefined,
+      60_000,
+    );
+    return Array.isArray(data) ? (data as NormalizationRule[]) : [];
+  }
+
+  /** List stored normalization rules, optionally filtered by KG and/or status
+   *  (`GET /normalize/rules?kg&status`). */
+  async normalizeRules(
+    opts: { kg?: string; status?: string } = {},
+  ): Promise<NormalizationRule[]> {
+    const qs = new URLSearchParams();
+    if (opts.kg) qs.set("kg", opts.kg);
+    if (opts.status) qs.set("status", opts.status);
+    const query = qs.toString() ? `?${qs.toString()}` : "";
+    const data = await this.request<unknown>(
+      "GET",
+      this.pNormalizeRules(query),
+      undefined,
+      15_000,
+    );
+    return Array.isArray(data) ? (data as NormalizationRule[]) : [];
+  }
+
+  /** Confirm a suggested normalization rule (`POST /normalize/rules/{id}/confirm`). */
+  async normalizeConfirmRule(ruleId: string): Promise<NormalizationRule> {
+    return this.request<NormalizationRule>(
+      "POST",
+      this.pNormalizeRule(ruleId, "confirm"),
+      undefined,
+      15_000,
+    );
+  }
+
+  /** Reject a suggested normalization rule (`POST /normalize/rules/{id}/reject`). */
+  async normalizeRejectRule(ruleId: string): Promise<NormalizationRule> {
+    return this.request<NormalizationRule>(
+      "POST",
+      this.pNormalizeRule(ruleId, "reject"),
+      undefined,
+      15_000,
+    );
+  }
+
+  /** Apply a confirmed normalization rule in the background; the server acks 202
+   *  (`POST /normalize/rules/{id}/apply`). */
+  async normalizeApplyRule(ruleId: string): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      "POST",
+      this.pNormalizeRule(ruleId, "apply"),
+      {},
+      60_000,
+    );
+  }
+
+  /** Recommend ontology relationships/changes for the active KG
+   *  (`POST /ontology/recommend`). Body shape is passed through unchanged.
+   *
+   *  NOTE: this targets the *premium* ontology-recommender route, which is only
+   *  mounted on deployments carrying the proprietary layer. It 404s on a bare
+   *  OSS deployment. */
+  async ontologyRecommend(
+    body: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      "POST",
+      this.pOntologyRecommend(),
+      body,
+      60_000,
+    );
   }
 }
 
@@ -935,4 +1211,292 @@ export interface AgentTurnOptions {
 export interface AgentResult {
   kind: "answer" | "clarify" | "plan" | "result" | "error";
   [key: string]: unknown;
+}
+
+// --- New typed shapes (COG-128) ---------------------------------------------- #
+
+/** One row in the Explorer Data table — an entity instance with its attribute
+ *  values. `id` is the entity URI; `name` is the display name; the remaining
+ *  keys are per-attribute values (all stringly-typed for display). */
+export interface TypeRecord {
+  id: string;
+  name: string;
+  [attr: string]: string;
+}
+
+/** A page of {@link TypeRecord}s returned by {@link Client.exploreRecords}.
+ *  `next_cursor` is the last entity URI of this page; pass it back as `cursor`
+ *  to fetch the following page, or `null` when there are no more rows. */
+export interface TypeRecordsPage {
+  columns: string[];
+  rows: TypeRecord[];
+  total: number;
+  next_cursor: string | null;
+}
+
+/** An undirected type→type edge in the Explorer overview graph, weighted by the
+ *  number of instance relationships it summarizes. */
+export interface TypeEdge {
+  source: string;
+  target: string;
+  weight: number;
+}
+
+/** A stored normalization rule (suggested / confirmed / rejected / applied).
+ *  Open beyond the documented fields because the rule's `params` shape varies by
+ *  `rule_type` (e.g. `strip_emoji`, `list_explode`). */
+export interface NormalizationRule {
+  id: string;
+  kg_name: string;
+  type_name: string;
+  predicate: string;
+  rule_type: string;
+  target_kind?: string;
+  params?: Record<string, unknown>;
+  confidence?: number;
+  rationale?: string;
+  status: "suggested" | "confirmed" | "rejected" | "applied" | string;
+  created_at?: string;
+  applied_at?: string | null;
+  [key: string]: unknown;
+}
+
+// --- Raw / passthrough API (COG-128) ----------------------------------------- #
+
+/**
+ * Raw / passthrough surface — reached via {@link Client.raw}. Each method maps
+ * to ONE canonical backend operation, builds the path internally (callers pass
+ * NO path string), and returns the backend {@link Response} VERBATIM:
+ *
+ *  - it does NOT throw on a non-2xx status (a 404/500 resolves as a `Response`
+ *    whose `.status` the caller inspects — contrast the typed methods, which
+ *    throw {@link CographError}); and
+ *  - it does NOT parse or reshape the body (the caller gets the unread stream;
+ *    contrast e.g. {@link Client.listKgs}, which unwraps `{kgs:[]}`).
+ *
+ * Every method funnels through {@link Client.requestRaw}, so the base URL,
+ * `X-API-Key`, `/graphs/{tenant}` prefix, JSON content-type and timeout are
+ * centralized in exactly one place. The only rejection paths are a network
+ * failure or a timeout — the cases where there is no HTTP response to return.
+ *
+ * @example
+ * ```ts
+ * const client = new Client({ apiKey, tenant });
+ * // Webapp proxy pattern: forward the backend response 1:1, no reshaping.
+ * const res = await client.raw.enrichJobs(); // GET …/enrich/jobs
+ * return new Response(res.body, { status: res.status, headers: res.headers });
+ *
+ * // A non-2xx is a Response, not a throw:
+ * const r = await client.raw.enrichJob("does-not-exist");
+ * if (r.status === 404) { ... }            // no try/catch needed
+ * ```
+ */
+export class RawApi {
+  constructor(private readonly client: Client) {}
+
+  // -- agent / ask --------------------------------------------------------- #
+
+  /** `POST /graphs/{tenant}/agent` — one turn of the unified Ask-AI agent. */
+  agent(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pAgent(), { body, ...init });
+  }
+
+  /** `POST /graphs/{tenant}/ask` — natural-language question. */
+  ask(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pAsk(), { body, ...init });
+  }
+
+  // -- ingest -------------------------------------------------------------- #
+
+  /** `POST /graphs/{tenant}/ingest` — ingest text/json (or csv) content. */
+  ingest(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pIngest(), { body, ...init });
+  }
+
+  /** `POST /graphs/{tenant}/ingest/csv/schema` — infer a CSV schema mapping. */
+  ingestCsvSchema(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pIngestCsvSchema(), { body, ...init });
+  }
+
+  /** `POST /graphs/{tenant}/ingest/csv/rows` — write a batch of mapped rows. */
+  ingestCsvRows(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pIngestCsvRows(), { body, ...init });
+  }
+
+  // -- enrich jobs --------------------------------------------------------- #
+
+  /** `POST /graphs/{tenant}/enrich/jobs` — plan + run an enrichment job. */
+  enrichCreateJob(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pEnrichJobs(), { body, ...init });
+  }
+
+  /** `GET /graphs/{tenant}/enrich/jobs` — list recent enrichment jobs. */
+  enrichJobs(init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pEnrichJobs(), init);
+  }
+
+  /** `GET /graphs/{tenant}/enrich/jobs/{id}` — fetch a single job. */
+  enrichJob(jobId: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pEnrichJob(jobId), init);
+  }
+
+  /** `GET /graphs/{tenant}/enrich/jobs/{id}/conflicts` — conflict review queue. */
+  enrichConflicts(jobId: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pEnrichJobConflicts(jobId), init);
+  }
+
+  /** `POST /graphs/{tenant}/enrich/jobs/{id}/apply` — apply review decisions. */
+  enrichApply(jobId: string, body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pEnrichJobApply(jobId), { body, ...init });
+  }
+
+  /** `DELETE /graphs/{tenant}/enrich/jobs/{id}` — cancel a job. */
+  enrichCancel(jobId: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("DELETE", this.client.pEnrichJob(jobId), init);
+  }
+
+  // -- ontology ------------------------------------------------------------ #
+
+  /** `GET /graphs/{tenant}/ontology/types` — list ontology types. */
+  ontologyTypes(init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pOntologyTypes(), init);
+  }
+
+  /** `POST /graphs/{tenant}/ontology/resolve` — resolve an NL ontology change. */
+  ontologyResolve(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pOntologyResolve(), { body, ...init });
+  }
+
+  /** `POST /graphs/{tenant}/ontology/recommend` — recommend ontology changes.
+   *  Premium route: only mounted on deployments with the proprietary layer,
+   *  404s on bare OSS. */
+  ontologyRecommend(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pOntologyRecommend(), { body, ...init });
+  }
+
+  /** `POST /graphs/{tenant}/ontology/apply` — apply one resolved change. */
+  ontologyApply(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pOntologyApply(), { body, ...init });
+  }
+
+  // -- knowledge graphs ---------------------------------------------------- #
+
+  /** `GET /graphs/{tenant}/kgs` — list knowledge graphs. */
+  kgs(init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pKgs(), init);
+  }
+
+  /** `POST /graphs/{tenant}/kgs` — create a knowledge graph. */
+  createKg(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pKgs(), { body, ...init });
+  }
+
+  /** `DELETE /graphs/{tenant}/kgs/{name}` — delete a knowledge graph. */
+  deleteKg(name: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("DELETE", this.client.pKg(name), init);
+  }
+
+  // -- explore ------------------------------------------------------------- #
+
+  /** `GET /graphs/{tenant}/explore/kgs/{kg}/types/{type}/summary`. */
+  exploreSummary(kg: string, typeName: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pExploreSummary(kg, typeName), init);
+  }
+
+  /** `GET /graphs/{tenant}/explore/kgs/{kg}/types/{type}/records?limit&cursor`. */
+  exploreRecords(
+    kg: string,
+    typeName: string,
+    opts: { limit?: number; cursor?: string } = {},
+    init?: RawInit,
+  ): Promise<Response> {
+    const qs = new URLSearchParams();
+    if (opts.limit != null) qs.set("limit", String(opts.limit));
+    if (opts.cursor) qs.set("cursor", opts.cursor);
+    const query = qs.toString() ? `?${qs.toString()}` : "";
+    return this.client.requestRaw("GET", this.client.pExploreRecords(kg, typeName, query), init);
+  }
+
+  /** `GET /graphs/{tenant}/explore/kgs/{kg}/type-edges`. */
+  exploreTypeEdges(kg: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pExploreTypeEdges(kg), init);
+  }
+
+  /** `GET /graphs/{tenant}/kgs/{kg}/type-counts`. */
+  typeCounts(kg: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pTypeCounts(kg), init);
+  }
+
+  /** `GET /graphs/{tenant}/explore/search?kg&q&kind`. */
+  exploreSearch(
+    kg: string,
+    q: string,
+    kind: "type" | "attr" = "type",
+    init?: RawInit,
+  ): Promise<Response> {
+    const qs = new URLSearchParams({ kg, q, kind }).toString();
+    return this.client.requestRaw("GET", this.client.pExploreSearch(`?${qs}`), init);
+  }
+
+  // -- normalize ----------------------------------------------------------- #
+
+  /** `POST /graphs/{tenant}/normalize/suggest?kg&type` — infer + persist rules. */
+  normalizeSuggest(kg: string, type: string, init?: RawInit): Promise<Response> {
+    const qs = new URLSearchParams({ kg, type }).toString();
+    return this.client.requestRaw("POST", this.client.pNormalizeSuggest(`?${qs}`), init);
+  }
+
+  /** `GET /graphs/{tenant}/normalize/rules?kg&status` — list stored rules. */
+  normalizeRules(opts: { kg?: string; status?: string } = {}, init?: RawInit): Promise<Response> {
+    const qs = new URLSearchParams();
+    if (opts.kg) qs.set("kg", opts.kg);
+    if (opts.status) qs.set("status", opts.status);
+    const query = qs.toString() ? `?${qs.toString()}` : "";
+    return this.client.requestRaw("GET", this.client.pNormalizeRules(query), init);
+  }
+
+  /** `POST /graphs/{tenant}/normalize/rules` — create a user-authored rule. */
+  normalizeCreateRule(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pNormalizeRules(), { body, ...init });
+  }
+
+  /** `POST /graphs/{tenant}/normalize/rules/{id}/confirm`. */
+  normalizeConfirmRule(ruleId: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pNormalizeRule(ruleId, "confirm"), init);
+  }
+
+  /** `POST /graphs/{tenant}/normalize/rules/{id}/reject`. */
+  normalizeRejectRule(ruleId: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pNormalizeRule(ruleId, "reject"), init);
+  }
+
+  /** `POST /graphs/{tenant}/normalize/rules/{id}/apply`. */
+  normalizeApplyRule(ruleId: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pNormalizeRule(ruleId, "apply"), init);
+  }
+
+  // -- tenants (account-level, NOT tenant-scoped) -------------------------- #
+
+  /** `POST /v1/me/tenants` — create/grant a tenant for the authed user. */
+  createTenant(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pTenants(), { body, ...init });
+  }
+
+  /** `DELETE /v1/me/tenants/{id}` — remove a tenant grant. */
+  deleteTenant(tenantId: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("DELETE", this.client.pTenant(tenantId), init);
+  }
+
+  /** `GET /v1/me/tenants` — list tenants the authed user can access. */
+  tenants(init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pTenants(), init);
+  }
+}
+
+/** Per-call overrides for a {@link RawApi} method — extra/override headers and a
+ *  custom timeout. A `body` here is ignored by methods that take an explicit
+ *  body argument (they set it themselves). */
+export interface RawInit {
+  headers?: Record<string, string>;
+  timeoutMs?: number;
 }

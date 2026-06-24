@@ -1,4 +1,4 @@
-export { Client, CographError } from "./client.js";
+export { Client, CographError, RawApi } from "./client.js";
 export type {
   ClientOptions,
   IngestOptions,
@@ -21,4 +21,10 @@ export type {
   ConflictPolicy,
   RowAction,
   ReviewDecision,
+  // COG-128 — raw/passthrough API + newly-added typed shapes
+  RawInit,
+  TypeRecord,
+  TypeRecordsPage,
+  TypeEdge,
+  NormalizationRule,
 } from "./client.js";

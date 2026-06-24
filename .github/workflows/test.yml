@@ -33,3 +33,26 @@ jobs:
           OMNIX_API_KEYS: '{"test-key": "test-tenant"}'
           OMNIX_NEPTUNE_ENDPOINT: "http://fake-neptune:8182"
           PYTHONPATH: ${{ github.workspace }}
+
+  # TS SDK (packages/cograph) — typecheck, build, and unit tests (vitest).
+  ts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck --workspace packages/cograph
+
+      - name: Build all packages
+        run: npm run build --workspaces
+
+      - name: Run TS tests
+        run: npm test --workspaces --if-present

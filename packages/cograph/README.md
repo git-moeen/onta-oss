@@ -120,8 +120,40 @@ new Client({
 - `ontologyApply(proposal)` — confirm and commit a single `ResolvedChange` from `ontologyResolve`'s `proposals`. Pass the object through unchanged; returns `{ applied, operations, summary }`.
 - `typeCounts(kg)` — `[{ name, entity_count }]` for the given KG, sorted desc. Powers `/types`.
 - `typeUsage(kg, name, { includeSystem? })` — full breakdown for one type: attributes (with usage counts), relationships, and 3 sample entities. Powers `/type`. System predicates filtered by default.
+- `exploreRecords(kg, type, { limit?, cursor? })` — one keyset-paginated page of entity instances (`{ columns, rows, total, next_cursor }`).
+- `exploreTypeEdges(kg)` — undirected type→type edges for an overview graph (`[{ source, target, weight }]`).
+- `normalizeSuggest(kg, type)`, `normalizeRules({ kg?, status? })`, `normalizeConfirmRule(id)`, `normalizeRejectRule(id)`, `normalizeApplyRule(id)` — inferred-normalization rule lifecycle.
+- `ontologyRecommend(body?)` — recommend ontology relationships/changes for a KG.
 
 All errors throw `CographError`.
+
+### Raw / passthrough API (`client.raw.*`)
+
+Every method above throws on a non-2xx status and some reshape the payload
+(e.g. `listKgs()` unwraps `{ kgs: [] }`). When you instead want the backend
+`Response` **verbatim** — to forward it 1:1 (e.g. from a web proxy route) or to
+branch on `status` without a `try/catch` — use the `raw` namespace. Each raw
+method maps to one canonical operation with the path encoded inside the SDK, so
+callers pass **no path string**:
+
+```ts
+const client = new Client({ apiKey, tenant });
+
+// Forward the backend response unchanged from a proxy:
+const res = await client.raw.enrichJobs();          // GET …/enrich/jobs
+return new Response(res.body, { status: res.status, headers: res.headers });
+
+// A non-2xx is a Response, not a throw — and the body is never reshaped:
+const r = await client.raw.enrichJob("missing");
+if (r.status === 404) { /* … */ }
+```
+
+`client.raw` covers agent, ask, ingest (+ csv schema/rows), enrich jobs
+(create/list/get/conflicts/apply/cancel), ontology (types/resolve/recommend/apply),
+kgs (list/create/delete), explore (summary/records/type-edges/type-counts/search),
+normalize (suggest/rules GET+POST/confirm/reject/apply) and tenants
+(list/create/delete). Each returns `Promise<Response>` and only ever rejects on a
+network error or timeout (i.e. when there is no HTTP response to return).
 
 ## One-shot CLI
 
