@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { Client, CographError } from "./client.js";
 import { renderAgentResult } from "./agentRender.js";
@@ -960,12 +960,19 @@ program
 
 /** True when this module is the process entry point (run as `cograph …`), not
  *  when it's imported (e.g. by the unit tests that exercise `runAgentCommand`).
- *  Guards the auto-parse so importing the module has no side effects. */
+ *  Guards the auto-parse so importing the module has no side effects.
+ *
+ *  npm installs the `bin` as a SYMLINK (node_modules/.bin/cograph →
+ *  dist/cli.js). Node sets import.meta.url to the *realpath* of the entry file
+ *  while process.argv[1] keeps the *symlink* path, so a naive href comparison
+ *  never matches and the CLI silently does nothing. Resolve the symlink first:
+ *  compare fileURLToPath(import.meta.url) against realpathSync(process.argv[1]).
+ */
 function isMainModule(): boolean {
   const argv1 = process.argv[1];
   if (!argv1) return false;
   try {
-    return import.meta.url === pathToFileURL(argv1).href;
+    return fileURLToPath(import.meta.url) === realpathSync(argv1);
   } catch {
     return false;
   }
