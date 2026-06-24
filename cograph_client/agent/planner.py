@@ -81,6 +81,11 @@ _INTENT_PLAN_ORDER = {"clean": 0, "enrich": 1, "dedup": 2, "ontology": 3}
 # the worst case so the panel can never loop forever on `clarify`.
 _MAX_CLARIFY_ROUNDS = 1
 
+# How many recent turns of a (possibly long, history-backed) transcript to feed
+# the classifier prompt + accumulate for capability extraction. The store keeps
+# a longer tail for the history UI; the prompt only needs the recent context.
+_PROMPT_HISTORY_TURNS = 16
+
 
 _CLASSIFY_SYSTEM = """\
 You are the intent router for a knowledge-graph data assistant. Read the WHOLE \
@@ -291,6 +296,7 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
     the caller confirms via :func:`execute_plan`.
     """
     session_id = (session or {}).get("id")
+    owner = (session or {}).get("owner")
     history = await _load_history(ctx, session_id)
     prior_clarify_count = sum(
         1 for t in history if t.role == "assistant" and t.kind == "clarify"
@@ -298,7 +304,7 @@ async def handle(ctx: AgentContext, message: str, session: dict | None = None) -
 
     result = await _respond(ctx, message, session_id, history, prior_clarify_count)
 
-    await _record_turn(ctx, session_id, message, result)
+    await _record_turn(ctx, session_id, message, result, owner)
     if session_id:
         result.setdefault("session_id", session_id)
     return result
@@ -312,7 +318,14 @@ async def _respond(
     prior_clarify_count: int,
 ) -> dict:
     """The classify → dispatch core, factored out of transcript bookkeeping."""
-    classification = await _classify(ctx, message, history, prior_clarify_count)
+    # Only the recent tail grounds the prompt — a long history-backed thread
+    # shouldn't blow up the classifier context (COG-131).
+    recent = (
+        history[-_PROMPT_HISTORY_TURNS:]
+        if len(history) > _PROMPT_HISTORY_TURNS
+        else history
+    )
+    classification = await _classify(ctx, message, recent, prior_clarify_count)
     intents = classification.get("intents", ["ambiguous"])
 
     # A read-only question is terminal and does not compose with actions.
@@ -352,7 +365,7 @@ async def _respond(
 
     # Accumulate the user's answers across the dialogue so each capability's
     # field/attribute extraction sees the full ask, not just the latest reply.
-    instruction = _effective_instruction(history, message)
+    instruction = _effective_instruction(recent, message)
     steps = await _plan_intents(ctx, available, instruction)
     if not steps:
         labels = " and ".join(i for i, _ in available)
@@ -459,9 +472,17 @@ def _result_summary(result: dict) -> tuple[str, str | None]:
 
 
 async def _record_turn(
-    ctx: AgentContext, session_id: str | None, message: str, result: dict
+    ctx: AgentContext,
+    session_id: str | None,
+    message: str,
+    result: dict,
+    owner: str | None = None,
 ) -> None:
-    """Append the user message + assistant reply to the session transcript."""
+    """Append the user message + assistant reply to the session transcript.
+
+    ``owner`` (the auth subject) tags the thread so a signed-in user can find it
+    in their history; it's None for ownerless (demo) sessions.
+    """
     if not session_id:
         return
     text, intent = _result_summary(result)
@@ -470,7 +491,9 @@ async def _record_turn(
         Turn(role="assistant", text=text, kind=result.get("kind"), intent=intent),
     ]
     try:
-        await make_conversation_store().append(session_id, ctx.tenant_id, turns)
+        await make_conversation_store().append(
+            session_id, ctx.tenant_id, turns, owner=owner
+        )
     except Exception:  # noqa: BLE001 — persistence is best-effort, never 500
         logger.warning("agent_history_append_failed", exc_info=True)
 

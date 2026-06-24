@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 
 from cograph_client.auth.api_keys import (
+    AuthVerdict,
     TenantContext,
     get_tenant,
     register_external_verifier,
@@ -77,6 +78,40 @@ def test_open_access_honors_requested_tenant(open_access):
 def test_open_access_defaults_without_path(open_access):
     ctx = get_tenant(tenant=None, api_key=None)
     assert ctx.tenant_id == "default"
+
+
+def test_auth_verdict_carries_subject_to_context(open_access):
+    """A verifier may return an AuthVerdict (tenants + subject); the subject is
+    threaded onto TenantContext so per-user resources can scope by it."""
+    register_external_verifier(
+        lambda key: AuthVerdict(tenants=["alpha", "beta"], subject="user_123")
+    )
+    ctx = get_tenant(tenant="beta", api_key="k")
+    assert ctx.tenant_id == "beta"
+    assert ctx.subject == "user_123"
+
+
+def test_auth_verdict_authorizes_path_tenant(open_access):
+    """AuthVerdict tenants are authorized against the path like a sequence."""
+    register_external_verifier(
+        lambda key: AuthVerdict(tenants=["alpha"], subject="u1")
+    )
+    with pytest.raises(HTTPException) as exc:
+        get_tenant(tenant="not-owned", api_key="k")
+    assert exc.value.status_code == 403
+
+
+def test_auth_verdict_without_subject_is_none(open_access):
+    register_external_verifier(lambda key: AuthVerdict(tenants=["alpha"]))
+    ctx = get_tenant(tenant="alpha", api_key="k")
+    assert ctx.subject is None
+
+
+def test_sequence_verdict_has_no_subject(open_access):
+    """A bare sequence verdict (legacy) yields subject=None."""
+    register_external_verifier(lambda key: ["alpha"])
+    ctx = get_tenant(tenant="alpha", api_key="k")
+    assert ctx.subject is None
 
 
 def test_static_key_keeps_legacy_routing(monkeypatch):

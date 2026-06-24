@@ -26,6 +26,7 @@ from cograph_client.agent.conversation_store import (
     make_conversation_store,
     reset_conversation_store,
 )
+from cograph_client.auth.api_keys import AuthVerdict, register_external_verifier
 from cograph_client.agent.planner import (
     handle,
     register_default_capabilities,
@@ -401,3 +402,148 @@ async def test_options_are_capped_and_cleaned(monkeypatch):
     out = await asyncio.wait_for(handle(_ctx(), "x"), TIMEOUT)
     assert out["options"] == ["A", "B", "C", "D"]
 
+
+
+# --------------------------------------------------------------------------- #
+# 5. Thread history (COG-131): per-user listing + retrieval
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_list_for_owner_get_and_title():
+    store = InMemoryConversationStore()
+    await store.append(
+        "s1", "t1",
+        [Turn(role="user", text="Clean up the manufacturer names please"),
+         Turn(role="assistant", text="ok", kind="plan")],
+        owner="user_a",
+    )
+    await store.append("s2", "t1", [Turn(role="user", text="merge dupes")], owner="user_a")
+
+    listed = await store.list_for_owner("t1", "user_a")
+    assert {c.session_id for c in listed} == {"s1", "s2"}
+    # Title derived from the first user message; newest-first ordering.
+    s1 = next(c for c in listed if c.session_id == "s1")
+    assert s1.title.startswith("Clean up the manufacturer names")
+    assert s1.turn_count == 2
+
+    full = await store.get("s1", "t1", owner="user_a")
+    assert full is not None and [t.text for t in full.turns][0].startswith("Clean up")
+
+
+@pytest.mark.asyncio
+async def test_history_is_scoped_per_owner():
+    store = InMemoryConversationStore()
+    await store.append("s1", "t1", [Turn(role="user", text="mine")], owner="user_a")
+    await store.append("s2", "t1", [Turn(role="user", text="theirs")], owner="user_b")
+
+    assert [c.session_id for c in await store.list_for_owner("t1", "user_a")] == ["s1"]
+    # user_b cannot fetch user_a's thread (owner mismatch -> None, surfaced as 404).
+    assert await store.get("s1", "t1", owner="user_b") is None
+
+
+@pytest.mark.asyncio
+async def test_ownerless_session_never_listed():
+    """A demo (no-owner) session is persisted for in-session grounding but never
+    appears in any user's history."""
+    store = InMemoryConversationStore()
+    await store.append("demo-sess", "t1", [Turn(role="user", text="hi")])  # no owner
+    assert await store.list_for_owner("t1", "user_a") == []
+    assert await store.list_for_owner("t1", "") == []
+
+
+@pytest.mark.asyncio
+async def test_planner_records_owner(monkeypatch):
+    """handle(..., session={'owner': ...}) tags the thread so it lists for that
+    user."""
+
+    async def fake_chat(key, system, user, **kwargs):
+        return json.dumps({"intents": ["ambiguous"], "clarify": "Which?"})
+
+    monkeypatch.setattr(planner_mod, "openrouter_chat", fake_chat)
+    out = await asyncio.wait_for(
+        handle(_ctx(), "do something", session={"id": "sx", "owner": "user_z"}),
+        TIMEOUT,
+    )
+    assert out["kind"] == "clarify"
+    listed = await make_conversation_store().list_for_owner("t1", "user_z")
+    assert [c.session_id for c in listed] == ["sx"]
+
+
+# --- Route-level: per-user history endpoints ------------------------------- #
+@pytest.fixture
+def _history_client(monkeypatch):
+    """A TestClient whose auth verifier maps two keys to two subjects, with no
+    OpenRouter key so the agent returns a clarify (records a turn) sans LLM."""
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    from cograph_client.api.app import create_app
+    from cograph_client.graph.client import NeptuneClient
+
+    monkeypatch.setattr("cograph_client.auth.api_keys.settings.api_keys", "{}")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "cograph_client.api.routes.agent.settings.openrouter_api_key", "", raising=False
+    )
+
+    subjects = {"key-a": "user_a", "key-b": "user_b"}
+
+    def verifier(key):
+        subj = subjects.get(key)
+        return AuthVerdict(tenants=["test-tenant"], subject=subj) if subj else None
+
+    register_external_verifier(verifier)
+
+    app = create_app()
+    n = AsyncMock(spec=NeptuneClient)
+    n.query.return_value = {"head": {"vars": []}, "results": {"bindings": []}}
+    n.update.return_value = None
+    app.state.neptune_client = n
+    client = TestClient(app)
+    yield client
+    register_external_verifier(None)
+
+
+def _send(client, key, sid, msg):
+    return client.post(
+        "/graphs/test-tenant/agent",
+        json={"message": msg, "context": {"kg_name": "kg1"}, "session_id": sid},
+        headers={"X-API-Key": key},
+    )
+
+
+def test_route_history_lists_and_scopes_per_user(_history_client):
+    client = _history_client
+    # user_a starts two threads; user_b one.
+    assert _send(client, "key-a", "a1", "clean the names").status_code == 200
+    assert _send(client, "key-a", "a2", "merge dupes").status_code == 200
+    assert _send(client, "key-b", "b1", "enrich stuff").status_code == 200
+
+    ra = client.get("/graphs/test-tenant/conversations", headers={"X-API-Key": "key-a"})
+    assert ra.status_code == 200
+    a_sessions = {c["session_id"] for c in ra.json()["conversations"]}
+    assert a_sessions == {"a1", "a2"}  # only user_a's threads
+
+    rb = client.get("/graphs/test-tenant/conversations", headers={"X-API-Key": "key-b"})
+    assert {c["session_id"] for c in rb.json()["conversations"]} == {"b1"}
+
+
+def test_route_get_thread_is_owner_scoped(_history_client):
+    client = _history_client
+    _send(client, "key-a", "a1", "clean the names")
+
+    # Owner can fetch the full transcript.
+    ok = client.get(
+        "/graphs/test-tenant/conversations/a1", headers={"X-API-Key": "key-a"}
+    )
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["session_id"] == "a1"
+    assert body["turns"] and body["turns"][0]["role"] == "user"
+    assert body["title"].startswith("clean the names")
+
+    # A different user cannot read it (404, not enumerable).
+    denied = client.get(
+        "/graphs/test-tenant/conversations/a1", headers={"X-API-Key": "key-b"}
+    )
+    assert denied.status_code == 404

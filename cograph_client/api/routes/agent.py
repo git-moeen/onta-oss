@@ -99,4 +99,11 @@ async def agent_turn(
     ctx = _build_ctx(tenant, body, client, executor, job_store)
     if body.confirm is not None:
         return await planner.execute_plan(ctx, body.confirm.plan_id)
-    return await planner.handle(ctx, body.message, session={"id": body.session_id})
+    # Tag the thread with the auth subject (the signed-in user) so it shows up in
+    # their conversation history (COG-131). Ownerless (static/demo key) sessions
+    # carry owner=None and never appear in anyone's list.
+    return await planner.handle(
+        ctx,
+        body.message,
+        session={"id": body.session_id, "owner": tenant.subject},
+    )

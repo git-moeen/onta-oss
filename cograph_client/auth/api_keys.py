@@ -16,17 +16,39 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 class TenantContext:
     tenant_id: str
     api_key: str
+    # The auth subject (the user id behind the key) when the provider exposes
+    # one — None for anonymous/static keys. Used to scope per-user resources
+    # (e.g. Ask-AI conversation history, COG-131) without the OSS layer knowing
+    # anything provider-specific: "subject" is a generic auth concept.
+    subject: Optional[str] = None
+
+
+@dataclass
+class AuthVerdict:
+    """A richer verifier result: the tenants a key may access plus the auth
+    subject (the user id behind the key, when the provider exposes one).
+
+    Verifiers may keep returning a bare ``str``/``Sequence[str]`` (no subject);
+    returning an :class:`AuthVerdict` additionally carries the subject through
+    to :class:`TenantContext.subject`.
+    """
+
+    tenants: Sequence[str]
+    subject: Optional[str] = None
 
 
 # A verifier takes a raw API key and returns either:
 #   - a single tenant_id (legacy single-tenant keys), or
 #   - a sequence of tenant_ids the key may access (user-scoped keys: a user
 #     owns N tenants and every key they create works for all of them), or
+#   - an AuthVerdict (tenants + the auth subject), or
 #   - None if the key is not recognized.
 # Implementations are expected to fail closed (return None) on network or
 # timeout errors rather than raising — raising would turn an auth provider
 # outage into a 500.
-ExternalVerifier = Callable[[str], Optional[Union[str, Sequence[str]]]]
+ExternalVerifier = Callable[
+    [str], Optional[Union[str, Sequence[str], "AuthVerdict"]]
+]
 
 _external_verifier: Optional[ExternalVerifier] = None
 
@@ -43,7 +65,10 @@ def register_external_verifier(verifier: Optional[ExternalVerifier]) -> None:
 
 
 def _resolve_allowed(
-    allowed: Sequence[str], requested: Optional[str], api_key: str
+    allowed: Sequence[str],
+    requested: Optional[str],
+    api_key: str,
+    subject: Optional[str] = None,
 ) -> TenantContext:
     """Pick the tenant for a key that may access several.
 
@@ -55,9 +80,9 @@ def _resolve_allowed(
     if not allowed:
         raise HTTPException(status_code=401, detail="Invalid API key")
     if requested is None or requested == "":
-        return TenantContext(tenant_id=allowed[0], api_key=api_key)
+        return TenantContext(tenant_id=allowed[0], api_key=api_key, subject=subject)
     if requested in allowed:
-        return TenantContext(tenant_id=requested, api_key=api_key)
+        return TenantContext(tenant_id=requested, api_key=api_key, subject=subject)
     raise HTTPException(
         status_code=403,
         detail=f"API key does not grant access to tenant '{requested}'",
@@ -100,6 +125,10 @@ def get_tenant(
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("external verifier raised: %s", exc)
             verdict = None
+        if isinstance(verdict, AuthVerdict):
+            return _resolve_allowed(
+                verdict.tenants, tenant, api_key, subject=verdict.subject
+            )
         if isinstance(verdict, str):
             return TenantContext(tenant_id=verdict, api_key=api_key)
         if verdict is not None:
