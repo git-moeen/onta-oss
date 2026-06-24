@@ -41,11 +41,11 @@
   "homepage": "https://cograph.cloud",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/git-moeen/cograph-oss.git",
+    "url": "git+https://github.com/git-moeen/onta-oss.git",
     "directory": "packages/cograph"
   },
   "bugs": {
-    "url": "https://github.com/git-moeen/cograph-oss/issues"
+    "url": "https://github.com/git-moeen/onta-oss/issues"
   },
   "dependencies": {
     "commander": "^12.1.0"
