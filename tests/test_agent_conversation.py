@@ -343,3 +343,61 @@ async def test_multi_intent_single_turn_composes_plan(monkeypatch):
     assert out["kind"] == "plan"
     caps = {s["capability"] for s in out["steps"]}
     assert caps == {"normalize", "dedup"}
+
+
+# --------------------------------------------------------------------------- #
+# 4. Clickable clarify options
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_clarify_carries_classifier_options(monkeypatch):
+    """An ambiguous clarify surfaces the classifier's own suggested options so
+    the UI can render them as clickable choices."""
+
+    async def fake_chat(key, system, user, **kwargs):
+        return json.dumps(
+            {
+                "intents": ["ambiguous"],
+                "clarify": "Clean the values, merge duplicates, or both?",
+                "options": ["Clean up the values", "Merge duplicates", "Both"],
+            }
+        )
+
+    monkeypatch.setattr(planner_mod, "openrouter_chat", fake_chat)
+    out = await asyncio.wait_for(handle(_ctx(), "tidy these up"), TIMEOUT)
+    assert out["kind"] == "clarify"
+    assert out["options"] == ["Clean up the values", "Merge duplicates", "Both"]
+
+
+@pytest.mark.asyncio
+async def test_clarify_falls_back_to_default_options(monkeypatch):
+    """When the classifier offers no options (or none parse), the clarify still
+    carries the generic action menu — every clarify is clickable."""
+
+    async def fake_chat(key, system, user, **kwargs):
+        return json.dumps({"intents": ["ambiguous"], "clarify": "What next?"})
+
+    monkeypatch.setattr(planner_mod, "openrouter_chat", fake_chat)
+    out = await asyncio.wait_for(handle(_ctx(), "help"), TIMEOUT)
+    assert out["kind"] == "clarify"
+    assert out["options"], "a fallback clarify must still offer clickable options"
+    assert "Merge duplicate records" in out["options"]
+
+
+@pytest.mark.asyncio
+async def test_options_are_capped_and_cleaned(monkeypatch):
+    """Classifier options are de-duped and capped at 4 (defensive against a
+    runaway list)."""
+
+    async def fake_chat(key, system, user, **kwargs):
+        return json.dumps(
+            {
+                "intents": ["ambiguous"],
+                "clarify": "Which?",
+                "options": ["A", "A", "B", "C", "D", "E", "  ", "F"],
+            }
+        )
+
+    monkeypatch.setattr(planner_mod, "openrouter_chat", fake_chat)
+    out = await asyncio.wait_for(handle(_ctx(), "x"), TIMEOUT)
+    assert out["options"] == ["A", "B", "C", "D"]
+

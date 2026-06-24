@@ -112,7 +112,26 @@ what to do. If you can act, act.
 You are also given the available capabilities (one line each). Respond with \
 STRICT JSON only:
 {"intents": ["<one or more of the above>"], "clarify": "<a clarifying question, \
-ONLY when the single intent is ambiguous>"}"""
+ONLY when the single intent is ambiguous>", "options": ["<2-4 short clickable \
+answer choices>"]}
+
+When you ask a clarifying question, ALSO provide "options": a short list (2-4) of \
+the distinct answers the user is choosing between, each a few words, phrased as \
+the user would say them (e.g. for clean-vs-merge: ["Clean up the values", "Merge \
+duplicates", "Both"]). The user can click one instead of typing. Omit "options" \
+(or use []) only when the answer is genuinely free-form (a field name, a value) \
+and no small set of choices fits."""
+
+# Generic action options offered on a fall-back clarify (greeting, "I can't yet
+# handle X", or when the classifier didn't suggest its own). Each maps cleanly to
+# an intent when the user clicks it, so the next turn routes straight to a plan.
+_DEFAULT_ACTION_OPTIONS = [
+    "Ask a question about the data",
+    "Clean up messy values",
+    "Enrich missing attributes",
+    "Merge duplicate records",
+    "Change the schema",
+]
 
 
 def _format_history(history: list[Turn] | None) -> str:
@@ -195,7 +214,11 @@ async def _classify(
 
 
 def _ambiguous(clarify: str = "What would you like me to do?") -> dict:
-    return {"intents": ["ambiguous"], "clarify": clarify}
+    return {
+        "intents": ["ambiguous"],
+        "clarify": clarify,
+        "options": list(_DEFAULT_ACTION_OPTIONS),
+    }
 
 
 def _parse_classification(text: str) -> dict:
@@ -234,7 +257,27 @@ def _normalize_classification(data: dict) -> dict:
             intents.append(s)
     if not intents:
         intents = ["ambiguous"]
-    return {"intents": intents, "clarify": data.get("clarify", "") or ""}
+    return {
+        "intents": intents,
+        "clarify": data.get("clarify", "") or "",
+        "options": _clean_options(data.get("options")),
+    }
+
+
+def _clean_options(raw) -> list[str]:
+    """Sanitize classifier-suggested clickable options: strings, capped at 4."""
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for o in raw:
+        s = str(o).strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+        if len(out) >= 4:
+            break
+    return out
 
 
 async def handle(ctx: AgentContext, message: str, session: dict | None = None) -> dict:
@@ -284,6 +327,9 @@ async def _respond(
             "kind": "clarify",
             "question": classification.get("clarify")
             or "Could you clarify what you'd like me to do?",
+            # Offer the model's own choices when it gave them, else the generic
+            # action menu — so the user can click instead of typing.
+            "options": classification.get("options") or list(_DEFAULT_ACTION_OPTIONS),
         }
 
     # Resolve the registered capabilities. A recognized intent with no capability
@@ -301,6 +347,7 @@ async def _respond(
                 "questions, enrich attributes, clean up values, merge duplicates, "
                 "and inspect or extend the ontology — what would you like?"
             ),
+            "options": list(_DEFAULT_ACTION_OPTIONS),
         }
 
     # Accumulate the user's answers across the dialogue so each capability's
