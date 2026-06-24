@@ -29,11 +29,11 @@
   "homepage": "https://cograph.cloud",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/git-moeen/cograph-oss.git",
+    "url": "git+https://github.com/git-moeen/onta-oss.git",
     "directory": "packages/cograph-mcp"
   },
   "bugs": {
-    "url": "https://github.com/git-moeen/cograph-oss/issues"
+    "url": "https://github.com/git-moeen/onta-oss/issues"
   },
   "dependencies": {
     "cograph": "^0.1.0",
