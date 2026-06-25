@@ -253,6 +253,12 @@ export class Client {
   pJobs(query?: string): string {
     return `${this.base()}/jobs${query ?? ""}`;
   }
+  /** @internal Job-creating action endpoints (COG-99): find-merge-duplicates,
+   *  enrich, suggest-relationships. Each creates a tracked job and returns
+   *  `{job_id, status, poll_url}`. `name` is fixed by the calling raw method. */
+  pAction(name: string): string {
+    return `${this.base()}/actions/${name}`;
+  }
   /** @internal */ pKgs(): string {
     return `${this.base()}/kgs`;
   }
@@ -1385,6 +1391,36 @@ export class RawApi {
       ? `?category=${encodeURIComponent(opts.category)}`
       : "";
     return this.client.requestRaw("GET", this.client.pJobs(qs), init);
+  }
+
+  /** `POST /graphs/{tenant}/actions/find-merge-duplicates` — start a dedupe
+   *  job (second-pass entity resolution). Body `{kg_name}`. */
+  actionFindMergeDuplicates(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw(
+      "POST",
+      this.client.pAction("find-merge-duplicates"),
+      { body, ...init },
+    );
+  }
+
+  /** `POST /graphs/{tenant}/actions/enrich` — start an enrichment job. Body
+   *  `{type_name, attributes, kg_name, tier?, …}`. */
+  actionEnrich(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pAction("enrich"), {
+      body,
+      ...init,
+    });
+  }
+
+  /** `POST /graphs/{tenant}/actions/suggest-relationships` — start a
+   *  reconciliation job. Body `{kg_name}`. Premium: degrades to a terminal
+   *  failed job when no recommender is registered. */
+  actionSuggestRelationships(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw(
+      "POST",
+      this.client.pAction("suggest-relationships"),
+      { body, ...init },
+    );
   }
 
   /** `GET /graphs/{tenant}/enrich/jobs/{id}` — fetch a single job. */

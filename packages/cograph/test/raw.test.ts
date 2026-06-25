@@ -194,6 +194,24 @@ describe("canonical paths + methods for every covered op", () => {
     { name: "enrichJobs", run: (c) => c.raw.enrichJobs(), method: "GET", url: `${PREFIX}/enrich/jobs` },
     { name: "jobs", run: (c) => c.raw.jobs(), method: "GET", url: `${PREFIX}/jobs` },
     {
+      name: "actionFindMergeDuplicates",
+      run: (c) => c.raw.actionFindMergeDuplicates({}),
+      method: "POST",
+      url: `${PREFIX}/actions/find-merge-duplicates`,
+    },
+    {
+      name: "actionEnrich",
+      run: (c) => c.raw.actionEnrich({}),
+      method: "POST",
+      url: `${PREFIX}/actions/enrich`,
+    },
+    {
+      name: "actionSuggestRelationships",
+      run: (c) => c.raw.actionSuggestRelationships({}),
+      method: "POST",
+      url: `${PREFIX}/actions/suggest-relationships`,
+    },
+    {
       name: "enrichJob",
       run: (c) => c.raw.enrichJob("job 1"),
       method: "GET",
