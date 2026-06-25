@@ -5,6 +5,7 @@ from cograph_client.enrichment.executor import EnrichmentExecutor
 from cograph_client.enrichment.job_store import make_job_store
 from cograph_client.enrichment.sources.wikidata import WikidataAdapter
 from cograph_client.graph.client import NeptuneClient
+from cograph_client.scheduling.store import make_schedule_store
 
 
 def get_neptune_client(request: Request) -> NeptuneClient:
@@ -36,3 +37,15 @@ def get_executor(request: Request) -> EnrichmentExecutor:
 def get_enrichment_job_store(request: Request):
     _ensure_enrichment_state(request.app.state)
     return request.app.state.enrichment_job_store
+
+
+def get_schedule_store(request: Request):
+    """Lazily build and stash the schedule store on app.state (COG-135).
+
+    Mirrors get_enrichment_job_store: selects Postgres when a database_url is
+    configured, else the in-memory default. Attached to app.state so it's a
+    single per-process instance.
+    """
+    if getattr(request.app.state, "schedule_store", None) is None:
+        request.app.state.schedule_store = make_schedule_store()
+    return request.app.state.schedule_store

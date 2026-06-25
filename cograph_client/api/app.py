@@ -8,7 +8,7 @@ from slowapi.errors import RateLimitExceeded
 
 from cograph_client.api.middleware import RequestLoggingMiddleware
 from cograph_client.api.rate_limit import limiter
-from cograph_client.api.routes import actions, agent, ask, conversations, enrich, explore, functions, health, ingest, jobs, knowledge_graphs, lambda_functions, normalize, ontology, query, tenants, triples
+from cograph_client.api.routes import actions, agent, ask, conversations, enrich, explore, functions, health, ingest, jobs, knowledge_graphs, lambda_functions, normalize, ontology, query, schedules, tenants, triples
 from cograph_client.config import settings
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.logging import setup_logging
@@ -159,6 +159,7 @@ def create_app() -> FastAPI:
     app.include_router(enrich.router, tags=["enrich"])
     app.include_router(jobs.router, tags=["jobs"])
     app.include_router(actions.router, tags=["actions"])
+    app.include_router(schedules.router, tags=["schedules"])
     app.include_router(explore.router, tags=["explore"])
     app.include_router(normalize.router, tags=["normalize"])
     app.include_router(tenants.router, tags=["tenants"])

@@ -259,6 +259,15 @@ export class Client {
   pAction(name: string): string {
     return `${this.base()}/actions/${name}`;
   }
+  /** @internal Recurring-action schedules (COG-135). Optional `?...` filter is
+   *  baked into `query` by the caller. */
+  pSchedules(query?: string): string {
+    return `${this.base()}/schedules${query ?? ""}`;
+  }
+  /** @internal A single schedule by id. */
+  pSchedule(id: string): string {
+    return `${this.base()}/schedules/${encodeURIComponent(id)}`;
+  }
   /** @internal */ pKgs(): string {
     return `${this.base()}/kgs`;
   }
@@ -1228,6 +1237,38 @@ export interface ConflictReview {
   decision?: ReviewDecision | null;
 }
 
+// --- Recurring schedules (COG-135) ------------------------------------------- #
+
+/** The action a {@link Schedule} fires — mirrors the Ask-AI action endpoints:
+ *  find-merge-duplicates (dedupe), enrich (enrichment), suggest-relationships
+ *  (reconciliation). A schedule's `category` agrees with its `action`. */
+export type ScheduleAction =
+  | "find-merge-duplicates"
+  | "enrich"
+  | "suggest-relationships";
+
+/**
+ * A recurring-action schedule for a tenant's KG (COG-135). Recurs on EXACTLY
+ * one of `cron` / `interval_seconds` (the backend rejects both/neither). This
+ * is the scheduling DATA shape — the firing loop that turns a due schedule into
+ * a job is server-side and separate. `params` carries the action-specific job
+ * payload (e.g. `type_name`/`attributes`/`tier`/`conflict_policy` for enrich).
+ */
+export interface Schedule {
+  id: string;
+  tenant_id: string;
+  kg_name: string;
+  category: JobCategory;
+  action: ScheduleAction;
+  params: Record<string, unknown>;
+  cron?: string | null;
+  interval_seconds?: number | null;
+  enabled: boolean;
+  next_run?: string | null;
+  last_run?: string | null;
+  created_at: string;
+}
+
 // --- Unified Ask-AI agent (COG-118 / COG-125) -------------------------------- #
 
 /** Inputs to {@link Client.agent} — mirror the `/agent` HTTP body. */
@@ -1441,6 +1482,30 @@ export class RawApi {
   /** `DELETE /graphs/{tenant}/enrich/jobs/{id}` — cancel a job. */
   enrichCancel(jobId: string, init?: RawInit): Promise<Response> {
     return this.client.requestRaw("DELETE", this.client.pEnrichJob(jobId), init);
+  }
+
+  // -- schedules (COG-135) ------------------------------------------------- #
+
+  /** `GET /graphs/{tenant}/schedules` — list recurring schedules, oldest first. */
+  schedules(init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("GET", this.client.pSchedules(), init);
+  }
+
+  /** `POST /graphs/{tenant}/schedules` — create a recurring schedule. Body
+   *  `{kg_name, category, action, params?, cron?|interval_seconds, enabled?}`. */
+  createSchedule(body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("POST", this.client.pSchedules(), { body, ...init });
+  }
+
+  /** `PATCH /graphs/{tenant}/schedules/{id}` — enable/disable or update a
+   *  schedule. Only provided fields change. */
+  updateSchedule(id: string, body: unknown, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("PATCH", this.client.pSchedule(id), { body, ...init });
+  }
+
+  /** `DELETE /graphs/{tenant}/schedules/{id}` — delete a schedule. */
+  deleteSchedule(id: string, init?: RawInit): Promise<Response> {
+    return this.client.requestRaw("DELETE", this.client.pSchedule(id), init);
   }
 
   // -- ontology ------------------------------------------------------------ #

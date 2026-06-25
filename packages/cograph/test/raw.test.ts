@@ -236,6 +236,30 @@ describe("canonical paths + methods for every covered op", () => {
       url: `${PREFIX}/enrich/jobs/j1`,
     },
     {
+      name: "schedules",
+      run: (c) => c.raw.schedules(),
+      method: "GET",
+      url: `${PREFIX}/schedules`,
+    },
+    {
+      name: "createSchedule",
+      run: (c) => c.raw.createSchedule({}),
+      method: "POST",
+      url: `${PREFIX}/schedules`,
+    },
+    {
+      name: "updateSchedule",
+      run: (c) => c.raw.updateSchedule("s 1", {}),
+      method: "PATCH",
+      url: `${PREFIX}/schedules/${ENC("s 1")}`,
+    },
+    {
+      name: "deleteSchedule",
+      run: (c) => c.raw.deleteSchedule("s 1"),
+      method: "DELETE",
+      url: `${PREFIX}/schedules/${ENC("s 1")}`,
+    },
+    {
       name: "ontologyTypes",
       run: (c) => c.raw.ontologyTypes(),
       method: "GET",
