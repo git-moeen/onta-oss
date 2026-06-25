@@ -200,6 +200,85 @@ class NLQueryPipeline:
             timing=timing,
         )
 
+    async def select_entity_uris(
+        self,
+        description: str,
+        type_name: str,
+        graph_uri: str,
+        instance_graph: str | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Resolve an NL subset description to the IRIs of ``type_name`` entities.
+
+        Turns a ranked/specific subset — e.g. "the 5 brokers with the most
+        property listings" — into the concrete entity IRIs it names, so a caller
+        (the agent's enrich planner) can enrich exactly those via ``entity_uris``
+        instead of the whole type. Reuses the SAME NL→SPARQL generation +
+        validation as :meth:`ask` (one query engine, no divergence); it only
+        constrains the projection to the entity IRI (``?uri``) and extracts it.
+
+        Returns a deduped, order-preserving list capped at ``limit``. Returns
+        ``[]`` on any failure (unparseable/invalid SPARQL, Neptune error, or no
+        IRI column) — never raises; the caller decides how to handle "couldn't
+        resolve".
+        """
+        data_graph = instance_graph or graph_uri
+        try:
+            ontology = await self._fetch_ontology(graph_uri, data_graph)
+        except Exception:
+            logger.warning("select_entity_uris_ontology_failed", exc_info=True)
+            return []
+        cap = f" Return at most {int(limit)} rows." if limit else ""
+        question = (
+            f"Return ONLY the IRI of each {type_name} entity in this set: "
+            f"{description}. The SELECT must project a single column named ?uri, "
+            f"bound by `?uri a` the {type_name} class. Apply any ranking/ordering "
+            f"and limit the set describes, but keep ?uri in the SELECT — do NOT "
+            f"aggregate it away or replace it with a label.{cap}"
+        )
+        try:
+            resp = await self._generate_sparql(question, ontology, data_graph)
+            sparql = normalize_sparql(resp.get("sparql", ""))
+            sparql = self._fix_attribute_uris(sparql, ontology)
+            sparql = self._fix_common_sparql_issues(sparql, ontology)
+            is_valid, error = validate_sparql(sparql)
+            if not is_valid:
+                logger.warning("select_entity_uris_invalid_sparql", error=error)
+                return []
+            raw = await self.neptune.query(sparql)
+            _, bindings = parse_sparql_results(raw)
+        except Exception:
+            logger.warning("select_entity_uris_failed", exc_info=True)
+            return []
+        return self._entity_uris_from_bindings(bindings, limit)
+
+    @staticmethod
+    def _entity_uris_from_bindings(
+        bindings: list[dict], limit: int | None = None
+    ) -> list[str]:
+        """Pull entity IRIs out of result bindings, order-preserving and deduped.
+
+        Prefers the ``?uri`` column the resolver prompt asks for; if a row lacks
+        it, falls back to the first http(s)-IRI value in that row. Caps at
+        ``limit`` when given.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _is_iri(v: object) -> bool:
+            return isinstance(v, str) and v.startswith(("http://", "https://"))
+
+        for row in bindings:
+            val = row.get("uri")
+            if not _is_iri(val):
+                val = next((v for v in row.values() if _is_iri(v)), None)
+            if val and val not in seen:
+                seen.add(val)
+                out.append(val)
+                if limit and len(out) >= int(limit):
+                    break
+        return out
+
     async def _fetch_ontology(self, graph_uri: str, instance_graph: str | None = None) -> str:
         # Cache key includes instance graph so different KGs get filtered ontologies
         cache_key = f"{graph_uri}|{instance_graph or ''}"

@@ -44,7 +44,7 @@ from cograph_client.enrichment.sources.base import adapter_cost, get_adapter
 from cograph_client.enrichment.tiers import get_chain
 from cograph_client.graph.ontology_queries import list_types_query
 from cograph_client.graph.parser import parse_sparql_results
-from cograph_client.graph.queries import tenant_graph_uri
+from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
 from cograph_client.normalization.inference import (
     list_type_schema,
     sample_predicate_values,
@@ -61,6 +61,12 @@ _bg_tasks: set[asyncio.Task] = set()
 # a first paid run small enough to inspect cheaply while still covering most
 # scoped subsets in one pass.
 _DEFAULT_PLAN_LIMIT = 200
+
+# Outer safety cap on a resolved subset ("top N", "those", an explicit list) so a
+# missing/over-broad LIMIT in the generated subset SPARQL can't fan a paid enrich
+# out to thousands of entities. The subset's own N (when given) still applies; this
+# only bounds the worst case.
+_SUBSET_MAX = 500
 
 # Functional confidence floor the AGENT'S PLAN uses for web-sourced enrichments
 # (COG-121). Web adapters (Exa/Parallel/…) return verdicts at a low, conservative
@@ -142,6 +148,21 @@ class EnrichCapability:
         )
         scope = req.get("scope")  # {"predicate":..., "value":...} | None
 
+        # Ranked / specific subset ("the top 5 brokers by listing count", "those",
+        # an explicit list). A field=value scope CANNOT express a ranked aggregate,
+        # so when the extractor flags a subset we resolve it to the CONCRETE entity
+        # IRIs via the shared NL→SPARQL pipeline and enrich exactly those
+        # (``entity_uris`` wins over scope in the executor). Fail CLOSED: if the
+        # user explicitly named a subset we could not resolve, do NOT silently
+        # enrich the whole type — return no plan so the turn clarifies instead.
+        subset = req.get("subset")  # {"description": str, "limit": int|None} | None
+        entity_uris: list[str] | None = None
+        if subset and subset.get("description"):
+            entity_uris = await self._resolve_subset_uris(ctx, type_name, subset)
+            if not entity_uris:
+                return []
+            scope = None  # the explicit entity set supersedes any value-scope
+
         # Resolve the tier's adapter chain ONCE and derive (a) whether it is a
         # paid/web chain and (b) the per-entity paid cost — both driven by
         # adapter-declared metadata, never adapter names (COG-123/COG-121 boundary).
@@ -194,22 +215,24 @@ class EnrichCapability:
                     steps.append(norm)
                     depends_on = [norm.id]
 
-        # Propose a conservative default cap so a large/expensive enrich is
-        # bounded by default (COG-123). User-overridable: it is just the plan's
-        # proposed value, surfaced in the preview and carried into the EnrichJob.
-        limit = _DEFAULT_PLAN_LIMIT
-
-        # Estimate how many entities the job will touch (the scope's matched
-        # count, reusing the executor's existing index-efficient COUNT — no new
-        # query engine). The executor calls the adapter chain once per
-        # (entity, attribute) pair (executor.process_entity loops over
-        # job.attributes around _lookup_chain), so a paid lookup runs
-        # min(matched, limit) × len(attributes) times. Cost ≈ per-entity-paid-cost
-        # × that paid-call count. If we can't compute the count cheaply we fall
-        # back to a clearly-labeled estimate (the cap) rather than reporting 0.
-        matched, matched_exact = await self._estimate_matched(
-            ctx, type_name, scope, attributes
-        )
+        # Bound the job + estimate how many entities it will touch. For an explicit
+        # entity set the user already chose the size, so there is NO cap and the
+        # matched count is exact (= the resolved IRIs). Otherwise apply the
+        # conservative default cap (COG-123) and estimate the matched count via the
+        # executor's existing index-efficient COUNT — no new query engine. The
+        # executor calls the adapter chain once per (entity, attribute) pair
+        # (executor.process_entity loops over job.attributes around _lookup_chain),
+        # so a paid lookup runs entities × len(attributes) times; cost ≈
+        # per-entity-paid-cost × that paid-call count. When the count can't be
+        # computed cheaply we fall back to a clearly-labeled estimate (the cap).
+        if entity_uris is not None:
+            limit = None
+            matched, matched_exact = len(entity_uris), True
+        else:
+            limit = _DEFAULT_PLAN_LIMIT
+            matched, matched_exact = await self._estimate_matched(
+                ctx, type_name, scope, attributes
+            )
         cost = _estimate_cost(
             tier=tier,
             per_entity_cost=per_entity_cost,
@@ -221,6 +244,15 @@ class EnrichCapability:
             n_attributes=len(attributes),
         )
 
+        subset_desc = subset.get("description") if subset else None
+        n_entities = len(entity_uris) if entity_uris is not None else None
+        if n_entities is not None:
+            target_phrase = (
+                f"the {n_entities} selected {type_name} "
+                f"{'entity' if n_entities == 1 else 'entities'}"
+            )
+        else:
+            target_phrase = f"matched {type_name} entities (capped at {limit})"
         enrich_step = PlanStep(
             capability=self.name,
             action="run_enrichment",
@@ -231,21 +263,29 @@ class EnrichCapability:
                 "confidence_min": confidence_min,
                 "scope": scope,
                 "limit": limit,
+                "entity_uris": entity_uris,
             },
             rationale=(
                 f"Enrich {', '.join(attributes)} on {type_name}"
-                + (f" scoped to {scope['predicate']}={scope['value']}" if scope else "")
+                + (
+                    f" for {subset_desc}" if subset_desc
+                    else (
+                        f" scoped to {scope['predicate']}={scope['value']}"
+                        if scope else ""
+                    )
+                )
                 + f" via the {tier.value} tier."
             ),
             confidence=0.8,
             preview={
                 "summary": (
-                    f"Look up {', '.join(attributes)} for matched {type_name} "
-                    f"entities (capped at {limit}) and stage the results for review."
+                    f"Look up {', '.join(attributes)} for {target_phrase} "
+                    "and stage the results for review."
                 ),
                 "scope": scope,
                 "tier": tier.value,
                 "limit": limit,
+                "entity_count": n_entities,
                 "confidence_min": confidence_min,
                 "confidence_note": _confidence_note(
                     confidence_min, confidence_lowered
@@ -298,6 +338,49 @@ class EnrichCapability:
             logger.warning("agent_enrich_count_failed", exc_info=True)
             return None, False
 
+    async def _resolve_subset_uris(
+        self, ctx: AgentContext, type_name: str, subset: dict
+    ) -> list[str]:
+        """Resolve a ranked/specific subset to the concrete entity IRIs it names.
+
+        Reuses the shared NL→SPARQL engine (:meth:`NLQueryPipeline.select_entity_uris`,
+        the same pipeline the question capability/``/ask`` route use) so "the 5
+        brokers with the most listings" becomes those 5 IRIs — no new query engine,
+        no client-side ranking. The subset's own LIMIT is honored by the generated
+        SPARQL; ``_SUBSET_MAX`` is an outer safety cap so a runaway/unbounded subset
+        can't fan out to thousands of paid calls. Returns ``[]`` on any failure —
+        the caller fails closed rather than enriching the whole type by accident.
+        """
+        description = str(subset.get("description") or "").strip()
+        if not description:
+            return []
+        raw_limit = subset.get("limit")
+        lim = (
+            int(raw_limit)
+            if isinstance(raw_limit, (int, float))
+            and not isinstance(raw_limit, bool)
+            and raw_limit > 0
+            else None
+        )
+        lim = min(lim, _SUBSET_MAX) if lim else _SUBSET_MAX
+
+        # Lazy import: keep the heavy NL pipeline (and its anthropic client) out of
+        # agent-registry import time, mirroring QueryCapability._build_pipeline.
+        from cograph_client.nlp.pipeline import NLQueryPipeline
+
+        pipeline = NLQueryPipeline(ctx.neptune, ctx.anthropic_key)
+        onto_graph = tenant_graph_uri(ctx.tenant_id)
+        instance_graph = (
+            kg_graph_uri(ctx.tenant_id, ctx.kg_name) if ctx.kg_name else onto_graph
+        )
+        try:
+            return await pipeline.select_entity_uris(
+                description, type_name, onto_graph, instance_graph, lim
+            )
+        except Exception:  # noqa: BLE001 — resolution must never crash planning
+            logger.warning("agent_enrich_subset_resolve_failed", exc_info=True)
+            return []
+
     async def execute(self, ctx: AgentContext, step: PlanStep) -> dict:
         """Create + run an EnrichJob in the background (same as /enrich/jobs)."""
         p = step.params
@@ -312,6 +395,9 @@ class EnrichCapability:
             scope = EnrichScope(
                 predicate=p["scope"]["predicate"], value=p["scope"]["value"]
             )
+        # Explicit entity set (resolved from a ranked/specific subset at plan time);
+        # the executor uses a VALUES block and lets it win over scope.
+        entity_uris = p.get("entity_uris") or None
         limit = p.get("limit")
         job = EnrichJob(
             id=str(uuid.uuid4()),
@@ -328,6 +414,7 @@ class EnrichCapability:
                 or _DEFAULT_CONFIDENCE_MIN
             ),
             scope=scope,
+            entity_uris=entity_uris,
             # Carry the plan's proposed cap so the job actually honors the bound
             # surfaced to the user at plan time (COG-123). int() guards a stray
             # non-int; None leaves whole-subset behavior unchanged. bool is a
@@ -664,6 +751,8 @@ Return STRICT JSON only (no markdown):
   "attributes": ["<attribute name(s) to enrich>"],
   "scope": {"predicate": "<an attribute OR relationship name>", "value": "<v>"} \
 or null,
+  "subset": {"description": "<self-contained description of WHICH entities>", \
+"limit": <int or null>} or null,
   "tier": "lite" | "base" | "core" | "pro",
   "confidence_min": 0.85
 }
@@ -675,11 +764,21 @@ instruction to the nearest existing ATTRIBUTE name. Examples: "current company" 
 "description". If NO existing attribute fits but the user clearly names a new \
 fact to add, propose a clean lowercase singular noun for it (e.g. "company") — \
 NEVER emit a modifier word like "current", "their", "the", "missing".
-- "scope" restricts WHICH entities to enrich ("for managers", "who speak \
-Persian"). Its "predicate" MUST be one of the given attribute or relationship \
-names. "languages" / "what they speak" -> the "speaks" relationship; "level" / \
-"who are managers" -> the level attribute/relationship. If there is no scope, \
-return null.
+- "scope" restricts WHICH entities to enrich by a simple FIELD=VALUE match ("for \
+managers", "who speak Persian"). Its "predicate" MUST be one of the given \
+attribute or relationship names. "languages" / "what they speak" -> the "speaks" \
+relationship; "level" / "who are managers" -> the level attribute/relationship. \
+If there is no such filter, return null.
+- "subset" pins enrichment to a RANKED or SPECIFIC set of entities that a simple \
+field=value "scope" CANNOT express — "the top 5 <type> by <metric>", "the 10 \
+most recent ...", "those"/"them"/"these" (entities referenced earlier in the \
+conversation), or an explicit named list. Write "description" as a SELF-CONTAINED \
+phrase naming exactly which entities (resolve pronouns using the whole \
+conversation, e.g. turn "those" into "the 5 brokers with the most property \
+listings"), and "limit" = the count if the user gave one (else null). Use \
+"subset" ONLY for ranked/specific sets; for "all <type>" or a plain field=value \
+filter leave it null. "scope" and "subset" are mutually exclusive — prefer \
+"subset" when the request is ranked or refers to specific earlier entities.
 - "tier" selects the data source. Choose "core" (paid web search: \
 Parallel/Exa) for OPEN-WEB facts about people or companies — employer, company, \
 website, description, bio, reviews, founder, headquarters, email, role, title, \
@@ -790,6 +889,25 @@ def _validate_enrich_request(
     else:
         scope = None
 
+    # Ranked/specific subset → a self-contained description + optional positive
+    # int limit. Kept independent of the type schema (it is resolved later via a
+    # SPARQL select, not validated against predicate names). A subset supersedes a
+    # value-scope, so drop the scope when a subset is present.
+    subset = parsed.get("subset")
+    if isinstance(subset, dict) and str(subset.get("description") or "").strip():
+        raw_limit = subset.get("limit")
+        s_limit = (
+            int(raw_limit)
+            if isinstance(raw_limit, (int, float))
+            and not isinstance(raw_limit, bool)
+            and raw_limit > 0
+            else None
+        )
+        subset = {"description": str(subset["description"]).strip(), "limit": s_limit}
+        scope = None
+    else:
+        subset = None
+
     tier = parsed.get("tier")
     if tier not in {t.value for t in EnrichmentTier}:
         tier = _tier_for_attributes(attributes)
@@ -797,6 +915,7 @@ def _validate_enrich_request(
     return {
         "attributes": attributes,
         "scope": scope,
+        "subset": subset,
         "tier": tier,
         "confidence_min": parsed.get("confidence_min", 0.85),
     }

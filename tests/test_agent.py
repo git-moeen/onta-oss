@@ -342,6 +342,145 @@ async def test_enrich_infers_type_with_no_selection(monkeypatch):
     assert out["steps"][0]["params"]["type_name"] == "Broker"
 
 
+def _stub_subset_resolver(monkeypatch, uris: list[str]):
+    """Stub the NL→SPARQL subset resolver the enrich cap calls."""
+
+    async def fake_select(self, description, type_name, graph_uri, instance_graph=None, limit=None):
+        return list(uris)
+
+    monkeypatch.setattr(
+        "cograph_client.nlp.pipeline.NLQueryPipeline.select_entity_uris", fake_select
+    )
+
+
+@pytest.mark.asyncio
+async def test_enrich_resolves_ranked_subset_to_entity_uris(monkeypatch):
+    """"enrich the top 5 brokers by listings with websites" resolves the ranked
+    subset to concrete entity IRIs and enriches EXACTLY those (entity_uris) — not
+    the whole Broker type. scope/limit are cleared and the preview count is 5."""
+    _stub_classifier(monkeypatch, "enrich")
+    _stub_kg_types(monkeypatch, ["Broker", "PropertyListing"])
+
+    async def fake_schema(neptune, tenant_id, type_name):
+        return {"attributes": ["website"], "relationships": []}
+
+    monkeypatch.setattr(
+        "cograph_client.agent.capabilities.enrich_cap.list_type_schema", fake_schema
+    )
+    _stub_enrich_extract(
+        monkeypatch,
+        {
+            "attributes": ["website"],
+            "scope": None,
+            "subset": {
+                "description": "the 5 brokers with the most property listings",
+                "limit": 5,
+            },
+            "tier": "core",
+        },
+    )
+    uris = [f"https://onta.dev/e/broker/{i}" for i in range(5)]
+    _stub_subset_resolver(monkeypatch, uris)
+
+    out = await asyncio.wait_for(
+        handle(
+            _ctx(),
+            "enrich the top 5 brokers by number of listings with their websites",
+        ),
+        TIMEOUT,
+    )
+    assert out["kind"] == "plan"
+    p = out["steps"][0]["params"]
+    assert p["type_name"] == "Broker"
+    assert p["entity_uris"] == uris  # exactly the resolved 5
+    assert p["scope"] is None  # explicit set supersedes value-scope
+    assert p["limit"] is None  # no whole-type cap for an explicit set
+    assert out["steps"][0]["preview"]["entity_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_enrich_unresolvable_subset_fails_closed(monkeypatch):
+    """When the user names a subset we CANNOT resolve to entities, fail closed —
+    clarify instead of silently enriching the whole type."""
+    _stub_classifier(monkeypatch, "enrich")
+    _stub_kg_types(monkeypatch, ["Broker"])
+
+    async def fake_schema(neptune, tenant_id, type_name):
+        return {"attributes": ["website"], "relationships": []}
+
+    monkeypatch.setattr(
+        "cograph_client.agent.capabilities.enrich_cap.list_type_schema", fake_schema
+    )
+    _stub_enrich_extract(
+        monkeypatch,
+        {
+            "attributes": ["website"],
+            "scope": None,
+            "subset": {"description": "the brokers Sarah mentioned", "limit": None},
+            "tier": "core",
+        },
+    )
+    _stub_subset_resolver(monkeypatch, [])  # resolution finds nothing
+
+    out = await asyncio.wait_for(
+        handle(_ctx(), "enrich the brokers Sarah mentioned with their websites"),
+        TIMEOUT,
+    )
+    assert out["kind"] == "clarify"  # not a whole-type plan
+
+
+@pytest.mark.asyncio
+async def test_execute_enrich_passes_entity_uris(monkeypatch):
+    """An enrich step carrying entity_uris builds an EnrichJob scoped to exactly
+    those IRIs (entity_uris wins over scope in the executor)."""
+    cap = EnrichCapability()
+    job_store = FakeJobStore()
+    ctx = _ctx(job_store=job_store)
+    uris = ["https://onta.dev/e/broker/1", "https://onta.dev/e/broker/2"]
+    step = PlanStep(
+        capability="enrich",
+        action="run_enrichment",
+        params={
+            "type_name": "Broker",
+            "attributes": ["website"],
+            "tier": "core",
+            "confidence_min": 0.4,
+            "scope": None,
+            "limit": None,
+            "entity_uris": uris,
+        },
+    )
+    out = await asyncio.wait_for(cap.execute(ctx, step), TIMEOUT)
+    assert out["kind"] == "ack"
+    assert len(job_store.created) == 1
+    job = job_store.created[0]
+    assert job.entity_uris == uris
+    assert job.type_name == "Broker"
+    assert job.limit is None
+
+
+def test_pipeline_entity_uris_from_bindings():
+    """The resolver extracts the ?uri column (deduped, order-preserving, capped),
+    falling back to the first IRI-looking value when a row lacks ?uri."""
+    from cograph_client.nlp.pipeline import NLQueryPipeline
+
+    bindings = [
+        {"uri": "https://onta.dev/e/b/1", "n": "299"},
+        {"uri": "https://onta.dev/e/b/2", "n": "194"},
+        {"uri": "https://onta.dev/e/b/1", "n": "299"},  # duplicate dropped
+        {"name": "no-iri-here"},  # skipped — no IRI
+        {"x": "https://onta.dev/e/b/3"},  # fallback to first IRI value
+    ]
+    assert NLQueryPipeline._entity_uris_from_bindings(bindings, limit=10) == [
+        "https://onta.dev/e/b/1",
+        "https://onta.dev/e/b/2",
+        "https://onta.dev/e/b/3",
+    ]
+    assert NLQueryPipeline._entity_uris_from_bindings(bindings, limit=1) == [
+        "https://onta.dev/e/b/1",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_ambiguous_routes_to_clarify(monkeypatch):
     _stub_classifier(monkeypatch, "ambiguous", clarify="Which field?")
