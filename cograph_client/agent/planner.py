@@ -389,6 +389,20 @@ async def _respond(
         if payload is not None:
             return {"kind": "answer", **payload}
 
+    # Brief clarification step: a capability couldn't pin down WHICH entities the
+    # user means (e.g. enrich couldn't resolve a described subset, or the scope
+    # matched nothing). Surface a short, targeted question (with clickable options)
+    # so the user can guide the scope; the running transcript accumulates their
+    # reply, so next turn the capability re-resolves with the added detail.
+    if len(steps) == 1 and steps[0].action == "clarify":
+        p = steps[0].params
+        return {
+            "kind": "clarify",
+            "question": p.get("question")
+            or "Could you clarify which entities you mean?",
+            "options": p.get("options") or [],
+        }
+
     steps = order_steps(steps)
     plan_id = _new_plan_id()
     await make_plan_store().save(
@@ -434,6 +448,12 @@ async def _plan_intents(
         steps = await cap.plan(ctx, instruction)  # type: ignore[attr-defined]
         if not steps:
             continue
+        # A capability can ask for a brief clarification instead of proposing a
+        # plan (e.g. enrich couldn't resolve a described subset, or the scope
+        # matched 0 entities). Surface that immediately rather than composing a
+        # partial plan around it — the user's reply re-runs resolution next turn.
+        if len(steps) == 1 and getattr(steps[0], "action", "") == "clarify":
+            return steps
         if intent in ("dedup", "enrich") and normalize_ids:
             for s in steps:
                 s.depends_on = list(dict.fromkeys([*s.depends_on, *normalize_ids]))

@@ -160,7 +160,11 @@ class EnrichCapability:
         if subset and subset.get("description"):
             entity_uris = await self._resolve_subset_uris(ctx, type_name, subset)
             if not entity_uris:
-                return []
+                # Couldn't pin the subset down (the LLM couldn't form a query, or
+                # it matched 0). Don't enrich the whole type and don't bail with a
+                # generic message — ask a SHORT, targeted question so the user can
+                # guide us to a scope we can find (COG: confirm-the-scope).
+                return [_subset_clarify_step(type_name, subset)]
             scope = None  # the explicit entity set supersedes any value-scope
 
         # Resolve the tier's adapter chain ONCE and derive (a) whether it is a
@@ -233,6 +237,13 @@ class EnrichCapability:
             matched, matched_exact = await self._estimate_matched(
                 ctx, type_name, scope, attributes
             )
+            # A value-FILTER the user gave that we can count exactly and that
+            # matches NOTHING has no entities to enrich — ask briefly instead of
+            # proposing an empty paid job (COG: confirm-the-scope on 0 results).
+            # Scoped only: an unfiltered "enrich all X" is never interrupted by a
+            # transient 0, and the subset path handles its own empties above.
+            if scope is not None and matched_exact and matched == 0:
+                return [_no_match_clarify_step(type_name, scope)]
         cost = _estimate_cost(
             tier=tier,
             per_entity_cost=per_entity_cost,
@@ -247,9 +258,13 @@ class EnrichCapability:
         subset_desc = subset.get("description") if subset else None
         n_entities = len(entity_uris) if entity_uris is not None else None
         if n_entities is not None:
+            noun = "entity" if n_entities == 1 else "entities"
+            # Echo the INTERPRETED subset back so the user can verify we understood
+            # their scope before confirming a paid run (COG: confirm-the-scope).
             target_phrase = (
-                f"the {n_entities} selected {type_name} "
-                f"{'entity' if n_entities == 1 else 'entities'}"
+                f"the {n_entities} {type_name} {noun} matching “{subset_desc}”"
+                if subset_desc
+                else f"the {n_entities} selected {type_name} {noun}"
             )
         else:
             target_phrase = f"matched {type_name} entities (capped at {limit})"
@@ -562,6 +577,53 @@ def _resolve_target_type(
     if len(known_types) == 1:
         return known_types[0]
     return None
+
+
+# --- brief scope clarifications (action="clarify" steps the planner surfaces) -- #
+# When we can't turn the user's described scope into a concrete entity set, a SHORT
+# targeted question + clickable options beats either silently enriching the whole
+# type or a vague "be more specific". The planner short-circuits a single
+# action="clarify" step into a {kind:"clarify"} reply; the user's answer is
+# accumulated into the next turn's instruction so resolution re-runs with it.
+
+
+def _subset_clarify_step(type_name: str, subset: dict) -> PlanStep:
+    """Brief clarify when a described subset can't be resolved to any entities —
+    guide the user toward a scope we CAN find via SPARQL (by name, all, or rank)."""
+    desc = str(subset.get("description") or "").strip()
+    by = f" by “{desc}”" if desc else ""
+    return PlanStep(
+        capability="enrich",
+        action="clarify",
+        params={
+            # Guidance lives in the question (names / a ranking); the one chip is a
+            # self-contained quick action, since a clicked option is sent verbatim.
+            "question": (
+                f"I couldn't pin down which {type_name} you mean{by}. Tell me by "
+                "name or a ranking (e.g. “top 5 by listings”), or enrich them all?"
+            ),
+            "options": [f"Enrich all {type_name}"],
+        },
+        rationale="The described subset did not resolve to any entities.",
+    )
+
+
+def _no_match_clarify_step(type_name: str, scope: dict) -> PlanStep:
+    """Brief clarify when the user's value-FILTER matched 0 entities — nothing to
+    enrich, so ask rather than propose an empty paid job."""
+    return PlanStep(
+        capability="enrich",
+        action="clarify",
+        params={
+            "question": (
+                f"No {type_name} matched {scope.get('predicate')} = "
+                f"{scope.get('value')!r}. Adjust the filter, or enrich all "
+                f"{type_name}?"
+            ),
+            "options": [f"Enrich all {type_name}"],
+        },
+        rationale=f"No {type_name} matched the requested filter.",
+    )
 
 
 def _default_conflict_policy():

@@ -427,6 +427,49 @@ async def test_enrich_unresolvable_subset_fails_closed(monkeypatch):
         TIMEOUT,
     )
     assert out["kind"] == "clarify"  # not a whole-type plan
+    # Brief + targeted: names the type and offers guiding options to converge.
+    assert "Broker" in out["question"]
+    assert out.get("options")
+
+
+@pytest.mark.asyncio
+async def test_enrich_zero_match_scope_clarifies(monkeypatch):
+    """A value-scope that matches 0 entities asks a brief question instead of
+    proposing an empty paid job (confirm-the-scope on 0 results)."""
+    _stub_classifier(monkeypatch, "enrich")
+    _stub_kg_types(monkeypatch, ["Mentor"])
+    _stub_schema(monkeypatch)  # Mentor: 'speaks' relationship present
+    _stub_enrich_extract(
+        monkeypatch,
+        {
+            "attributes": ["company"],
+            "scope": {"predicate": "speaks", "value": "Klingon"},
+            "tier": "core",
+        },
+    )
+
+    async def fake_sample(neptune, tenant_id, kg, type_name, pred_leaf):
+        return [], "literal"
+
+    monkeypatch.setattr(
+        "cograph_client.agent.capabilities.enrich_cap.sample_predicate_values",
+        fake_sample,
+    )
+
+    class ZeroExecutor:
+        async def count_entities(self, tenant_id, kg_name, type_name, scope=None):
+            return 0
+
+    out = await asyncio.wait_for(
+        handle(
+            _ctx(executor=ZeroExecutor()),
+            "enrich the company for mentors who speak Klingon",
+        ),
+        TIMEOUT,
+    )
+    assert out["kind"] == "clarify"
+    assert "Mentor" in out["question"]  # targeted to the type
+    assert out.get("options")  # offers "enrich all" / "different value"
 
 
 @pytest.mark.asyncio
@@ -735,6 +778,18 @@ async def test_route_confirm_executes_plan(monkeypatch):
     monkeypatch.setattr(
         "cograph_client.agent.capabilities.enrich_cap.sample_predicate_values",
         fake_sample,
+    )
+
+    # The route uses a real executor over a mocked (empty) Neptune, so a real
+    # COUNT would read 0 and the planner would (correctly) clarify "nothing
+    # matched". This test exercises the confirm→execute flow, so give it a
+    # non-zero matched count to get an actual plan.
+    async def fake_count(self, *args, **kwargs):
+        return 3
+
+    monkeypatch.setattr(
+        "cograph_client.enrichment.executor.EnrichmentExecutor.count_entities",
+        fake_count,
     )
 
     app = create_app()
