@@ -42,6 +42,9 @@ from cograph_client.enrichment.models import (
 )
 from cograph_client.enrichment.sources.base import adapter_cost, get_adapter
 from cograph_client.enrichment.tiers import get_chain
+from cograph_client.graph.ontology_queries import list_types_query
+from cograph_client.graph.parser import parse_sparql_results
+from cograph_client.graph.queries import tenant_graph_uri
 from cograph_client.normalization.inference import (
     list_type_schema,
     sample_predicate_values,
@@ -114,8 +117,15 @@ class EnrichCapability:
         phrase like "current company" maps to the ``company`` attribute (and the
         tier is chosen with web-fact guidance), instead of the model guessing a
         stray word ("current") and the planner bailing to clarify.
+
+        The target TYPE is resolved from the instruction first, NOT from the
+        Explorer's current selection: "enrich brokers with their websites"
+        enriches Broker even when PropertyListing is the type selected in the UI.
+        ``ctx.type_name`` (the selection) is only a fallback for when the message
+        names no known type (see :func:`_resolve_target_type`).
         """
-        type_name = ctx.type_name or ""
+        known_types = await _list_types(ctx)
+        type_name = _resolve_target_type(instruction, known_types, ctx.type_name)
         if not type_name:
             return []
         schema = await list_type_schema(ctx.neptune, ctx.tenant_id, type_name)
@@ -340,6 +350,131 @@ class EnrichCapability:
                 "in the background; results will be staged for review."
             ),
         }
+
+
+# --- target-type resolution: prefer the type NAMED in the instruction --------- #
+# The Explorer sends the currently-selected type as ``ctx.type_name``. That
+# selection must NEVER override a type the user actually names in their message:
+# "enrich brokers with their websites" enriches Broker even when PropertyListing
+# is the selected type. We resolve the target type from the instruction text
+# (case-insensitive, CamelCase- and plural-tolerant) and fall back to the
+# selection ONLY when the message names no known type — so a missing/wrong UI
+# selection no longer bails the plan to "couldn't determine the specifics".
+
+_TYPE_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+
+
+async def _list_types(ctx: AgentContext) -> list[str]:
+    """The tenant's declared type names, for resolving the target type from text.
+
+    Reuses the SAME ontology query the ``/ontology/types`` route and the ontology
+    capability use (:func:`list_types_query`) — a bounded single round-trip read,
+    never an instance scan. Defensive: any read error degrades to ``[]`` so type
+    resolution falls back to the selected type rather than failing the plan.
+    """
+    try:
+        onto_graph = tenant_graph_uri(ctx.tenant_id)
+        _, rows = parse_sparql_results(
+            await ctx.neptune.query(list_types_query(onto_graph))
+        )
+    except Exception:  # noqa: BLE001 — a type-list read must never break planning
+        logger.warning("agent_enrich_list_types_failed", exc_info=True)
+        return []
+    seen: set[str] = set()
+    names: list[str] = []
+    for r in rows:
+        label = (r.get("label") or "").strip()
+        if label and label not in seen:
+            seen.add(label)
+            names.append(label)
+    return names
+
+
+def _singularize(word: str) -> str:
+    """Tiny dependency-free English singularizer — for MATCHING only, not display."""
+    w = word.lower()
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"  # companies -> company, agencies -> agency
+    if len(w) > 4 and w.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return w[:-2]  # addresses -> address, boxes -> box
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]  # brokers -> broker, listings -> listing
+    return w
+
+
+def _type_tokens(text: str) -> list[str]:
+    return [w.lower() for w in _TYPE_WORD_RE.findall(text or "")]
+
+
+def _camel_words(type_name: str) -> list[str]:
+    """Split a type name into lowercase words: ``PropertyListing`` -> ['property',
+    'listing'], ``URL`` -> ['url'], ``real_estate_agent`` -> ['real', 'estate',
+    'agent']. Lets a multi-word type be phrase-matched against the instruction."""
+    parts: list[str] = []
+    for chunk in re.split(r"[\s_\-]+", type_name or ""):
+        parts.extend(
+            re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z][a-z0-9]*|[a-z0-9]+", chunk)
+        )
+    return [p.lower() for p in parts if p]
+
+
+def _phrase_in_tokens(words: list[str], tokens: list[str]) -> bool:
+    """True if ``words`` appears as a contiguous run in ``tokens`` (each compared
+    singularized, so "property listings" matches the type ``PropertyListing``)."""
+    if not words:
+        return False
+    w = [_singularize(x) for x in words]
+    t = [_singularize(x) for x in tokens]
+    span = len(w)
+    return any(t[i : i + span] == w for i in range(len(t) - span + 1))
+
+
+def _match_type_in_text(text: str, known_types: list[str]) -> str | None:
+    """Return the known type NAMED in ``text``, or None.
+
+    A single-word type matches a (singularized) token; a multi-word (CamelCase)
+    type matches the full phrase in order. When several types match, the LONGEST
+    name wins so a specific ``PropertyListing`` beats a bare ``Property``.
+    """
+    tokens = _type_tokens(text)
+    if not tokens or not known_types:
+        return None
+    singles = {_singularize(t) for t in tokens}
+    best: str | None = None
+    best_len = -1
+    for name in known_types:
+        words = _camel_words(name)
+        if not words:
+            continue
+        if len(words) == 1:
+            hit = _singularize(words[0]) in singles
+        else:
+            hit = _phrase_in_tokens(words, tokens)
+        if hit and len(name) > best_len:
+            best, best_len = name, len(name)
+    return best
+
+
+def _resolve_target_type(
+    instruction: str, known_types: list[str], selected: str | None
+) -> str | None:
+    """Pick the type to enrich, PREFERRING one named in the instruction.
+
+    Order:
+      1. a known type named in the message wins — the user said it explicitly;
+      2. else the selected (UI) type, when it is a real KG type OR when we
+         couldn't list types at all (preserve the legacy selection behavior);
+      3. else, when the KG has exactly one type, that type;
+      4. else None — the caller asks which type to enrich.
+    """
+    named = _match_type_in_text(instruction, known_types)
+    if named:
+        return named
+    if selected and (not known_types or selected in known_types):
+        return selected
+    if len(known_types) == 1:
+        return known_types[0]
+    return None
 
 
 def _default_conflict_policy():

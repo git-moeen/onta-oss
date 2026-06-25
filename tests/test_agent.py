@@ -265,6 +265,83 @@ async def test_enrich_routes_to_plan(monkeypatch):
     assert steps[0]["params"]["attributes"] == ["company"]
 
 
+def _stub_kg_types(monkeypatch, names: list[str]):
+    """Stub the enrich capability's KG type listing to ``names``."""
+
+    async def fake_list_types(ctx):
+        return list(names)
+
+    monkeypatch.setattr(
+        "cograph_client.agent.capabilities.enrich_cap._list_types", fake_list_types
+    )
+
+
+@pytest.mark.asyncio
+async def test_enrich_infers_type_from_message_over_selection(monkeypatch):
+    """The type NAMED in the message wins over the UI selection: "enrich brokers
+    with their websites" targets Broker even though ctx.type_name is Mentor (the
+    selected-but-wrong type). Regression for the enrich-uses-selection bug."""
+    _stub_classifier(monkeypatch, "enrich")
+    _stub_kg_types(monkeypatch, ["Broker", "PropertyListing", "Mentor"])
+
+    captured: dict = {}
+
+    async def fake_schema(neptune, tenant_id, type_name):
+        captured["schema_type"] = type_name
+        return {"attributes": ["website"], "relationships": []}
+
+    monkeypatch.setattr(
+        "cograph_client.agent.capabilities.enrich_cap.list_type_schema", fake_schema
+    )
+    _stub_enrich_extract(
+        monkeypatch, {"attributes": ["website"], "scope": None, "tier": "core"}
+    )
+
+    out = await asyncio.wait_for(
+        handle(_ctx(), "enrich brokers with their websites"), TIMEOUT
+    )
+    assert out["kind"] == "plan"
+    step = out["steps"][0]
+    assert step["params"]["type_name"] == "Broker"  # message won, not Mentor
+    assert captured["schema_type"] == "Broker"  # grounded in Broker's schema
+    assert step["params"]["attributes"] == ["website"]
+
+
+@pytest.mark.asyncio
+async def test_enrich_infers_type_with_no_selection(monkeypatch):
+    """With NO type selected (ctx.type_name is None), a message that names the
+    type still plans (resolves Broker) instead of bailing to clarify."""
+    _stub_classifier(monkeypatch, "enrich")
+    _stub_kg_types(monkeypatch, ["Broker", "PropertyListing"])
+
+    async def fake_schema(neptune, tenant_id, type_name):
+        return {"attributes": ["website"], "relationships": []}
+
+    monkeypatch.setattr(
+        "cograph_client.agent.capabilities.enrich_cap.list_type_schema", fake_schema
+    )
+    _stub_enrich_extract(
+        monkeypatch, {"attributes": ["website"], "scope": None, "tier": "core"}
+    )
+
+    ctx = AgentContext(
+        tenant_id="t1",
+        kg_name="kg1",
+        neptune=FakeNeptune(),
+        type_name=None,  # nothing selected in the UI
+        openrouter_key="fake-key",
+        extras={
+            "enrichment_executor": FakeExecutor(),
+            "enrichment_job_store": FakeJobStore(),
+        },
+    )
+    out = await asyncio.wait_for(
+        handle(ctx, "look up the websites for the top 5 brokers"), TIMEOUT
+    )
+    assert out["kind"] == "plan"
+    assert out["steps"][0]["params"]["type_name"] == "Broker"
+
+
 @pytest.mark.asyncio
 async def test_ambiguous_routes_to_clarify(monkeypatch):
     _stub_classifier(monkeypatch, "ambiguous", clarify="Which field?")
