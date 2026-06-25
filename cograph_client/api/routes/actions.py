@@ -158,6 +158,110 @@ def _new_job(
     )
 
 
+# --- scheduled dispatch (COG-136) ---------------------------------------------
+# The schedule firing loop and the /actions/* routes must create+run jobs the
+# SAME way, so the worker logic isn't duplicated and the two paths can't drift.
+# The routes keep their existing _new_job + _spawn(worker) flow byte-for-byte;
+# this helper is the ONE place that maps a Schedule (action + category + params)
+# onto the same job + same worker, tagged trigger=scheduled. The runner imports
+# and awaits it; the routes are unchanged.
+
+
+def _job_from_schedule(schedule) -> EnrichJob:
+    """Build an ``EnrichJob`` for a scheduled firing of ``schedule``.
+
+    Mirrors ``_new_job`` (manual path) but tags ``trigger=scheduled`` and pulls
+    the action payload from ``schedule.params`` (the enrich body fields when the
+    action is ``enrich``; dedupe/suggest carry no extra payload). Unknown/extra
+    params are ignored so adding a field to an action body never breaks dispatch.
+    """
+    params = schedule.params or {}
+    tier = params.get("tier", EnrichmentTier.lite)
+    conflict_policy = params.get("conflict_policy", ConflictPolicy.stage)
+    scope = params.get("scope")
+    if scope is not None and not isinstance(scope, EnrichScope):
+        scope = EnrichScope.model_validate(scope)
+    job = _new_job(
+        tenant_id=schedule.tenant_id,
+        kg_name=schedule.kg_name,
+        category=schedule.category,
+        type_name=params.get("type_name", ""),
+        attributes=params.get("attributes") or [],
+        tier=EnrichmentTier(tier) if not isinstance(tier, EnrichmentTier) else tier,
+        conflict_policy=(
+            ConflictPolicy(conflict_policy)
+            if not isinstance(conflict_policy, ConflictPolicy)
+            else conflict_policy
+        ),
+        confidence_min=params.get("confidence_min", 0.85),
+        limit=params.get("limit"),
+        scope=scope,
+        entity_uris=params.get("entity_uris"),
+    )
+    job.trigger = JobTrigger.scheduled
+    return job
+
+
+async def dispatch_scheduled_action(
+    schedule,
+    *,
+    client: NeptuneClient,
+    job_store,
+    executor: EnrichmentExecutor,
+) -> EnrichJob:
+    """Create + run the job for a due ``schedule``, reusing the route workers.
+
+    Returns the created job. The worker runs to completion when awaited (the
+    runner awaits it); callers that want fire-and-forget can wrap the returned
+    coroutine themselves. Action → worker mapping is identical to the routes:
+
+    - ``find-merge-duplicates`` → :func:`_run_dedupe`
+    - ``enrich``                → :meth:`EnrichmentExecutor.run`
+    - ``suggest-relationships`` → :func:`_run_suggest` (premium recommender), or
+      a terminal no-op job when no recommender is wired (mirrors the route's
+      graceful degrade).
+    """
+    job = _job_from_schedule(schedule)
+    action = schedule.action
+
+    if action == "enrich":
+        await job_store.create(job)
+        await executor.run(job, schedule.tenant_id)
+        return job
+
+    if action == "find-merge-duplicates":
+        await job_store.create(job)
+        await _run_dedupe(
+            client, job_store, job.id, schedule.tenant_id, schedule.kg_name
+        )
+        return job
+
+    if action == "suggest-relationships":
+        if not job.cost_note:
+            job.cost_note = (
+                "Relationship suggestion requires the premium recommender."
+            )
+        if _recommender is None:
+            # Degrade gracefully, exactly like the route: terminal failed job.
+            now = datetime.now(timezone.utc)
+            job.status = JobStatus.failed
+            job.error = (
+                job.cost_note + " No recommender is wired in this deployment."
+            )
+            job.completed_at = now
+            job.last_run = now
+            await job_store.create(job)
+            return job
+        await job_store.create(job)
+        await _run_suggest(
+            client, job_store, job.id, schedule.tenant_id, schedule.kg_name
+        )
+        return job
+
+    # Defensive: ScheduleAction is a closed Literal, so this is unreachable.
+    raise ValueError(f"unknown schedule action: {action!r}")
+
+
 # --- find & merge duplicates (dedupe) -----------------------------------------
 
 

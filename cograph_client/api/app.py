@@ -129,7 +129,28 @@ async def lifespan(app: FastAPI):
     setup_logging(settings.log_level)
     logger.info("starting", neptune_endpoint=settings.neptune_endpoint)
     app.state.neptune_client = NeptuneClient(settings.neptune_endpoint, backend=settings.graph_backend)
+    # COG-136: start the in-process schedule firing loop. make_schedule_runner
+    # returns None when scheduling is disabled (no database_url and not explicitly
+    # enabled), so startup is unaffected when the feature is off. Failures here
+    # are logged but never block the app from serving requests.
+    app.state.schedule_runner = None
+    try:
+        from cograph_client.scheduling.runner import make_schedule_runner
+
+        runner = make_schedule_runner(app.state)
+        if runner is not None:
+            runner.start()
+            app.state.schedule_runner = runner
+            logger.info("schedule_runner_enabled")
+    except Exception as exc:  # noqa: BLE001 - scheduling must not break startup
+        logger.error("schedule_runner_start_failed", error=str(exc))
     yield
+    runner = getattr(app.state, "schedule_runner", None)
+    if runner is not None:
+        try:
+            await runner.stop()
+        except Exception as exc:  # noqa: BLE001 - shutdown best-effort
+            logger.warning("schedule_runner_stop_failed", error=str(exc))
     await app.state.neptune_client.close()
     logger.info("shutdown")
 
