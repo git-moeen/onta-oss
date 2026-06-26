@@ -265,6 +265,90 @@ async def test_enrich_routes_to_plan(monkeypatch):
     assert steps[0]["params"]["attributes"] == ["company"]
 
 
+# --------------------------------------------------------------------------- #
+# 2b. Deterministic web-discovery guard
+#     An explicit "… from the web" request must route to discovery even when the
+#     classifier mis-files it as question/ambiguous (the payload reads like a
+#     query: "list … with …"). The Explorer's "Add data from the web" entry point
+#     depends on this — see WebDiscoveryStep.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_explicit_web_request_forces_discover_over_question(monkeypatch):
+    # Classifier WRONGLY says "question" (the message contains "list"). The guard
+    # must override and route to discovery, NOT the query answerer.
+    _stub_classifier(monkeypatch, "question")
+
+    async def fake_answer(self, ctx, q):
+        return {"answer": "SHOULD_NOT_RUN", "sparql": "", "rows": [], "narrative": ""}
+
+    monkeypatch.setattr(QueryCapability, "answer", fake_answer)
+
+    out = await asyncio.wait_for(
+        handle(
+            _ctx(),
+            "Add data from the web: list models TTS models with a VAPI humanness score",
+        ),
+        TIMEOUT,
+    )
+    # Did NOT fall through to the read-only query path.
+    assert out.get("answer") != "SHOULD_NOT_RUN"
+    # With no web-source provider registered in OSS, the discover capability
+    # answers with a clear "not enabled" message — proof it handled the turn.
+    body = f"{out.get('narrative', '')} {out.get('answer', '')}".lower()
+    assert "enabled" in body
+
+
+@pytest.mark.asyncio
+async def test_explicit_web_request_overrides_ambiguous(monkeypatch):
+    # The reported bug: classifier returns the generic "ambiguous" clarify. The
+    # guard must still route an explicit web request to discovery.
+    _stub_classifier(monkeypatch, "ambiguous", clarify="Could you clarify?")
+    out = await asyncio.wait_for(
+        handle(_ctx(), "add the S&P 500 companies from the web"), TIMEOUT
+    )
+    # Not the generic clarify dead-end.
+    assert not (
+        out["kind"] == "clarify"
+        and "clarify what you'd like" in out.get("question", "").lower()
+    )
+    body = f"{out.get('narrative', '')} {out.get('answer', '')}".lower()
+    assert "enabled" in body  # routed to discovery (degrades to not-enabled in OSS)
+
+
+@pytest.mark.asyncio
+async def test_plain_list_question_is_not_hijacked(monkeypatch):
+    # A genuine read-only question that does NOT mention the web must still
+    # answer — the guard must not over-trigger.
+    _stub_classifier(monkeypatch, "question")
+
+    async def fake_answer(self, ctx, q):
+        return {"answer": "42", "sparql": "SELECT", "rows": [], "narrative": ""}
+
+    monkeypatch.setattr(QueryCapability, "answer", fake_answer)
+    out = await asyncio.wait_for(
+        handle(_ctx(), "list the TTS models in this graph"), TIMEOUT
+    )
+    assert out["kind"] == "answer"
+    assert out["answer"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_web_question_is_not_hijacked(monkeypatch):
+    # "how many … from the web?" is a read-only question (trailing '?', question
+    # lead) — the guard must leave it alone.
+    _stub_classifier(monkeypatch, "question")
+
+    async def fake_answer(self, ctx, q):
+        return {"answer": "7", "sparql": "SELECT", "rows": [], "narrative": ""}
+
+    monkeypatch.setattr(QueryCapability, "answer", fake_answer)
+    out = await asyncio.wait_for(
+        handle(_ctx(), "how many companies did we add from the web?"), TIMEOUT
+    )
+    assert out["kind"] == "answer"
+    assert out["answer"] == "7"
+
+
 def _stub_kg_types(monkeypatch, names: list[str]):
     """Stub the enrich capability's KG type listing to ``names``."""
 

@@ -27,6 +27,7 @@ restart or a different task than the one that planned), else an
 from __future__ import annotations
 
 import json
+import re
 
 import structlog
 
@@ -143,11 +144,45 @@ and no small set of choices fits."""
 # an intent when the user clicks it, so the next turn routes straight to a plan.
 _DEFAULT_ACTION_OPTIONS = [
     "Ask a question about the data",
+    "Add data from the web",
     "Clean up messy values",
     "Enrich missing attributes",
     "Merge duplicate records",
     "Change the schema",
 ]
+
+# --- deterministic web-discovery guard --------------------------------------- #
+# The LLM classifier occasionally mis-files an explicit "… from the web" ingest
+# as "question" (its payload usually contains "list"/"show me …") or "ambiguous".
+# That strands the Explorer's "Add data from the web" entry point — and the CLI /
+# MCP — on a generic clarify the user can't escape. When the phrasing is an
+# UNMISTAKABLE imperative web fetch we force the discover intent ourselves rather
+# than trusting the LLM. Kept narrow so genuine read-only questions are untouched.
+_WEB_FETCH_RE = re.compile(
+    r"\b(?:add|pull|fetch|find|get|grab|collect|ingest|import|gather|scrape|discover)\b"
+    r"[^?]*\bfrom\s+the\s+web\b",
+    re.IGNORECASE,
+)
+# Read-only framings we must NOT hijack even when they mention the web (e.g.
+# "how many companies did we add from the web?").
+_QUESTION_LEAD_RE = re.compile(
+    r"^\s*(?:how\s+many|how\s+much|what|which|who|whom|whose|when|where|why|"
+    r"do\s+we|did\s+we|does|is\s+there|are\s+there|count)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_web_discovery_request(message: str) -> bool:
+    """True when ``message`` is an unmistakable 'fetch X from the web' request.
+
+    Conservative on purpose: a trailing '?' or a question-word lead disqualifies
+    it, so a real read-only question that merely mentions the web is never forced
+    into discovery.
+    """
+    msg = (message or "").strip()
+    if not msg or msg.endswith("?") or _QUESTION_LEAD_RE.match(msg):
+        return False
+    return bool(_WEB_FETCH_RE.search(msg))
 
 
 def _format_history(history: list[Turn] | None) -> str:
@@ -344,6 +379,19 @@ async def _respond(
     )
     classification = await _classify(ctx, message, recent, prior_clarify_count)
     intents = classification.get("intents", ["ambiguous"])
+
+    # Deterministic web-discovery override: an explicit "… from the web" ingest
+    # must route to discovery even if the classifier filed it as question /
+    # ambiguous (the payload often reads like a query — "list … with …"). Force
+    # discover and drop the read-only intents so it can't be hijacked by the
+    # question fast-path below. Only when the discover capability is registered.
+    if _is_web_discovery_request(message) and get_capability(
+        _INTENT_TO_CAPABILITY["discover"]
+    ) is not None:
+        intents = [
+            "discover",
+            *[i for i in intents if i not in ("discover", "question", "ambiguous")],
+        ]
 
     # A read-only question is terminal and does not compose with actions.
     if "question" in intents:
