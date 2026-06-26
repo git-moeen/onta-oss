@@ -1,6 +1,6 @@
 {
   "name": "cograph-mcp",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Cograph MCP server — expose knowledge graph tools to AI agents",
   "type": "module",
   "main": "./dist/index.js",
