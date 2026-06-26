@@ -36,6 +36,7 @@ from cograph_client.graph.ontology_queries import (
 )
 from cograph_client.graph.layers import LayerStack, type_name_from_uri
 from cograph_client.graph.parser import parse_sparql_results
+from cograph_client.graph.kg_writer import insert_facts
 from cograph_client.graph.provenance import build_provenance_triples, provenance_graph_uri
 from cograph_client.graph.queries import BATCH_PREDICATE, batched_insert_triples, delete_batch_query, insert_triples, tenant_graph_uri
 from cograph_client.resolver.attribute_resolver import (
@@ -451,22 +452,20 @@ class SchemaResolver:
         if er_index_triples:
             all_entity_triples.extend(er_index_triples)
 
-        # Batch insert ALL entity triples in one call (not per-entity)
-        if all_entity_triples:
+        # Single shared write path (graph/kg_writer.py) — the SAME function the
+        # enrichment writer uses: batched instance-triple insert + the companion
+        # provenance graph, in one place, so ingestion and enrichment can never
+        # drift on HOW facts are written. (Per-fact provenance is flushed in one
+        # batched INSERT per ingest, COG-46 — the exact triples a per-entity
+        # write would produce; only the write pattern is batched.)
+        if all_entity_triples or all_provenance_triples:
             instance_graph = getattr(self, "_instance_graph", graph_uri)
-            for sparql in batched_insert_triples(instance_graph, all_entity_triples):
-                await self._neptune.update(sparql)
-
-        # Flush per-fact provenance in ONE batched INSERT per ingest (COG-46),
-        # chunked at the same batch size as the instance-triple batcher. The
-        # exact same triples a per-entity write would produce — only the
-        # write pattern changes.
-        if all_provenance_triples:
-            instance_graph = getattr(self, "_instance_graph", graph_uri)
-            for sparql in batched_insert_triples(
-                provenance_graph_uri(instance_graph), all_provenance_triples,
-            ):
-                await self._neptune.update(sparql)
+            await insert_facts(
+                self._neptune,
+                instance_graph,
+                all_entity_triples,
+                provenance_triples=all_provenance_triples or None,
+            )
 
         # Incrementally embed newly created types for future embedding pre-filter matches
         if result.types_created and self._embedding_service is not None:

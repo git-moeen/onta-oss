@@ -1024,6 +1024,46 @@ def test_executor_no_match_when_no_verdict():
     asyncio.run(run())
 
 
+def test_executor_apply_routes_through_shared_writer(monkeypatch):
+    """The enrichment apply path MUST go through the shared writer's post-write
+    housekeeping (graph/kg_writer.refresh_after_write) — the convergence
+    guarantee with CSV/JSON ingestion. Regression guard: if someone reintroduces
+    a bespoke write tail that skips re-embed / cache-invalidate, this fails."""
+    import cograph_client.enrichment.executor as ex
+
+    captured: dict = {}
+
+    async def fake_refresh(neptune, *, tenant_id, kg_name, affected_types, recompute_stats=True):
+        captured["called"] = True
+        captured["tenant_id"] = tenant_id
+        captured["kg_name"] = kg_name
+        captured["affected_types"] = set(affected_types)
+
+    monkeypatch.setattr(ex, "refresh_after_write", fake_refresh)
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.return_value = _entities_query_response(rows)
+        store = InMemoryJobStore()
+        wikidata = FakeWikidata(
+            {("Bosch", "manufacturer"): [Verdict(value="Robert Bosch GmbH", confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, EnrichmentCache(), wikidata)
+        # overwrite policy + empty existing → action=filled → a write happens.
+        job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        assert captured.get("called") is True
+        assert captured["kg_name"] == "kg"
+        assert captured["affected_types"] == {"Product"}
+
+    asyncio.run(run())
+
+
 def test_executor_stage_with_no_results_completes_applied():
     """stage policy + all no_match → ``applied`` (nothing to review), while
     stage policy + a staged value → ``review``. The two halves pin the boundary

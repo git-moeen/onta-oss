@@ -40,10 +40,10 @@ from cograph_client.enrichment.strategy import (
 )
 from cograph_client.enrichment.tiers import get_chain
 from cograph_client.graph.client import NeptuneClient
+from cograph_client.graph.kg_writer import insert_facts, refresh_after_write
 from cograph_client.graph.ontology_queries import upsert_attribute
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import (
-    insert_triples,
     kg_graph_uri,
     tenant_graph_uri,
 )
@@ -920,12 +920,19 @@ class EnrichmentExecutor:
                 # above before any write, so review-mode declares nothing.
                 applied_attrs = self._applied_attribute_names(all_rows, policy)
                 await self._declare_attributes(tenant_id, job.type_name, applied_attrs)
-                await self._neptune.update(insert_triples(graph_uri, triples))
-                # New attribute values were written → the Explorer's precomputed
-                # type-stats (coverage %, counts) are now stale. Recompute them
-                # in the background so the panels refresh without waiting for the
-                # summary-cache TTL. Only fire when something was actually applied.
-                self._schedule_stats_recompute(tenant_id, job.kg_name)
+                # Single shared write path — identical to CSV/JSON ingestion
+                # (graph/kg_writer.py): batched insert, then post-write
+                # housekeeping (invalidate the NL-planning cache, re-embed the
+                # enriched type so semantic retrieval doesn't serve a stale schema
+                # embedding, and recompute the Explorer's type-stats). Only fires
+                # when something was actually applied.
+                await insert_facts(self._neptune, graph_uri, triples)
+                await refresh_after_write(
+                    self._neptune,
+                    tenant_id=tenant_id,
+                    kg_name=job.kg_name,
+                    affected_types={job.type_name},
+                )
             job.status = JobStatus.applied
             job.completed_at = _now()
             await self._jobs.update(job)
@@ -1195,26 +1202,20 @@ class EnrichmentExecutor:
             # the ontology too (COG-112), so the enriched attribute is first-class
             # schema, mirroring the auto-apply path in run().
             await self._declare_attributes(job.tenant_id, job.type_name, applied_attrs)
-            await self._neptune.update(insert_triples(graph_uri, triples))
-            # Accepted facts were written → refresh the Explorer's precomputed
-            # type-stats in the background (mirrors the auto-apply path in run()).
-            self._schedule_stats_recompute(job.tenant_id, job.kg_name)
+            # Same shared write path as run() / ingestion (graph/kg_writer.py):
+            # batched insert + post-write housekeeping (cache-invalidate,
+            # re-embed the type, recompute stats).
+            await insert_facts(self._neptune, graph_uri, triples)
+            await refresh_after_write(
+                self._neptune,
+                tenant_id=job.tenant_id,
+                kg_name=job.kg_name,
+                affected_types={job.type_name},
+            )
         job.status = JobStatus.applied
         job.completed_at = _now()
         await self._jobs.update(job)
         return applied
-
-    def _schedule_stats_recompute(self, tenant_id: str, kg_name: str) -> None:
-        """Fire-and-forget a type-stats recompute after an enrichment write.
-
-        Lazy-imported from the explore route to avoid a module-load import cycle
-        (the API route modules cross-reference one another; ingest.py uses the
-        same lazy pattern). ``schedule_recompute`` is best-effort — it swallows
-        Neptune errors internally — so this never affects the job's outcome.
-        """
-        from cograph_client.api.routes.explore import schedule_recompute
-
-        schedule_recompute(self._neptune, tenant_id, kg_name)
 
 
 def _slug_from_uri(uri: str) -> str:

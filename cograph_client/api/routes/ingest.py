@@ -13,8 +13,8 @@ from cograph_client.auth.api_keys import TenantContext, get_tenant
 from cograph_client.config import settings
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.resolver.models import CSVRowsRequest, CSVSchemaMapping, CSVSchemaRequest, IngestRequest, IngestResult
+from cograph_client.graph.kg_writer import refresh_after_write
 from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
-from cograph_client.nlp.pipeline import NLQueryPipeline
 from cograph_client.resolver.attribute_resolver import AttributeSchema
 from cograph_client.resolver.schema_resolver import SchemaResolver
 from cograph_client.resolver.verdict_cache import JsonVerdictCache
@@ -59,30 +59,20 @@ async def ingest(
         source=body.source,
         instance_graph=instance_graph,
     )
-    # Invalidate ontology cache so queries pick up new types/relationships
-    graph_uri = tenant_graph_uri(tenant.tenant_id)
-    NLQueryPipeline.invalidate_cache(graph_uri)
-    # Re-embed all affected types (new types + types with new attributes)
-    # so semantic retrieval never serves stale embeddings
+    # Single shared post-write housekeeping path (graph/kg_writer.py) — the SAME
+    # refresh the enrichment writer runs: invalidate the NL-planning cache,
+    # re-embed affected types (new types + types that gained an attribute), and
+    # recompute the Explorer's type-stats. Keeps ingestion and enrichment from
+    # drifting on WHAT gets refreshed after a write.
     affected_types = set(result.types_created)
     for attr_added in result.attributes_added:
-        type_name = attr_added.split(".")[0]
-        affected_types.add(type_name)
-    if affected_types:
-        from cograph_client.nlp.pipeline import get_embedding_service
-        svc = get_embedding_service()
-        if svc:
-            try:
-                await svc.embed_types(graph_uri, list(affected_types), client)
-            except Exception:
-                pass  # non-blocking
-    # Refresh precomputed Explorer type-stats for this KG (background, non-blocking).
-    if body.kg_name:
-        try:
-            from cograph_client.api.routes.explore import schedule_recompute
-            schedule_recompute(client, tenant.tenant_id, body.kg_name)
-        except Exception:
-            pass
+        affected_types.add(attr_added.split(".")[0])
+    await refresh_after_write(
+        client,
+        tenant_id=tenant.tenant_id,
+        kg_name=body.kg_name,
+        affected_types=affected_types,
+    )
     return result
 
 
@@ -337,20 +327,20 @@ async def ingest_csv_rows(
         body.source, result, entity_uri_map, entity_type_map, batch_id,
     )
 
-    NLQueryPipeline.invalidate_cache(graph_uri)
-    # Incrementally embed new/changed types
+    # Shared post-write housekeeping (graph/kg_writer.py) — same path as /ingest
+    # and the enrichment writer: cache-invalidate, re-embed affected types, and
+    # recompute stats. (CSV-rows previously skipped the stats recompute; routing
+    # through the shared path gives it the same refresh as every other writer.)
     affected_types = set(result.types_created)
     for attr_added in result.attributes_added:
         if "." in attr_added:
             affected_types.add(attr_added.split(".")[0])
-    if affected_types:
-        from cograph_client.nlp.pipeline import get_embedding_service
-        svc = get_embedding_service()
-        if svc:
-            try:
-                await svc.embed_types(graph_uri, list(affected_types), client)
-            except Exception:
-                pass  # non-blocking
+    await refresh_after_write(
+        client,
+        tenant_id=tenant.tenant_id,
+        kg_name=body.kg_name,
+        affected_types=affected_types,
+    )
     return result
 
 
