@@ -216,6 +216,100 @@ async def test_execute_runs_full_discover_and_ingests(monkeypatch):
     assert captured["source"] == "web:fake:OpenRouter models"
 
 
+def _ctx_with_store(store) -> AgentContext:
+    """Agent context carrying a job store, as the agent route injects it."""
+    return AgentContext(
+        tenant_id="demo-tenant",
+        kg_name="models",
+        neptune=MagicMock(),
+        anthropic_key="sk-ant-test",
+        openrouter_key="",
+        extras={"prior_clarify_count": 0, "enrichment_job_store": store},
+    )
+
+
+async def test_execute_tracks_job_with_results_and_platforms(monkeypatch):
+    """With a job store present, execute creates a tracked discovery job, returns
+    its id + initial status, and drives it to applied with a result count, the
+    platforms consulted, and the run cost — so the client can poll a live status."""
+    from cograph_client.enrichment.job_store import InMemoryJobStore
+    from cograph_client.enrichment.models import JobCategory, JobStatus
+
+    provider = FakeProvider(is_paid=True, cost_per_call=0.09)
+    register_web_source(provider)
+
+    async def fake_ingest(self, rows, mapping, tenant_id, source="", instance_graph=None):
+        return IngestResult(entities_extracted=len(rows), entities_resolved=len(rows))
+
+    monkeypatch.setattr(SchemaResolver, "ingest_mapped_records", fake_ingest)
+
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    store = InMemoryJobStore()
+    cap = WebIngestCapability()
+    step = (
+        await cap.plan(_ctx_with_store(store), "list of OpenRouter models", parsed=CONFIRMED_SPEC)
+    )[0]
+    ack = await cap.execute(_ctx_with_store(store), step)
+
+    # The ack hands back a job id + initial status to poll on.
+    assert ack["kind"] == "ack"
+    job_id = ack["job_id"]
+    assert ack["job_status"] == "queued"
+
+    # The job is in the store immediately (queued), then completes after the run.
+    queued = await store.get(job_id)
+    assert queued is not None
+    assert queued.category == JobCategory.discovery
+    assert queued.cost == pytest.approx(0.09)
+
+    await spawned["task"]
+
+    done = await store.get(job_id)
+    assert done.status == JobStatus.applied
+    assert done.result_count == len(FULL_ROWS)
+    assert done.progress.total == len(FULL_ROWS)
+    assert done.progress.processed == len(FULL_ROWS)
+    assert "openrouter.ai" in (done.platforms or [])
+    assert done.type_name == "OpenRouterModel"
+    assert done.completed_at is not None
+
+
+async def test_execute_marks_job_failed_on_error(monkeypatch):
+    """A discovery that raises mid-ingest leaves the job failed with an error, not
+    silently dropped — so the live status can show the failure."""
+    from cograph_client.enrichment.job_store import InMemoryJobStore
+    from cograph_client.enrichment.models import JobStatus
+
+    register_web_source(FakeProvider())
+
+    async def boom(self, *a, **k):
+        raise RuntimeError("ingest exploded")
+
+    monkeypatch.setattr(SchemaResolver, "ingest_mapped_records", boom)
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    store = InMemoryJobStore()
+    cap = WebIngestCapability()
+    step = (
+        await cap.plan(_ctx_with_store(store), "list of OpenRouter models", parsed=CONFIRMED_SPEC)
+    )[0]
+    ack = await cap.execute(_ctx_with_store(store), step)
+    await spawned["task"]
+
+    failed = await store.get(ack["job_id"])
+    assert failed.status == JobStatus.failed
+    assert "ingest exploded" in (failed.error or "")
+
+
 def test_capability_registered_by_default():
     from cograph_client.agent.planner import register_default_capabilities
     from cograph_client.agent.registry import get_capability

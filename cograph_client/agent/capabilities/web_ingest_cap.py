@@ -35,10 +35,21 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+from urllib.parse import urlparse
 
 import structlog
 
 from cograph_client.agent.registry import AgentContext, PlanStep
+from cograph_client.enrichment.models import (
+    ConflictPolicy,
+    EnrichJob,
+    EnrichmentTier,
+    JobCategory,
+    JobStatus,
+)
 from cograph_client.graph.queries import kg_graph_uri
 from cograph_client.resolver.llm_router import PRIMARY_MODEL, openrouter_chat
 from cograph_client.resolver.models import (
@@ -209,7 +220,38 @@ class WebIngestCapability:
         source = f"web:{provider.name}:{query}"
         pctx = _provider_context(ctx)
 
+        # Track the discovery as a real job so the client polls a LIVE status
+        # (queued → running → applied/failed) with a result count, the platforms
+        # consulted, and the run cost — instead of a synchronous "done" the
+        # instant the background task is spawned. The job store is the same
+        # unified store enrichment/dedupe use (injected on ctx.extras by the
+        # agent route); when it's absent (a bare/test context) we degrade to the
+        # previous fire-and-forget behavior so nothing breaks.
+        job_store = ctx.extras.get("enrichment_job_store")
+        cost_usd, cost_note = _step_cost(step)
+        job: Optional[EnrichJob] = None
+        if job_store is not None:
+            job = EnrichJob(
+                id=str(uuid.uuid4()),
+                tenant_id=ctx.tenant_id,
+                kg_name=kg_name or "",
+                type_name=proposed_type,
+                attributes=attributes,
+                tier=EnrichmentTier.lite,
+                status=JobStatus.queued,
+                created_at=datetime.now(timezone.utc),
+                conflict_policy=ConflictPolicy.stage,
+                category=JobCategory.discovery,
+                cost=cost_usd,
+                cost_note=cost_note,
+            )
+            await job_store.create(job)
+
         async def _run() -> None:
+            if job is not None and job_store is not None:
+                job.status = JobStatus.running
+                job.started_at = datetime.now(timezone.utc)
+                await job_store.update(job)
             try:
                 full = await provider.discover(
                     query,
@@ -219,25 +261,42 @@ class WebIngestCapability:
                     context=pctx,
                 )
                 rows = full.rows[:cap]
+                platforms = _platforms(getattr(full, "sources", None), provider)
+                # Surface the row count + platforms as soon as discovery returns,
+                # before the (slower) ingest — so a poll mid-run shows progress.
+                if job is not None and job_store is not None:
+                    job.progress.total = len(rows)
+                    job.platforms = platforms
+                    await job_store.update(job)
                 if not rows:
                     logger.info("web_ingest_no_rows", query=query)
+                    await _finish_job(
+                        job, job_store, processed=0, entities=0,
+                        platforms=platforms,
+                    )
                     return
                 result = await resolver.ingest_mapped_records(
                     rows, mapping, ctx.tenant_id, source=source,
                     instance_graph=instance_graph,
                 )
+                entities = int(getattr(result, "entities_resolved", 0) or 0)
                 logger.info(
                     "web_ingest_complete",
                     query=query,
                     rows=len(rows),
-                    entities=result.entities_resolved,
-                    types=result.types_created,
+                    entities=entities,
+                    types=getattr(result, "types_created", None),
                 )
-            except Exception:  # noqa: BLE001 — background job must self-contain errors
+                await _finish_job(
+                    job, job_store, processed=len(rows), entities=entities,
+                    platforms=platforms,
+                )
+            except Exception as exc:  # noqa: BLE001 — background job self-contains errors
                 logger.error("web_ingest_failed", query=query, exc_info=True)
+                await _fail_job(job, job_store, str(exc))
 
         _spawn(_run())
-        return {
+        ack = {
             "kind": "ack",
             "capability": self.name,
             "action": step.action,
@@ -246,6 +305,12 @@ class WebIngestCapability:
                 f"as {proposed_type} ({', '.join(attributes)}) in the background."
             ),
         }
+        if job is not None:
+            # Hand the job id + initial status back so the client can poll the
+            # live status (GET /enrich/jobs/{id} or the unified /jobs feed).
+            ack["job_id"] = job.id
+            ack["job_status"] = job.status.value
+        return ack
 
 
 # --- entity + attribute resolution ------------------------------------------- #
@@ -489,6 +554,91 @@ def _estimate_cost(
             f"across sub-queries)."
         ),
     }
+
+
+# --- job tracking ------------------------------------------------------------ #
+
+
+def _step_cost(step: PlanStep) -> tuple[Optional[float], Optional[str]]:
+    """Pull the plan card's cost estimate (estimated_usd + note) off the step so
+    it can be stamped on the job — that's the "how much did it cost" detail the
+    job-status view shows. Returns (usd, note); either may be None."""
+    cost = step.cost or {}
+    usd = cost.get("estimated_usd")
+    note = cost.get("note")
+    usd_f = (
+        float(usd)
+        if isinstance(usd, (int, float)) and not isinstance(usd, bool)
+        else None
+    )
+    return usd_f, (str(note) if note else None)
+
+
+def _host(url: str) -> str:
+    """Hostname of a URL with a leading ``www.`` dropped; a bare token (already a
+    host/provider name) is returned trimmed/lower-cased. '' if unparseable."""
+    try:
+        netloc = urlparse(url).netloc
+    except Exception:  # noqa: BLE001 — never let URL parsing break a run
+        netloc = ""
+    host = (netloc or url or "").strip().lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _platforms(sources, provider) -> list[str]:
+    """Distinct platforms consulted during a discovery run — the host of each
+    source URL (de-duplicated, order-preserved, capped), falling back to the
+    provider name when no URLs were returned. Surfaced in the job-details view
+    as "what platforms were used"."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for s in sources or []:
+        host = _host(str(s))
+        if host and host not in seen:
+            seen.add(host)
+            out.append(host)
+        if len(out) >= 8:
+            break
+    if not out:
+        name = (getattr(provider, "name", "") or "").strip()
+        if name:
+            out.append(name)
+    return out
+
+
+async def _finish_job(
+    job: Optional[EnrichJob],
+    job_store,
+    *,
+    processed: int,
+    entities: int,
+    platforms: list[str],
+) -> None:
+    """Mark a discovery job applied with its result count + final progress."""
+    if job is None or job_store is None:
+        return
+    now = datetime.now(timezone.utc)
+    job.progress.processed = processed
+    job.progress.filled = entities
+    job.result_count = entities
+    if platforms:
+        job.platforms = platforms
+    job.status = JobStatus.applied
+    job.completed_at = now
+    job.last_run = now
+    await job_store.update(job)
+
+
+async def _fail_job(job: Optional[EnrichJob], job_store, error: str) -> None:
+    """Mark a discovery job failed, carrying a (truncated) error for the UI."""
+    if job is None or job_store is None:
+        return
+    now = datetime.now(timezone.utc)
+    job.status = JobStatus.failed
+    job.error = (error or "discovery failed")[:500]
+    job.completed_at = now
+    job.last_run = now
+    await job_store.update(job)
 
 
 def _answer_step(text: str) -> PlanStep:

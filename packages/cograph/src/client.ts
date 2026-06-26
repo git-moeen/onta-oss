@@ -1139,8 +1139,15 @@ export type JobStatus =
   | "cancelled"
   | "failed";
 /** The kind of work a tracked job performs — the unified `/jobs` feed spans all
- *  three. Existing enrichment jobs default to `enrichment` server-side. */
-export type JobCategory = "dedupe" | "enrichment" | "reconciliation";
+ *  categories. Existing enrichment jobs default to `enrichment` server-side.
+ *  `discovery` is a web-discovery ingest (the `web_ingest` capability): it
+ *  CREATES a new record set from the web rather than filling/merging an existing
+ *  one. */
+export type JobCategory =
+  | "dedupe"
+  | "enrichment"
+  | "reconciliation"
+  | "discovery";
 /** How a job was kicked off. Today everything is `manual` (a user clicked an
  *  action); `scheduled`/`webhook` are reserved for future automation. */
 export type JobTrigger = "manual" | "scheduled" | "webhook";
@@ -1220,6 +1227,11 @@ export interface JobSummary {
   next_run?: string | null;
   cost?: number | null;
   cost_note?: string | null;
+  /** Discovery/web-ingest summary fields. `result_count` is the headline "how
+   *  many records were found" number; `platforms` are the web sources/providers
+   *  consulted during the run. Both null/absent for non-discovery jobs. */
+  result_count?: number | null;
+  platforms?: string[] | null;
   /** Derived 0-100 completion percentage from progress.processed/total. */
   progress_pct?: number;
 }

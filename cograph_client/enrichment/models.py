@@ -55,13 +55,16 @@ class JobStatus(str, Enum):
 class JobCategory(str, Enum):
     """The kind of work a job performs.
 
-    The unified Jobs page lists jobs across all three categories. Existing
-    enrichment jobs default to ``enrichment`` for backward compatibility.
+    The unified Jobs page lists jobs across all categories. Existing enrichment
+    jobs default to ``enrichment`` for backward compatibility. ``discovery`` is
+    web-discovery ingest (the ``web_ingest`` capability): it CREATES a new set of
+    records from the web rather than filling/merging existing ones.
     """
 
     dedupe = "dedupe"
     enrichment = "enrichment"
     reconciliation = "reconciliation"
+    discovery = "discovery"
 
 
 class JobTrigger(str, Enum):
@@ -254,6 +257,14 @@ class EnrichJob(BaseModel):
     next_run: Optional[datetime] = None
     cost: Optional[float] = None
     cost_note: Optional[str] = None
+    # Discovery/web-ingest summary fields (COG — realtime job status). Both
+    # optional with safe defaults so enrichment/dedupe job construction is
+    # unchanged. ``result_count`` is the headline "how many records were found"
+    # number (entities resolved); ``platforms`` are the web sources/providers
+    # consulted during the run (e.g. the provider name + distinct source hosts),
+    # surfaced in the job-details view.
+    result_count: Optional[int] = None
+    platforms: Optional[list[str]] = None
 
 
 class JobSummary(BaseModel):
@@ -278,6 +289,10 @@ class JobSummary(BaseModel):
     next_run: Optional[datetime] = None
     cost: Optional[float] = None
     cost_note: Optional[str] = None
+    # Discovery/web-ingest summary fields (see EnrichJob). Optional so the
+    # summary of an enrichment/dedupe job is unchanged.
+    result_count: Optional[int] = None
+    platforms: Optional[list[str]] = None
     # Derived 0-100 completion percentage from progress.processed/total.
     progress_pct: int = 0
 
@@ -327,5 +342,7 @@ def job_to_summary(job: EnrichJob) -> JobSummary:
         next_run=job.next_run,
         cost=job.cost,
         cost_note=job.cost_note,
+        result_count=job.result_count,
+        platforms=job.platforms,
         progress_pct=_progress_pct(job.progress),
     )
