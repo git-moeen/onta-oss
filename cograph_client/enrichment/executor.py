@@ -892,7 +892,16 @@ class EnrichmentExecutor:
             # Apply phase
             policy = job.conflict_policy
             if policy == ConflictPolicy.stage:
-                job.status = JobStatus.review
+                # Stage = hold the found values for human review. But if there
+                # was nothing to stage — every row was a no_match/skip, so
+                # ``job.results`` is empty — there is nothing to review.
+                # Leaving such a run in ``review`` strands it in a pending state
+                # forever and reads as a baffling "In review" with zero results
+                # in the UI (the exact symptom users hit on an attribute the
+                # sources have no data for). Land an empty run as ``applied`` —
+                # a completed run that changed nothing — and only go to
+                # ``review`` when at least one value was actually staged.
+                job.status = JobStatus.review if job.results else JobStatus.applied
                 job.completed_at = _now()
                 await self._jobs.update(job)
                 return

@@ -1014,6 +1014,54 @@ def test_executor_no_match_when_no_verdict():
         assert final.progress.filled == 0
         assert final.progress.conflicts == 0
         assert final.progress.processed == 1
+        # A stage-policy run that found NOTHING to stage must complete as
+        # ``applied`` (a finished run that changed nothing), NOT ``review`` —
+        # there is nothing to review, so "In review" with zero results would
+        # strand the job and confuse the user.
+        assert final.status == JobStatus.applied
+        assert final.results == []
+
+    asyncio.run(run())
+
+
+def test_executor_stage_with_no_results_completes_applied():
+    """stage policy + all no_match → ``applied`` (nothing to review), while
+    stage policy + a staged value → ``review``. The two halves pin the boundary
+    so an empty stage run never lands in a perpetual pending state."""
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Unknown", "vals": ""},
+        ]
+
+        # No verdicts → no_match for every row → nothing staged.
+        neptune = AsyncMock()
+        neptune.query.return_value = _entities_query_response(rows)
+        store = InMemoryJobStore()
+        empty_job = _make_job(policy=ConflictPolicy.stage)
+        await store.create(empty_job)
+        await EnrichmentExecutor(
+            neptune, store, EnrichmentCache(), FakeWikidata({})
+        ).run(empty_job, "test-tenant")
+        done_empty = await store.get(empty_job.id)
+        assert done_empty.status == JobStatus.applied
+        assert done_empty.results == []
+
+        # A confident verdict → one staged value → still goes to review.
+        neptune2 = AsyncMock()
+        neptune2.query.return_value = _entities_query_response(rows)
+        store2 = InMemoryJobStore()
+        staged_job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.stage)
+        await store2.create(staged_job)
+        wikidata = FakeWikidata(
+            {("Unknown", "manufacturer"): [Verdict(value="Acme", confidence=0.95, source="wikidata")]}
+        )
+        await EnrichmentExecutor(
+            neptune2, store2, EnrichmentCache(), wikidata
+        ).run(staged_job, "test-tenant")
+        done_staged = await store2.get(staged_job.id)
+        assert done_staged.status == JobStatus.review
+        assert len(done_staged.results) == 1
 
     asyncio.run(run())
 
