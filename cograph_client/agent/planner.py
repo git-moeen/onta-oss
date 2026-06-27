@@ -221,6 +221,14 @@ def _url_intent(message: str) -> str:
     return "enrich" if _ENRICH_VERB_RE.search(message or "") else "discover"
 
 
+def _is_interrogative(message: str) -> bool:
+    """True when ``message`` reads as a read-only question — a trailing '?' or a
+    leading question word. Mirrors the web-discovery guard so a genuine question
+    that merely contains a link is answered, not hijacked into an action."""
+    msg = (message or "").strip()
+    return bool(msg) and (msg.endswith("?") or bool(_QUESTION_LEAD_RE.match(msg)))
+
+
 def _format_history(history: list[Turn] | None) -> str:
     """Render the prior turns as a transcript block for the classifier prompt."""
     if not history:
@@ -436,9 +444,23 @@ async def _respond(
     # else brings in a NEW set of records ("discover"). Force the chosen intent to
     # the front and drop question/ambiguous so it can't be hijacked by the
     # question fast-path below. Only when the target capability is registered.
-    if _message_has_urls(message, getattr(ctx, "urls", None)):
+    _ctx_urls = getattr(ctx, "urls", None)
+    if _message_has_urls(message, _ctx_urls):
         url_intent = _url_intent(message)
-        if get_capability(_INTENT_TO_CAPABILITY[url_intent]) is not None:
+        # Don't hijack a genuine read-only question that merely contains a link in
+        # its TEXT (e.g. "what does https://acme/about say about pricing?"). A link
+        # ATTACHED as structured request context (ctx.urls) or an explicit enrich
+        # verb is an unambiguous action and still routes; a bare interrogative
+        # whose only action signal is a URL falls through to the classifier, which
+        # answers it.
+        defer_to_classifier = (
+            not _ctx_urls
+            and url_intent != "enrich"
+            and _is_interrogative(message)
+        )
+        if not defer_to_classifier and get_capability(
+            _INTENT_TO_CAPABILITY[url_intent]
+        ) is not None:
             intents = [
                 url_intent,
                 *[

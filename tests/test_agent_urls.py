@@ -302,6 +302,74 @@ async def test_no_urls_leaves_question_untouched(monkeypatch):
     assert out["answer"] == "42"
 
 
+@pytest.mark.asyncio
+async def test_url_in_question_form_defers_to_classifier(monkeypatch):
+    """A genuine read-only QUESTION that merely contains a link in its text (no
+    attached ctx.urls, no enrich verb) must be ANSWERED, not hijacked into an
+    ingest/enrich plan. Mirrors the web-discovery interrogative guard."""
+    _stub_classifier(monkeypatch, "question")
+
+    from cograph_client.agent.capabilities.query import QueryCapability
+
+    async def fake_answer(self, ctx, q):
+        return {"answer": "ANSWERED", "sparql": "", "rows": [], "narrative": ""}
+
+    monkeypatch.setattr(QueryCapability, "answer", fake_answer)
+
+    out = await asyncio.wait_for(
+        handle(
+            _ctx(),
+            "what does https://acme.example.com/about say about their pricing?",
+        ),
+        TIMEOUT,
+    )
+    assert out["kind"] == "answer"
+    assert out["answer"] == "ANSWERED"  # deferred to the read-only path
+
+
+@pytest.mark.asyncio
+async def test_question_form_url_with_enrich_verb_still_routes(monkeypatch):
+    """An explicit enrich verb is an unambiguous action — it routes even when the
+    message is phrased as a question (the verb wins over the interrogative guard)."""
+    _stub_classifier(monkeypatch, "question")
+    executor = _stub_enrich(
+        monkeypatch,
+        {"attributes": ["website"], "scope": None, "tier": "core"},
+    )
+
+    out = await asyncio.wait_for(
+        handle(
+            _ctx(executor=executor),
+            "can you enrich the Company website from https://acme.example.com/about?",
+        ),
+        TIMEOUT,
+    )
+    assert out["kind"] == "plan"
+    assert out["steps"][0]["capability"] == "enrich"
+
+
+@pytest.mark.asyncio
+async def test_attached_ctx_urls_route_even_in_question_form(monkeypatch):
+    """Links ATTACHED as structured context (ctx.urls) are a deliberate action
+    signal — they route even when the message is a bare question with no verb."""
+    _stub_classifier(monkeypatch, "question")
+
+    from cograph_client.agent.capabilities.query import QueryCapability
+
+    async def fake_answer(self, ctx, q):
+        return {"answer": "SHOULD_NOT_RUN", "sparql": "", "rows": [], "narrative": ""}
+
+    monkeypatch.setattr(QueryCapability, "answer", fake_answer)
+
+    out = await asyncio.wait_for(
+        handle(_ctx(urls=["https://list.example.com/companies"]), "what's here?"),
+        TIMEOUT,
+    )
+    assert out.get("answer") != "SHOULD_NOT_RUN"  # not the read-only path
+    body = f"{out.get('narrative', '')} {out.get('answer', '')}".lower()
+    assert "enabled" in body  # routed to discovery (degrades to not-enabled in OSS)
+
+
 # --------------------------------------------------------------------------- #
 # 4. The _url_intent helper: enrich-type verb vs everything else.
 # --------------------------------------------------------------------------- #
