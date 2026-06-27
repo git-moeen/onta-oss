@@ -4,12 +4,14 @@ All KGs share the tenant's ontology but have separate instance data.
 """
 
 import asyncio
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from cograph_client.api.deps import get_neptune_client
+from cograph_client.api.deps import get_enrichment_job_store, get_neptune_client
 from cograph_client.auth.api_keys import TenantContext, get_tenant
+from cograph_client.enrichment.models import JobCategory, JobStatus
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.ontology_queries import (
     get_type_attributes_query,
@@ -107,20 +109,37 @@ class KGInfo(BaseModel):
     name: str
     description: str = ""
     triple_count: int = 0
+    # Dashboard-summary stats, served from the durable per-KG stats store (no
+    # Neptune scan on the hot path). Default to zeros/active for KGs whose row
+    # isn't materialized yet — the next list lazily backfills it from the
+    # precomputed stats graph (mirrors triple_count's lazy materialization).
+    entity_count: int = 0
+    edge_count: int = 0
+    # "active" | "enriching" — derived live from the tenant's in-flight jobs.
+    status: str = "active"
+    stats_updated_at: Optional[str] = None
 
 
 @router.get("", response_model=list[KGInfo])
 async def list_kgs(
     tenant: TenantContext = Depends(get_tenant),
     client: NeptuneClient = Depends(get_neptune_client),
+    job_store=Depends(get_enrichment_job_store),
 ):
-    """List all knowledge graphs for a tenant.
+    """List all knowledge graphs for a tenant, with dashboard-summary stats.
 
     Triple counts are read from the metadata graph (stored alongside the KG
     registration) in the SAME query that lists the KGs — no per-KG scan on the
     hot path. KGs with no stored count yet (legacy, or freshly invalidated
     after ingest) fall back to a live COUNT(*); those run in PARALLEL and are
     written back so the next read is again a single tiny lookup.
+
+    Entity/edge counts come from the durable per-KG stats store (kept fresh by
+    the shared write/refresh path) — a single relational read, no Neptune. Rows
+    for KGs that predate the store are backfilled lazily from their existing
+    precomputed stats graph the first time they're listed (the same lazy
+    materialization pattern as triple counts). ``status`` is derived live from
+    the tenant's in-flight enrichment jobs.
     """
     base = tenant_graph_uri(tenant.tenant_id)
 
@@ -165,10 +184,78 @@ async def list_kgs(
             return_exceptions=True,
         )
 
-    return [
-        KGInfo(name=e["name"], description=e["desc"], triple_count=e["count"] or 0)
-        for e in entries
-    ]
+    stats_by_kg = await _kg_stats_for(client, tenant.tenant_id, [e["name"] for e in entries])
+    enriching = await _enriching_kgs(job_store, tenant.tenant_id)
+
+    out: list[KGInfo] = []
+    for e in entries:
+        s = stats_by_kg.get(e["name"])
+        out.append(
+            KGInfo(
+                name=e["name"],
+                description=e["desc"],
+                triple_count=e["count"] or 0,
+                entity_count=s.entity_count if s else 0,
+                edge_count=s.edge_count if s else 0,
+                status="enriching" if e["name"] in enriching else "active",
+                stats_updated_at=s.updated_at.isoformat() if s else None,
+            )
+        )
+    return out
+
+
+async def _kg_stats_for(client: "NeptuneClient", tenant_id: str, kg_names: list[str]):
+    """Return {kg_name: KgStats} from the durable store, backfilling misses.
+
+    Steady state: one relational read for the whole tenant (no Neptune). KGs
+    without a row yet are backfilled in parallel from their precomputed stats
+    graph; a KG whose stats graph isn't materialized either gets a background
+    recompute scheduled (which populates the store) and is served as zeros for
+    now. Best-effort throughout — a store/Neptune hiccup degrades to zeros, it
+    never fails the KG listing.
+    """
+    from cograph_client.api.routes.explore import backfill_kg_summary, schedule_recompute
+    from cograph_client.graph.kg_stats_store import KgStats, get_kg_stats_store
+
+    store = get_kg_stats_store()
+    try:
+        rows = await store.list_for_tenant(tenant_id)
+    except Exception:  # noqa: BLE001 — degrade to no stats rather than 500
+        rows = []
+    by_kg: dict[str, KgStats] = {r.kg_name: r for r in rows}
+
+    missing = [n for n in kg_names if n not in by_kg]
+    if missing:
+        backfilled = await asyncio.gather(
+            *(backfill_kg_summary(client, tenant_id, n) for n in missing),
+            return_exceptions=True,
+        )
+        for name, res in zip(missing, backfilled):
+            if isinstance(res, KgStats):
+                by_kg[name] = res
+            elif not isinstance(res, Exception):
+                # res is None: stats graph not materialized yet → schedule a
+                # recompute so the store is populated for next time.
+                try:
+                    schedule_recompute(client, tenant_id, name)
+                except Exception:  # noqa: BLE001
+                    pass
+    return by_kg
+
+
+async def _enriching_kgs(job_store, tenant_id: str) -> set[str]:
+    """KG names with an in-flight (queued/running) enrichment or discovery job."""
+    try:
+        jobs = await job_store.list_for_tenant(tenant_id)
+    except Exception:  # noqa: BLE001
+        return set()
+    active = {JobStatus.queued, JobStatus.running}
+    enriching = {JobCategory.enrichment, JobCategory.discovery}
+    return {
+        j.kg_name
+        for j in jobs
+        if j.status in active and j.category in enriching and j.kg_name
+    }
 
 
 @router.post("", response_model=KGInfo, status_code=201)

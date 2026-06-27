@@ -7,9 +7,20 @@ with no stored count yet fall back to a live COUNT(*) — which is then persiste
 so the next read is again a single tiny lookup.
 """
 
+import pytest
+
 from cograph_client.api.routes.knowledge_graphs import KG_TRIPLE_COUNT
+from cograph_client.graph.kg_stats_store import reset_kg_stats_store
 
 TENANT = "test-tenant"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_kg_stats_store():
+    """Isolate the process-wide dashboard-summary store across these tests."""
+    reset_kg_stats_store()
+    yield
+    reset_kg_stats_store()
 
 
 def _binding(**vals):
@@ -26,6 +37,10 @@ def _route(*, stored_count: str | None, live_count: str = "999"):
                 "head": {"vars": ["c"]},
                 "results": {"bindings": [_binding(c=live_count)]},
             }
+        # Dashboard-summary backfill reads (per-KG stats graph): no stats
+        # materialized in this test → empty, so the store row stays unset.
+        if "entityCount" in sparql or "SUM(?rel)" in sparql or "forType" in sparql:
+            return {"head": {"vars": []}, "results": {"bindings": []}}
         # The metadata list query.
         row = {"name": "kg-a", "desc": "A"}
         if stored_count is not None:
@@ -44,7 +59,15 @@ def test_stored_count_served_without_live_scan(client, mock_neptune, auth_header
     resp = client.get(f"/graphs/{TENANT}/kgs", headers=auth_headers)
     assert resp.status_code == 200
     assert resp.json() == [
-        {"name": "kg-a", "description": "A", "triple_count": 218261}
+        {
+            "name": "kg-a",
+            "description": "A",
+            "triple_count": 218261,
+            "entity_count": 0,
+            "edge_count": 0,
+            "status": "active",
+            "stats_updated_at": None,
+        }
     ]
 
     # The hot path must NOT issue a full-graph COUNT(*) when the count is stored.

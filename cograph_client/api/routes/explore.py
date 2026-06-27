@@ -586,6 +586,7 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
     _, rows = parse_sparql_results(await client.query(scan))
 
     entity_counts: dict[str, int] = {}
+    total_edges = 0  # sum of entity-valued-object totals across predicate rows
     triples: list[str] = []
     # ADR 0004: raw type-level relationship declarations (type_uri, pred_uri,
     # support). Source counts are resolved AFTER the loop, once entity_counts is
@@ -610,6 +611,7 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
         if p_uri == RDF_TYPE:
             entity_counts[type_uri_str] = cnt
             continue
+        total_edges += rel
         node = _stat_node(type_uri_str, p_uri)
         stat = (
             f"<{node}> <{_STAT_FOR_TYPE}> <{type_uri_str}> ; "
@@ -645,6 +647,30 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
     # avoids an import cycle between this module and knowledge_graphs.
     from cograph_client.api.routes.knowledge_graphs import invalidate_triple_count
     await invalidate_triple_count(client, tenant_id, kg_name)
+
+    # Materialize the per-KG dashboard summary (entity/edge totals + per-type
+    # breakdown) into the durable store, so the dashboard reads a tiny relational
+    # row instead of querying Neptune. This rides the one shared write/refresh
+    # path — it is not a second computation. Best-effort: a store hiccup must not
+    # fail the recompute (reads fall back to lazy backfill from the stats graph).
+    type_breakdown = {
+        (t[len(TYPE_URI_PREFIX):] if t.startswith(TYPE_URI_PREFIX) else t): n
+        for t, n in entity_counts.items()
+    }
+    try:
+        from cograph_client.graph.kg_stats_store import KgStats, get_kg_stats_store
+
+        await get_kg_stats_store().upsert(
+            KgStats(
+                tenant_id=tenant_id,
+                kg_name=kg_name,
+                entity_count=sum(entity_counts.values()),
+                edge_count=total_edges,
+                type_breakdown=type_breakdown,
+            )
+        )
+    except Exception:  # noqa: BLE001 — store write is best-effort
+        logger.warning("kg_stats_store_upsert_failed", kg=kg_name, exc_info=True)
 
     result = {"types": len(entity_counts), "predicate_rows": len(triples) - len(entity_counts)}
     if drift_enabled:
@@ -764,6 +790,68 @@ async def _persist_drift_history(
         logger.warning("drift_history_persist_failed", tenant=tenant_id, kg=kg_name, exc_info=True)
 
 
+async def read_kg_summary_from_stats(
+    client: NeptuneClient, tenant_id: str, kg_name: str
+):
+    """Aggregate a KG's per-type stats graph into KG-level totals.
+
+    Reads the *precomputed* stats graph (tiny — one row per type / per
+    type-predicate), NOT the full instance graph, so this is cheap. Returns
+    ``(entity_total, edge_total, {type_leaf: count})`` or ``None`` when the KG
+    has no materialized entity counts yet (e.g. a KG that predates the stats
+    graph and has never been recomputed) — the caller should then schedule a
+    recompute. This is the source the dashboard-summary store is backfilled from.
+    """
+    stats = _stats_graph_uri(tenant_id, kg_name)
+    ec_q = f"SELECT ?t ?ec FROM <{stats}> WHERE {{ ?t <{_STAT_ENTITY_COUNT}> ?ec }}"
+    _, ec_rows = parse_sparql_results(await client.query(ec_q))
+    if not ec_rows:
+        return None
+    breakdown: dict[str, int] = {}
+    entity_total = 0
+    for r in ec_rows:
+        t = r.get("t", "")
+        leaf = t[len(TYPE_URI_PREFIX):] if t.startswith(TYPE_URI_PREFIX) else t
+        try:
+            n = int(r.get("ec", "0"))
+        except (ValueError, TypeError):
+            n = 0
+        breakdown[leaf] = n
+        entity_total += n
+    edge_q = f"SELECT (SUM(?rel) AS ?total) FROM <{stats}> WHERE {{ ?s <{_STAT_REL}> ?rel }}"
+    _, edge_rows = parse_sparql_results(await client.query(edge_q))
+    try:
+        edge_total = int(edge_rows[0].get("total", "0")) if edge_rows else 0
+    except (ValueError, TypeError):
+        edge_total = 0
+    return entity_total, edge_total, breakdown
+
+
+async def backfill_kg_summary(client: NeptuneClient, tenant_id: str, kg_name: str):
+    """Seed the durable dashboard-summary store for one KG from existing stats.
+
+    Used to lazily fill rows for KGs that predate the store (the first time
+    they're listed) without a fresh whole-KG scan. Returns the upserted
+    :class:`KgStats`, or ``None`` if the KG's stats graph isn't materialized yet
+    (the caller schedules a recompute, which will populate the store directly).
+    """
+    agg = await read_kg_summary_from_stats(client, tenant_id, kg_name)
+    if agg is None:
+        return None
+    entity_total, edge_total, breakdown = agg
+    from cograph_client.graph.kg_stats_store import KgStats, get_kg_stats_store
+
+    row = KgStats(
+        tenant_id=tenant_id,
+        kg_name=kg_name,
+        entity_count=entity_total,
+        edge_count=edge_total,
+        type_breakdown=breakdown,
+    )
+    await get_kg_stats_store().upsert(row)
+    return row
+
+
 async def drop_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> None:
     """Drop a KG's precomputed stats graph and evict its in-memory summaries.
 
@@ -779,6 +867,15 @@ async def drop_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str) -> 
     await client.update(f"DROP SILENT GRAPH <{stats}> ; DROP SILENT GRAPH <{hist}>")
     for key in [k for k in _summary_cache if k[0] == tenant_id and k[1] == kg_name]:
         _summary_cache.pop(key, None)
+    # Drop the materialized dashboard-summary row too — its key is derived from
+    # the KG name, so a KG recreated under the same name would otherwise inherit
+    # the deleted KG's counts. Best-effort, matching the cache eviction above.
+    try:
+        from cograph_client.graph.kg_stats_store import get_kg_stats_store
+
+        await get_kg_stats_store().delete(tenant_id, kg_name)
+    except Exception:  # noqa: BLE001
+        logger.warning("kg_stats_store_delete_failed", kg=kg_name, exc_info=True)
 
 
 # Background recompute: the whole-KG scan takes ~15s, longer than the ALB
