@@ -291,6 +291,23 @@ def get_type_attributes_query(graph_uri: str, type_name: str) -> str:
     )
 
 
+def get_attribute_range_query(graph_uri: str, type_name: str, attr_name: str) -> str:
+    """Fetch the single ``rdfs:range`` currently declared for one attribute.
+
+    Returns ``?range`` (zero rows if the attribute / its range is undeclared).
+    Used by enrichment to decide whether declaring an enriched attribute would
+    DOWNGRADE an existing richer range (an XSD primitive like ``xsd:integer`` or
+    a relationship ``types/<Target>`` URI) down to ``xsd:string`` — it must not.
+    """
+    a_uri = attr_uri(type_name, attr_name)
+    return (
+        f"SELECT ?range FROM <{graph_uri}>\n"
+        f"WHERE {{\n"
+        f"  <{a_uri}> <{RDFS}#range> ?range .\n"
+        f"}}"
+    )
+
+
 def get_subtypes_query(graph_uri: str, type_name: str) -> str:
     t_uri = type_uri(type_name)
     return (
@@ -629,16 +646,42 @@ def batch_entity_exists_query(graph_uri: str, entity_uris: list[str]) -> str:
     )
 
 
+# The XSD ``rdfs:range`` URI an attribute carries when it is a plain string
+# attribute — the weakest primitive range, the only one enrichment is allowed to
+# overwrite (a string range is "untyped enough" that an inferred richer type is a
+# strict improvement; anything else is a downgrade we must preserve).
+XSD_STRING = f"{XSD}#string"
+
+_DATATYPE_TO_XSD = {
+    "string": f"{XSD}#string",
+    "integer": f"{XSD}#integer",
+    "float": f"{XSD}#float",
+    "boolean": f"{XSD}#boolean",
+    "datetime": f"{XSD}#dateTime",
+    "uri": f"{RDFS}#Resource",
+}
+
+
 def _datatype_to_xsd(datatype: str) -> str:
-    mapping = {
-        "string": f"{XSD}#string",
-        "integer": f"{XSD}#integer",
-        "float": f"{XSD}#float",
-        "boolean": f"{XSD}#boolean",
-        "datetime": f"{XSD}#dateTime",
-        "uri": f"{RDFS}#Resource",
-    }
-    if datatype in mapping:
-        return mapping[datatype]
+    if datatype in _DATATYPE_TO_XSD:
+        return _DATATYPE_TO_XSD[datatype]
     # Treat as a reference to another type
     return type_uri(datatype)
+
+
+def xsd_to_datatype(range_uri: str) -> str:
+    """Reverse of :func:`_datatype_to_xsd`: map a declared ``rdfs:range`` URI back
+    to the ``datatype`` name :func:`upsert_attribute` accepts, so an existing
+    range can be RE-asserted verbatim.
+
+    A primitive XSD/Resource URI maps to its name (``…#integer`` -> ``integer``);
+    a ``types/<X>`` relationship URI maps to the bare type name ``X`` (which
+    ``_datatype_to_xsd`` round-trips back to the same ``types/<X>`` URI). Any
+    other/unknown URI falls back to ``string`` so a malformed range can never
+    crash a declaration."""
+    for name, uri in _DATATYPE_TO_XSD.items():
+        if range_uri == uri:
+            return name
+    if range_uri.startswith(_TYPES_URI):
+        return range_uri[len(_TYPES_URI):].rstrip("/")
+    return "string"

@@ -41,7 +41,12 @@ from cograph_client.enrichment.strategy import (
 from cograph_client.enrichment.tiers import get_chain
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.kg_writer import insert_facts, refresh_after_write
-from cograph_client.graph.ontology_queries import upsert_attribute
+from cograph_client.graph.ontology_queries import (
+    XSD_STRING,
+    get_attribute_range_query,
+    upsert_attribute,
+    xsd_to_datatype,
+)
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import (
     kg_graph_uri,
@@ -71,10 +76,13 @@ PROGRESS_FLUSH_EVERY = 10
 
 # rdfs:comment stamped on an enrichment-declared attribute so the ontology /schema
 # view + Explorer can distinguish a schema slot that arrived via enrichment from
-# one declared by ingest or the ontology endpoint. Enriched values are strings
-# (the wikidata/adapter funnel yields literal text), so the declared range is
-# always xsd:string — matching what the instance triples actually carry.
+# one declared by ingest or the ontology endpoint.
 ENRICH_ATTR_DESCRIPTION = "Added by enrichment job"
+# Default declared range when a brand-new enriched attribute carries no values we
+# can type (empty / non-numeric). The actual range is INFERRED per-attribute from
+# the applied values (_infer_datatype_from_values) and, for an attribute already
+# declared with a richer range by ingestion, the existing range is PRESERVED
+# rather than downgraded (see _declare_attributes) — so this is only the floor.
 ENRICH_ATTR_DATATYPE = "string"
 
 # Hard ceiling on a single adapter lookup (COG-112). A misbehaving adapter — a
@@ -149,6 +157,113 @@ def _local_name(uri_or_value: str) -> str:
     if "/" in s:
         s = s.rsplit("/", 1)[-1]
     return s
+
+
+def _is_int(v: str) -> bool:
+    """True if ``v`` parses as an int (tolerating thousands separators / sign).
+
+    Mirrors agent/capabilities/web_ingest_cap.py's helper — kept as a small local
+    copy rather than imported so the enrichment layer takes no dependency on the
+    agent layer."""
+    try:
+        int(v.replace(",", ""))
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _is_float(v: str) -> bool:
+    """True if ``v`` parses as a float (tolerating thousands separators / sign)."""
+    try:
+        float(v.replace(",", ""))
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+ENTITY_URI_PREFIX = "https://cograph.tech/entities/"
+
+
+def _is_iso_datetime(v: str) -> bool:
+    """True if ``v`` parses as an ISO-8601 date or datetime via
+    :meth:`datetime.fromisoformat`.
+
+    Accepts plain dates (``2026-06-28``), datetimes (``2026-06-28T21:24:50``),
+    and timezone-aware forms (``…+00:00`` and a trailing ``Z``, which Python's
+    pre-3.11 ``fromisoformat`` rejects, so we normalise ``Z`` to ``+00:00``
+    first). A bare integer like ``2026`` is deliberately NOT a date here — the
+    caller only reaches this helper for values that already failed int/float and
+    contain a date separator, so an all-integer column can never be misread as a
+    date."""
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        datetime.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _entity_iri_type(value: str) -> str | None:
+    """Parse the ``<TypeName>`` out of a canonical entity IRI of the form
+    ``https://cograph.tech/entities/<TypeName>/<id>``, else None.
+
+    Returns the bare type name (e.g. ``Manufacturer``) so the caller can decide
+    whether a column of entity IRIs is a relationship to a single target type.
+    Returns None for anything that is not such an IRI — a literal, a different
+    URI namespace, or a malformed entities IRI missing the ``<id>`` segment."""
+    if not isinstance(value, str) or not value.startswith(ENTITY_URI_PREFIX):
+        return None
+    rest = value[len(ENTITY_URI_PREFIX):]
+    parts = rest.split("/", 1)
+    # Need a non-empty <TypeName> AND a non-empty <id> segment.
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0]
+
+
+def _infer_datatype_from_values(values: list[str]) -> str:
+    """Cheap datatype guess from the actual enriched values for one attribute.
+
+    Precedence (first match wins), each requiring ALL non-empty values to agree:
+      1. ``integer`` — every value parses as an int.
+      2. ``float`` — every value parses as a float.
+      3. ``datetime`` — every value is an ISO-8601 date/datetime (checked only
+         for values that failed int/float AND carry a date separator ``-``/``T``/
+         ``:``, so an all-integer column like ``2026`` is never misread as a
+         date). ``datetime`` is the name ``_datatype_to_xsd`` maps to
+         ``xsd:dateTime``.
+      4. a bare ``<TypeName>`` (a RELATIONSHIP range) — every value is a
+         canonical entity IRI (``…/entities/<TypeName>/<id>``) AND they all share
+         the SAME ``<TypeName>``. ``_datatype_to_xsd`` maps that bare name to the
+         ``types/<TypeName>`` URI (an object-property range). Mixed IRI types →
+         no single range, so we fall through to string (don't guess).
+      5. ``string`` — the safe floor (also for empty / all-blank).
+
+    Date and relationship detection (E2) are now attempted because they DO
+    round-trip reliably: an ISO date and a canonical entity IRI are both exact,
+    machine-minted forms, unlike free-text. Mirrors web_ingest_cap._infer_datatype
+    for the primitive cases."""
+    vals = [str(v).strip() for v in values if v not in (None, "")]
+    vals = [v for v in vals if v]
+    if not vals:
+        return "string"
+    if all(_is_int(v) for v in vals):
+        return "integer"
+    if all(_is_float(v) for v in vals):
+        return "float"
+    # Date only for values that look temporal (carry a date separator) and are
+    # not numeric — guards an all-integer column from a date false-positive.
+    if all(any(c in v for c in "-T:") and _is_iso_datetime(v) for v in vals):
+        return "datetime"
+    # Relationship: all values are entity IRIs sharing one target type.
+    iri_types = [_entity_iri_type(v) for v in vals]
+    if all(t is not None for t in iri_types) and len(set(iri_types)) == 1:
+        return iri_types[0]  # bare <TypeName> → types/<TypeName> range
+    return "string"
 
 
 def _safe_iri(uri: str) -> bool:
@@ -940,11 +1055,15 @@ class EnrichmentExecutor:
                 # (ontology) graph, so an enriched attribute is first-class schema
                 # — visible in the /schema view, the Explorer column schema, and
                 # the Enrich dialog's predicate dropdown, not just as orphan data.
-                # One idempotent upsert per attribute (not per row). This runs in
-                # the apply branch only (skip/verify/overwrite); `stage` returned
-                # above before any write, so review-mode declares nothing.
-                applied_attrs = self._applied_attribute_names(all_rows, policy)
-                await self._declare_attributes(tenant_id, job.type_name, applied_attrs)
+                # One idempotent upsert per attribute (not per row), each declared
+                # with a range inferred from its actual applied values and never
+                # downgrading an existing richer range. This runs in the apply
+                # branch only (skip/verify/overwrite); `stage` returned above
+                # before any write, so review-mode declares nothing.
+                applied_attr_values = self._applied_attribute_values(all_rows, policy)
+                await self._declare_attributes(
+                    tenant_id, job.type_name, applied_attr_values
+                )
                 # Single shared write path — identical to CSV/JSON ingestion
                 # (graph/kg_writer.py): batched insert, then post-write
                 # housekeeping (invalidate the NL-planning cache, re-embed the
@@ -1149,62 +1268,101 @@ class EnrichmentExecutor:
             triples.extend(self._provenance_triples(r.entity_uri, type_name, r.attribute, r.verdict))
         return triples
 
-    def _applied_attribute_names(
+    def _applied_attribute_values(
         self, rows: list[RowResult], policy: ConflictPolicy
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         """The attribute names (primary + their provenance companions) that
-        ACTUALLY received a written value under ``policy`` — the set whose ontology
-        declarations the apply step upserts so an enriched attribute becomes
-        first-class schema (visible in the /schema view, the Explorer column
-        schema, and the Enrich dialog's predicate dropdown). Attributes that found
-        nothing are excluded so enrichment never pollutes the ontology with empty
-        slots. Order-preserving + deduped so the caller issues one declaration per
-        attribute, not one per row.
+        ACTUALLY received a written value under ``policy``, mapped to the list of
+        string VALUES applied for each — the set whose ontology declarations the
+        apply step upserts so an enriched attribute becomes first-class schema
+        (visible in the /schema view, the Explorer column schema, and the Enrich
+        dialog's predicate dropdown). Attributes that found nothing are excluded
+        so enrichment never pollutes the ontology with empty slots. Insertion-
+        ordered + value-accumulating so the caller issues one declaration per
+        attribute (not one per row) AND can infer that attribute's datatype from
+        the actual values written.
 
         The provenance companions (``<attr>_source_url``, ``<attr>_provenance``)
         are declared only when :meth:`_provenance_triples` actually emitted them
         for some applied row — matching the citation columns that were really
         written (a verdict with no ``source_url`` writes no ``_source_url`` triple,
-        so we don't declare a phantom column)."""
-        names: list[str] = []
-        seen: set[str] = set()
-
-        def _add(name: str) -> None:
-            if name not in seen:
-                seen.add(name)
-                names.append(name)
+        so we don't declare a phantom column). Their values are strings (URLs /
+        free text) so they naturally infer ``string``."""
+        out: dict[str, list[str]] = {}
 
         for r in rows:
             if not self._row_is_applied(r, policy):
                 continue
-            _add(r.attribute)
+            out.setdefault(r.attribute, []).append(r.verdict.value)
             # Mirror the companion provenance triples this row actually wrote, so
-            # the declared schema matches the data exactly.
-            for _s, prov_pred, _o in self._provenance_triples(
+            # the declared schema (and its inferred datatype) matches the data.
+            for _s, prov_pred, prov_val in self._provenance_triples(
                 r.entity_uri, "", r.attribute, r.verdict
             ):
-                _add(_local_name(prov_pred))
-        return names
+                out.setdefault(_local_name(prov_pred), []).append(prov_val)
+        return out
+
+    async def _resolve_declared_datatype(
+        self, onto_graph: str, type_name: str, attr_name: str, values: list[str]
+    ) -> str:
+        """Resolve the ``datatype`` to declare for one enriched attribute, never
+        DOWNGRADING an existing richer range.
+
+        Two inputs combine:
+          1. The datatype INFERRED from the actual applied ``values`` (integer /
+             float / string) — so a numeric enriched attribute is typed, not
+             stamped ``xsd:string`` blindly.
+          2. The attribute's range as ALREADY declared in the ontology. If that
+             existing range is anything other than ``xsd:string`` — a richer XSD
+             primitive (integer/float/dateTime) OR a relationship ``types/<X>``
+             URI declared by ingestion — it is PRESERVED verbatim; enrichment must
+             not clobber an ingest-inferred integer or a relationship edge down to
+             a string.
+
+        Net rule: ``existing_range if (existing_range and existing_range !=
+        xsd:string) else inferred``. With no existing range, or an existing
+        ``xsd:string``, the inferred datatype wins (so a brand-new attribute is
+        typed correctly, and a previously-untyped string slot can be upgraded)."""
+        inferred = _infer_datatype_from_values(values)
+        raw = await self._neptune.query(
+            get_attribute_range_query(onto_graph, type_name, attr_name)
+        )
+        _, bindings = parse_sparql_results(raw)
+        existing = bindings[0].get("range") if bindings else None
+        if existing and existing != XSD_STRING:
+            # Re-assert the existing richer range verbatim (round-trips back to the
+            # same URI through upsert_attribute -> _datatype_to_xsd).
+            return xsd_to_datatype(existing)
+        return inferred
 
     async def _declare_attributes(
-        self, tenant_id: str, type_name: str, attr_names: list[str]
+        self, tenant_id: str, type_name: str, attr_values: dict[str, list[str]]
     ) -> None:
         """Upsert each enrichment-applied attribute's ontology declaration into the
         TENANT (ontology) graph so it becomes first-class schema. Reuses the same
         idempotent :func:`upsert_attribute` the ontology endpoint uses
-        (``rdf:Property ; rdfs:label ; rdfs:domain <Type> ; rdfs:range xsd:string``),
-        one update per attribute. Called BEFORE the instance ``insert_triples``
-        write (declare schema, then write data) and inside the job's try/except so
-        a declaration failure fails the job, consistent with existing behavior."""
+        (``rdf:Property ; rdfs:label ; rdfs:domain <Type> ; rdfs:range <…>``), one
+        update per attribute. The declared ``rdfs:range`` is resolved per attribute
+        by :meth:`_resolve_declared_datatype`: inferred from the actual applied
+        values, but never downgrading an existing richer range. Called BEFORE the
+        instance ``insert_triples`` write (declare schema, then write data) and
+        inside the job's try/except so a declaration failure fails the job,
+        consistent with existing behavior.
+
+        ``attr_values`` maps each applied attribute name (primary + provenance
+        companions) to the string values written for it."""
         onto_graph = tenant_graph_uri(tenant_id)
-        for name in attr_names:
+        for name, values in attr_values.items():
+            datatype = await self._resolve_declared_datatype(
+                onto_graph, type_name, name, values
+            )
             await self._neptune.update(
                 upsert_attribute(
                     onto_graph,
                     type_name,
                     name,
                     description=ENRICH_ATTR_DESCRIPTION,
-                    datatype=ENRICH_ATTR_DATATYPE,
+                    datatype=datatype,
                 )
             )
 
@@ -1217,8 +1375,10 @@ class EnrichmentExecutor:
         graph_uri = kg_graph_uri(job.tenant_id, job.kg_name)
         triples: list[tuple[str, str, str]] = []
         applied = 0  # number of accepted facts (provenance triples don't count)
-        applied_attrs: list[str] = []
-        seen_attrs: set[str] = set()
+        # Insertion-ordered map of applied attribute name -> the string values
+        # written for it, so declarations infer the right range (and never
+        # downgrade an existing one), mirroring run()'s _applied_attribute_values.
+        applied_attr_values: dict[str, list[str]] = {}
         for d in decisions:
             if d.decision != "accept":
                 continue
@@ -1226,18 +1386,19 @@ class EnrichmentExecutor:
             triples.append((d.entity_uri, p, d.proposed.value))
             prov = self._provenance_triples(d.entity_uri, job.type_name, d.attribute, d.proposed)
             triples.extend(prov)
-            # Track the attribute names (primary + provenance companions actually
-            # written) so we can declare them in the ontology, mirroring run().
-            for name in [d.attribute, *(_local_name(pp) for _s, pp, _o in prov)]:
-                if name not in seen_attrs:
-                    seen_attrs.add(name)
-                    applied_attrs.append(name)
+            # Track the attribute names + values (primary + provenance companions
+            # actually written) so we declare them in the ontology, mirroring run().
+            applied_attr_values.setdefault(d.attribute, []).append(d.proposed.value)
+            for _s, prov_pred, prov_val in prov:
+                applied_attr_values.setdefault(_local_name(prov_pred), []).append(prov_val)
             applied += 1
         if triples:
             # Declare schema, THEN write data — accepted review decisions extend
             # the ontology too (COG-112), so the enriched attribute is first-class
             # schema, mirroring the auto-apply path in run().
-            await self._declare_attributes(job.tenant_id, job.type_name, applied_attrs)
+            await self._declare_attributes(
+                job.tenant_id, job.type_name, applied_attr_values
+            )
             # Same shared write path as run() / ingestion (graph/kg_writer.py):
             # batched insert + post-write housekeeping (cache-invalidate,
             # re-embed the type, recompute stats).

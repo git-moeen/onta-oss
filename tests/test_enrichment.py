@@ -13,6 +13,8 @@ from cograph_client.enrichment.cache import EnrichmentCache
 from cograph_client.enrichment.executor import (
     EnrichmentExecutor,
     _build_select_query,
+    _entity_iri_type,
+    _infer_datatype_from_values,
     _parse_vals,
     _resolve_pred_iris_from_bindings,
     _scope_block,
@@ -82,6 +84,16 @@ def _count_response(n: int) -> dict:
         "head": {"vars": ["n"]},
         "results": {"bindings": [{"n": {"type": "literal", "value": str(n)}}]},
     }
+
+
+def _range_response(range_uri: str | None = None) -> dict:
+    """SPARQL result for get_attribute_range_query: zero rows when ``range_uri`` is
+    None (attribute has no existing range → enrichment uses its inferred range), or
+    one ``?range`` binding when an existing range should be preserved."""
+    bindings = (
+        [{"range": {"type": "uri", "value": range_uri}}] if range_uri else []
+    )
+    return {"head": {"vars": ["range"]}, "results": {"bindings": bindings}}
 
 
 # ---------------------------------------------------------------------------
@@ -2163,6 +2175,8 @@ def test_apply_decisions_writes_accepted_only(monkeypatch):
 
     async def run():
         neptune = AsyncMock()
+        # Declaration reads the attribute's existing range first; none exists yet.
+        neptune.query.return_value = _range_response()
         store = InMemoryJobStore()
         cache = EnrichmentCache()
         wikidata = FakeWikidata({})
@@ -2288,6 +2302,8 @@ def test_apply_decisions_schedules_stats_recompute(monkeypatch):
 
     async def run():
         neptune = AsyncMock()
+        # Declaration reads the attribute's existing range first; none exists yet.
+        neptune.query.return_value = _range_response()
         store = InMemoryJobStore()
         cache = EnrichmentCache()
         wikidata = FakeWikidata({})
@@ -2513,6 +2529,8 @@ def test_apply_decisions_declares_accepted_attribute(monkeypatch):
     async def run():
         neptune = AsyncMock()
         neptune.update.return_value = None
+        # Declaration reads the attribute's existing range first; none exists yet.
+        neptune.query.return_value = _range_response()
         store = InMemoryJobStore()
         cache = EnrichmentCache()
         wikidata = FakeWikidata({})
@@ -2542,6 +2560,358 @@ def test_apply_decisions_declares_accepted_attribute(monkeypatch):
         tenant_graph = "https://cograph.tech/graphs/test-tenant"
         assert any(company_attr in d for d in decls)
         assert all(tenant_graph in d for d in decls)
+
+    asyncio.run(run())
+
+
+def _query_router(entities: dict, *, existing_range: str | None = None):
+    """An AsyncMock ``query`` side_effect that serves the entity-selection SELECT
+    and the per-attribute range SELECT (``SELECT ?range``) from one fake Neptune.
+    ``existing_range`` is the range the ontology already declares for the enriched
+    attribute (None = undeclared)."""
+
+    async def _route(sparql: str, *a, **k):
+        if "SELECT ?range" in sparql:
+            return _range_response(existing_range)
+        return entities
+
+    return _route
+
+
+def test_executor_apply_infers_integer_range_for_numeric_values(monkeypatch):
+    """A brand-new enriched attribute whose applied values are all numeric must be
+    declared with an xsd:integer range — NOT blindly stamped xsd:string (the
+    hardcoded-datatype bug)."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p2", "label": "Makita", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        # No existing range for 'humanness_score' → inference decides the range.
+        neptune.query.side_effect = _query_router(
+            _entities_query_response(rows), existing_range=None
+        )
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Bosch", "humanness_score"): [
+                    Verdict(value="92", confidence=0.95, source="wikidata")
+                ],
+                ("Makita", "humanness_score"): [
+                    Verdict(value="87", confidence=0.95, source="wikidata")
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["humanness_score"], policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        score_attr = "https://cograph.tech/types/Product/attrs/humanness_score"
+        xsd_integer = "http://www.w3.org/2001/XMLSchema#integer"
+        xsd_string = "http://www.w3.org/2001/XMLSchema#string"
+        primary = [d for d in _declaration_updates(neptune) if score_attr in d]
+        assert primary, "humanness_score attribute not declared"
+        d = primary[0]
+        # The numeric attribute is typed as integer, NOT stamped string.
+        assert xsd_integer in d
+        assert xsd_string not in d
+
+    asyncio.run(run())
+
+
+def test_executor_apply_does_not_downgrade_existing_richer_range(monkeypatch):
+    """If an attribute already carries a richer range (an ingest-inferred
+    xsd:integer, or a relationship types/<Target> URI), applying an enrichment job
+    on it must PRESERVE that range — never silently downgrade it to xsd:string."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+    async def _assert_preserves(existing_range: str, value: str):
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.side_effect = _query_router(
+            _entities_query_response(rows), existing_range=existing_range
+        )
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {("Bosch", "rating"): [Verdict(value=value, confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["rating"], policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        rating_attr = "https://cograph.tech/types/Product/attrs/rating"
+        xsd_string = "http://www.w3.org/2001/XMLSchema#string"
+        primary = [d for d in _declaration_updates(neptune) if rating_attr in d]
+        assert primary, "rating attribute not declared"
+        d = primary[0]
+        # The pre-existing richer range is re-asserted verbatim, never downgraded.
+        assert existing_range in d
+        assert f"#range> <{xsd_string}>" not in d
+
+    async def run():
+        # (a) ingest-inferred integer range survives a string-valued enrichment.
+        await _assert_preserves(
+            "http://www.w3.org/2001/XMLSchema#integer", value="five stars"
+        )
+        # (b) a relationship range (types/<Target>) survives too — the edge stays.
+        await _assert_preserves(
+            "https://cograph.tech/types/Manufacturer", value="Robert Bosch GmbH"
+        )
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# E2: date + entity-reference (relationship) datatype inference
+# ---------------------------------------------------------------------------
+
+
+def test_infer_datatype_dates_to_datetime():
+    """ISO dates / datetimes (plain, Z-suffixed, +00:00) all infer ``datetime``."""
+    assert _infer_datatype_from_values(["2026-06-28"]) == "datetime"
+    assert (
+        _infer_datatype_from_values(["2026-06-28", "2026-06-28T00:00:00Z"])
+        == "datetime"
+    )
+    assert (
+        _infer_datatype_from_values(["2026-06-28T21:24:50+00:00"]) == "datetime"
+    )
+
+
+def test_infer_datatype_integer_not_misread_as_date():
+    """An all-integer column must stay ``integer`` — never a date false-positive,
+    even though a bare year-like int contains no separator."""
+    assert _infer_datatype_from_values(["2026", "1999", "42"]) == "integer"
+
+
+def test_infer_datatype_entity_iris_same_type_is_relationship():
+    """All values are entity IRIs sharing one ``<TypeName>`` → that bare type name
+    (which maps to a ``types/<TypeName>`` relationship range)."""
+    vals = [
+        "https://cograph.tech/entities/Manufacturer/bosch",
+        "https://cograph.tech/entities/Manufacturer/makita",
+    ]
+    assert _infer_datatype_from_values(vals) == "Manufacturer"
+
+
+def test_infer_datatype_mixed_iri_types_falls_back_to_string():
+    """Entity IRIs of DIFFERENT types have no single relationship range → string
+    (don't guess)."""
+    vals = [
+        "https://cograph.tech/entities/Manufacturer/bosch",
+        "https://cograph.tech/entities/Country/germany",
+    ]
+    assert _infer_datatype_from_values(vals) == "string"
+
+
+def test_entity_iri_type_parses_and_rejects():
+    """``_entity_iri_type`` extracts the type from a canonical entity IRI and
+    returns None for non-matching values (literal, foreign URI, missing id)."""
+    assert (
+        _entity_iri_type("https://cograph.tech/entities/Manufacturer/bosch")
+        == "Manufacturer"
+    )
+    assert _entity_iri_type("Robert Bosch GmbH") is None
+    assert _entity_iri_type("https://cograph.tech/types/Manufacturer") is None
+    # Missing <id> segment is not a complete entity IRI.
+    assert _entity_iri_type("https://cograph.tech/entities/Manufacturer") is None
+    assert _entity_iri_type("https://cograph.tech/entities/Manufacturer/") is None
+
+
+def _instance_inserts(neptune) -> list[str]:
+    """SPARQL update strings that look like an INSTANCE-data write (carry the
+    entity-IRI prefix as a SUBJECT, i.e. the ``insert_facts`` triples) but are NOT
+    ontology declarations (no ``rdf:Property`` + ``rdfs:domain``)."""
+    rdf_property = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
+    rdfs_domain = "http://www.w3.org/2000/01/rdf-schema#domain"
+    out: list[str] = []
+    for call in neptune.update.await_args_list:
+        sparql = call.args[0] if call.args else call.kwargs.get("sparql", "")
+        is_decl = rdf_property in sparql and rdfs_domain in sparql
+        if "https://cograph.tech/entities/" in sparql and not is_decl:
+            out.append(sparql)
+    return out
+
+
+def test_executor_apply_infers_datetime_range_for_date_values(monkeypatch):
+    """A brand-new enriched attribute whose applied values are all ISO dates must
+    be declared with an xsd:dateTime range — NOT stamped xsd:string."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p2", "label": "Makita", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.side_effect = _query_router(
+            _entities_query_response(rows), existing_range=None
+        )
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Bosch", "founded"): [
+                    Verdict(value="2026-06-28", confidence=0.95, source="wikidata")
+                ],
+                ("Makita", "founded"): [
+                    Verdict(
+                        value="2026-06-28T00:00:00Z", confidence=0.95, source="wikidata"
+                    )
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["founded"], policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        founded_attr = "https://cograph.tech/types/Product/attrs/founded"
+        xsd_datetime = "http://www.w3.org/2001/XMLSchema#dateTime"
+        xsd_string = "http://www.w3.org/2001/XMLSchema#string"
+        primary = [d for d in _declaration_updates(neptune) if founded_attr in d]
+        assert primary, "founded attribute not declared"
+        d = primary[0]
+        assert xsd_datetime in d
+        assert f"#range> <{xsd_string}>" not in d
+
+    asyncio.run(run())
+
+
+def test_executor_apply_entity_iri_values_declare_relationship_and_write_iri(monkeypatch):
+    """When all applied values are entity IRIs of one type ``Manufacturer``, the
+    attribute is declared with a ``types/Manufacturer`` relationship range AND the
+    instance triple's OBJECT is written as an IRI ``<…/entities/…>`` (the shared
+    writer auto-detects ``https://`` objects), never a quoted literal."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Drill", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p2", "label": "Saw", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.side_effect = _query_router(
+            _entities_query_response(rows), existing_range=None
+        )
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Drill", "manufacturer"): [
+                    Verdict(
+                        value="https://cograph.tech/entities/Manufacturer/bosch",
+                        confidence=0.95,
+                        source="wikidata",
+                    )
+                ],
+                ("Saw", "manufacturer"): [
+                    Verdict(
+                        value="https://cograph.tech/entities/Manufacturer/makita",
+                        confidence=0.95,
+                        source="wikidata",
+                    )
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        mfr_attr = "https://cograph.tech/types/Product/attrs/manufacturer"
+        types_mfr = "https://cograph.tech/types/Manufacturer"
+        # (a) declared as a relationship range types/Manufacturer, not xsd:string.
+        primary = [d for d in _declaration_updates(neptune) if mfr_attr in d]
+        assert primary, "manufacturer attribute not declared"
+        d = primary[0]
+        assert f"#range> <{types_mfr}>" in d
+        assert "#range> <http://www.w3.org/2001/XMLSchema#string>" not in d
+
+        # (b) the instance object is written as an IRI, not a quoted literal.
+        inserts = _instance_inserts(neptune)
+        joined = "\n".join(inserts)
+        assert "<https://cograph.tech/entities/Manufacturer/bosch>" in joined
+        assert '"https://cograph.tech/entities/Manufacturer/bosch"' not in joined
+
+    asyncio.run(run())
+
+
+def test_executor_apply_does_not_downgrade_datetime_or_relationship_range(monkeypatch):
+    """No-downgrade holds for the E2 ranges too: an existing xsd:dateTime or a
+    relationship types/<Target> range survives an enrichment whose own values
+    would infer something weaker."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+    async def _assert_preserves(existing_range: str, value: str):
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.side_effect = _query_router(
+            _entities_query_response(rows), existing_range=existing_range
+        )
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {("Bosch", "founded"): [Verdict(value=value, confidence=0.95, source="wikidata")]}
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["founded"], policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        founded_attr = "https://cograph.tech/types/Product/attrs/founded"
+        xsd_string = "http://www.w3.org/2001/XMLSchema#string"
+        primary = [d for d in _declaration_updates(neptune) if founded_attr in d]
+        assert primary, "founded attribute not declared"
+        d = primary[0]
+        assert existing_range in d
+        assert f"#range> <{xsd_string}>" not in d
+
+    async def run():
+        # An existing xsd:dateTime survives a free-text enrichment value.
+        await _assert_preserves(
+            "http://www.w3.org/2001/XMLSchema#dateTime", value="sometime in 2026"
+        )
+        # An existing relationship range survives a string-valued enrichment.
+        await _assert_preserves(
+            "https://cograph.tech/types/Manufacturer", value="Robert Bosch GmbH"
+        )
 
     asyncio.run(run())
 
