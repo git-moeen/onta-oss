@@ -3864,6 +3864,55 @@ def test_executor_apply_writes_typed_integer_literal(monkeypatch):
     asyncio.run(run())
 
 
+def test_executor_apply_writes_comma_number_as_string_not_dropped(monkeypatch):
+    """A comma-grouped number ("1,234") is declared ``string`` and survives as a
+    plain string literal — NOT declared integer and then dropped by the validator
+    (the comma data-loss regression the re-review flagged). Inference and the
+    write-side validator agree: commas are not numeric."""
+    import cograph_client.api.routes.explore as explore_mod
+
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p2", "label": "Makita", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.side_effect = _query_router(
+            _entities_query_response(rows), existing_range=None
+        )
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata(
+            {
+                ("Bosch", "unit_sales"): [
+                    Verdict(value="1,234", confidence=0.95, source="wikidata")
+                ],
+                ("Makita", "unit_sales"): [
+                    Verdict(value="12,345", confidence=0.95, source="wikidata")
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["unit_sales"], policy=ConflictPolicy.overwrite)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        joined = "\n".join(_instance_inserts(neptune))
+        # The comma value is written as a plain string literal — present, not dropped.
+        assert '"1,234"' in joined
+        assert '"12,345"' in joined
+        # Declared as string, so NOT typed integer.
+        decl = "\n".join(_declaration_updates(neptune))
+        assert "XMLSchema#integer" not in decl
+
+    asyncio.run(run())
+
+
 def test_executor_apply_writes_typed_datetime_literal(monkeypatch):
     """A date enriched value is stored as a TYPED ``^^<…#dateTime>`` literal
     matching the declared dateTime range."""
@@ -4121,20 +4170,23 @@ def test_apply_decisions_writes_typed_integer_literal(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_is_int_rejects_underscores_keeps_plain_ints():
-    """``_is_int`` rejects Python underscore groupings (a string SKU like
-    ``1_000`` must NOT be read as an int) while plain ints still parse True."""
+def test_is_int_rejects_underscores_and_commas_keeps_plain_ints():
+    """``_is_int`` rejects underscore AND comma groupings, while plain ints still
+    parse True. Commas are rejected so the inference layer agrees with the
+    write-side validator (which does NOT strip commas): otherwise a column like
+    ``"1,234"`` would be declared integer here and then DROPPED at write time."""
     assert _is_int("92") is True
     assert _is_int("-3") is True
-    assert _is_int("1,000") is True  # thousands separator still tolerated
+    assert _is_int("1,000") is False  # comma rejected (matches the validator)
     assert _is_int("1_000") is False
     assert _is_int("five") is False
 
 
-def test_is_float_rejects_non_finite_and_underscores():
+def test_is_float_rejects_non_finite_commas_and_underscores():
     """``_is_float`` rejects the non-finite special tokens float() accepts
-    (inf/-inf/infinity/nan) and underscore groupings, while real decimals and
-    real scientific notation still parse True."""
+    (inf/-inf/infinity/nan), comma groupings, and underscore groupings, while real
+    decimals and real scientific notation still parse True. Commas are rejected to
+    agree with the validator (which would drop a comma value declared float)."""
     assert _is_float("8.5") is True
     assert _is_float("1e10") is True  # real scientific notation
     assert _is_float("-2.0") is True
@@ -4143,10 +4195,14 @@ def test_is_float_rejects_non_finite_and_underscores():
     assert _is_float("infinity") is False
     assert _is_float("nan") is False
     assert _is_float("1_000.5") is False
+    assert _is_float("1,000.5") is False  # comma rejected (matches the validator)
 
 
 def test_infer_datatype_does_not_mis_declare_special_tokens():
-    """A column of ``inf``/``nan`` strings is NOT mis-declared float/int — it
-    falls through to ``string`` (the tightened helpers feed inference)."""
+    """A column of ``inf``/``nan``/underscore/comma strings is NOT mis-declared
+    float/int — it falls through to ``string`` (the tightened helpers feed
+    inference), so the values survive at write time as plain string literals
+    instead of being declared numeric and then dropped by the validator."""
     assert _infer_datatype_from_values(["inf", "nan"]) == "string"
     assert _infer_datatype_from_values(["1_000"]) == "string"
+    assert _infer_datatype_from_values(["1,234", "12,345"]) == "string"

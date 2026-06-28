@@ -163,44 +163,45 @@ def _local_name(uri_or_value: str) -> str:
 
 
 def _is_int(v: str) -> bool:
-    """True if ``v`` parses as an int (tolerating thousands separators / sign).
+    """True if ``v`` parses as a plain int (optional leading sign only).
 
     Mirrors agent/capabilities/web_ingest_cap.py's helper — kept as a small local
     copy rather than imported so the enrichment layer takes no dependency on the
     agent layer.
 
-    Tightened (P1 mis-declaration fix): we reject ``_`` digit-group separators that
-    Python's ``int()`` accepts (``int("1_000") == 1000``). A real numeric column
-    never uses underscores, and accepting them mis-DECLARES a plain string column
-    (e.g. an SKU like ``1_000``) as ``xsd:integer``."""
-    if not isinstance(v, str) or "_" in v:
-        # Underscores are a Python literal grouping ("1_000") never present in real
-        # data — treat them as "not an int" so the column isn't mis-typed.
+    This MUST agree with the write-side validator (``resolver.validator``): its
+    ``validate_value`` accepts integers as ``^-?\\d+$`` and ``coerce_value`` does
+    ``int(float(v))`` — neither strips thousands separators. So we reject ``,`` and
+    ``_`` groupings here too. If the inference layer declared ``xsd:integer`` for a
+    comma-grouped value the validator would then REJECT (drop) it at write time, so
+    a column like ``"1,234"`` must declare ``string`` and keep the value as a
+    visible string literal rather than vanish."""
+    if not isinstance(v, str) or "_" in v or "," in v:
         return False
     try:
-        int(v.replace(",", ""))
+        int(v)
         return True
     except (ValueError, AttributeError):
         return False
 
 
 def _is_float(v: str) -> bool:
-    """True if ``v`` parses as a float (tolerating thousands separators / sign).
+    """True if ``v`` parses as a finite float (optional leading sign only).
 
-    Tightened (P1 mis-declaration fix): Python's ``float()`` happily parses the
-    special tokens ``inf``/``-inf``/``infinity``/``nan`` and underscore groupings,
-    none of which are real numeric data — accepting them mis-DECLARES a string
-    column as ``xsd:float``. We reject underscores and any value whose normalized
-    form is a non-finite special token. Ordinary decimals and scientific notation
-    of real numbers (``8.5``, ``1e10``) still parse True."""
-    if not isinstance(v, str) or "_" in v:
+    Like :func:`_is_int`, this MUST agree with the write-side validator, which does
+    not strip thousands separators — so we reject ``,`` and ``_`` groupings (else a
+    comma value would be declared numeric and then dropped at write). Python's
+    ``float()`` also parses the special tokens ``inf``/``-inf``/``infinity``/``nan``,
+    none of which are real numeric data, so we reject those too. Ordinary decimals
+    and scientific notation of real numbers (``8.5``, ``1e10``) still parse True."""
+    if not isinstance(v, str) or "_" in v or "," in v:
         return False
     # Reject the non-finite special tokens float() accepts (inf/-inf/infinity/nan).
-    cleaned = v.replace(",", "").strip().lstrip("+-").lower()
+    cleaned = v.strip().lstrip("+-").lower()
     if cleaned in ("inf", "infinity", "nan"):
         return False
     try:
-        f = float(v.replace(",", ""))
+        f = float(v)
     except (ValueError, AttributeError):
         return False
     # Belt-and-suspenders: any non-finite result (should already be caught above)
