@@ -41,18 +41,76 @@ _CORE_SLOT_PRED = "https://cograph.tech/onto/coreSlot"
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 RDF_PROPERTY = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 RDFS = "http://www.w3.org/2000/01/rdf-schema"
+RDFS_NS = "http://www.w3.org/2000/01/rdf-schema#"
 TYPE_URI_PREFIX = "https://cograph.tech/types/"
 ENTITY_URI_PREFIX = "https://cograph.tech/entities/"
 # Instance relationship predicates are minted as `…/onto/<predName>` (see
 # nlp/pipeline.py); the matching ontology attr/core-slot marker lives at
 # `attr_uri(<sourceTypeLeaf>, <predName>)`. Strip this prefix to recover predName.
 ONTO_PRED_PREFIX = "https://cograph.tech/onto/"
+# Entity-resolution internals (blockKey, erSignal_*) are written under this
+# namespace by resolver.er.blocking — never user-facing domain data.
+ER_NS = "https://cograph.tech/er/"
+# Normalization internals (canonical-value bookkeeping) live under …/onto/norm/.
+ONTO_NORM_PREFIX = ONTO_PRED_PREFIX + "norm/"
 SYSTEM_PREDICATES: frozenset[str] = frozenset({
     f"{RDFS}#label",
     "https://cograph.tech/onto/ingested_at",
     "https://cograph.tech/onto/source",
 })
+
+# Internal / housekeeping predicates that must NOT surface in the Explorer's
+# user-facing Attributes / Relationships panel. Real domain attributes live at
+# `…/types/<T>/attrs/*` and real relationships are minted at `…/onto/<predName>`
+# (see ONTO_PRED_PREFIX) — so we can NOT blanket-exclude the whole `…/onto/`
+# namespace; legitimate relationships share it. Instead we exclude:
+#   * the RDF + RDFS system namespaces (rdf:type / rdfs:label are handled
+#     explicitly elsewhere; this keeps every OTHER rdf*/rdfs* term out too),
+#   * the entity-resolution namespace `…/er/` wholesale (blockKey, erSignal_*),
+#   * the normalization-bookkeeping namespace `…/onto/norm/` wholesale,
+#   * a curated set of housekeeping markers under `…/onto/` that ingest/lambda
+#     attach to every entity (batch_id, ingested_at, source, …) — these are the
+#     three the user reported plus the other system markers minted in the same
+#     namespace, but NOT real relationship predicates.
+# This is namespace/marker-based, not a copy of the three observed leaves, so a
+# newly added housekeeping marker in one of these namespaces is excluded too.
+_INTERNAL_ONTO_MARKERS: frozenset[str] = frozenset({
+    ONTO_PRED_PREFIX + "batch_id",
+    ONTO_PRED_PREFIX + "ingested_at",
+    ONTO_PRED_PREFIX + "source",
+    ONTO_PRED_PREFIX + "coreSlot",
+    ONTO_PRED_PREFIX + "aliasOf",
+    ONTO_PRED_PREFIX + "lambda_refreshed_at",
+})
+
+
+def _is_internal_predicate(p_uri: str) -> bool:
+    """True if ``p_uri`` is an internal/housekeeping predicate, not a user-facing
+    domain attribute or relationship.
+
+    Used everywhere predicates are turned into the Explorer's Attributes /
+    Relationships panel (assembly + the scan/recompute) so internal triples
+    (`onto/batch_id`, `er/blockKey`, `er/erSignal_*`, rdf*/rdfs*) never appear
+    with a coverage %. Kept namespace-based on purpose — see
+    ``_INTERNAL_ONTO_MARKERS`` for why the whole `…/onto/` namespace can't be
+    excluded.
+    """
+    if not p_uri:
+        return True
+    if p_uri == RDF_TYPE or p_uri in SYSTEM_PREDICATES:
+        return True
+    # Whole-namespace exclusions: RDF/RDFS system vocab + ER + normalization.
+    if p_uri.startswith(RDF_NS) or p_uri.startswith(RDFS_NS):
+        return True
+    if p_uri.startswith(ER_NS) or p_uri.startswith(ONTO_NORM_PREFIX):
+        return True
+    # Curated housekeeping markers under …/onto/ (the namespace also holds real
+    # relationship predicates, so we match the specific markers, not the prefix).
+    if p_uri in _INTERNAL_ONTO_MARKERS:
+        return True
+    return False
 
 # In-memory hot cache on top of the persistent stats graph. Read-heavy data
 # warmed on first read, busted whenever the underlying counts change.
@@ -206,7 +264,7 @@ def _assemble_summary(
     relationships = []
     for r in pred_records:
         p_uri = r.get("p", "")
-        if not p_uri or p_uri == RDF_TYPE or p_uri in SYSTEM_PREDICATES:
+        if _is_internal_predicate(p_uri):
             continue
         cnt = r.get("cnt", 0)
         rel = r.get("rel", 0)
@@ -284,6 +342,10 @@ async def _live_scan(client: NeptuneClient, kg_graph: str, t_uri: str) -> tuple[
             rel = 0
         if p_uri == RDF_TYPE:
             entity_count = cnt
+            continue
+        # Skip internal/housekeeping predicates so they never become user-facing
+        # attributes/relationships (onto/batch_id, er/blockKey, er/erSignal_*, …).
+        if _is_internal_predicate(p_uri):
             continue
         records.append({"p": p_uri, "cnt": cnt, "rel": rel,
                         "target": _target_from_entity_uri(r.get("sample", ""))})
@@ -610,6 +672,13 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
             rel = 0
         if p_uri == RDF_TYPE:
             entity_counts[type_uri_str] = cnt
+            continue
+        # Don't materialize stats for internal/housekeeping predicates — they
+        # must never reach the Explorer's Attributes/Relationships panel
+        # (onto/batch_id, er/blockKey, er/erSignal_*, rdf*/rdfs*). Filtering here
+        # keeps freshly recomputed stats clean (assembly filters too, as a
+        # backstop for already-materialized stats).
+        if _is_internal_predicate(p_uri):
             continue
         total_edges += rel
         node = _stat_node(type_uri_str, p_uri)
@@ -1295,7 +1364,12 @@ async def get_type_records(
         if p_uri == LABEL_PRED:
             entity_data[e_uri]["_label"] = o_val
             continue
-        if p_uri in SYSTEM_PREDICATES:
+        # Internal/housekeeping predicates (onto/batch_id, er/blockKey,
+        # er/erSignal_*, rdf*/rdfs*) must never become data-table columns — same
+        # filter the summary panel uses. rdfs:label is intercepted above (it is
+        # the row name); the real attrs/name predicate (…/onto/name) is NOT
+        # internal and still flows through to the name-precedence logic below.
+        if _is_internal_predicate(p_uri):
             continue
         # Resolve display name: check attr_label_by_pred (instance pred) first,
         # then attr_label_by_onto (onto attr URI), then fall back to the URI leaf.
