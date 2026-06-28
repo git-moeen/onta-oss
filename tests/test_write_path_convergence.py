@@ -145,6 +145,28 @@ def test_dedupe_writers_use_shared_refresh():
         )
 
 
+def test_web_ingest_calls_refresh_after_write():
+    """Web-discovery ingest (agent/capabilities/web_ingest_cap.py) CREATES new
+    types/attributes/entities via the ingest engine, so its background job must run
+    the same post-write housekeeping as every other writer — otherwise the
+    ontology expansion stays invisible to NL planning + Explorer. The refresh must
+    go through the shared refresh_after_write, not a re-inlined embed/cache step."""
+    import cograph_client.agent.capabilities.web_ingest_cap as web_ingest_mod
+
+    src = inspect.getsource(web_ingest_mod)
+    assert _calls(src, "refresh_after_write"), (
+        "web-discovery ingest must run post-write housekeeping via "
+        "kg_writer.refresh_after_write"
+    )
+    assert not _calls(src, "embed_types"), (
+        "web ingest re-inlined embed_types — delegate to refresh_after_write"
+    )
+    assert "invalidate_cache" not in src, (
+        "web ingest re-inlined the ontology-cache invalidation — delegate to "
+        "refresh_after_write"
+    )
+
+
 def test_shared_writer_is_the_single_housekeeping_owner():
     """Sanity: the shared writer itself is the one place embed/cache-invalidate/
     recompute live, so delegating to it actually centralizes the behavior."""

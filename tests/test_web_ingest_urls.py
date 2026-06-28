@@ -14,6 +14,7 @@ entity/attribute spec is injected via plan()'s ``parsed`` hook.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from unittest.mock import MagicMock
@@ -21,7 +22,12 @@ from unittest.mock import MagicMock
 from cograph_client.agent.capabilities import web_ingest_cap
 from cograph_client.agent.capabilities.web_ingest_cap import WebIngestCapability
 from cograph_client.agent.registry import AgentContext
-from cograph_client.resolver.models import CSVSchemaMapping, IngestResult
+from cograph_client.resolver.models import (
+    ExtractedAttribute,
+    ExtractedEntity,
+    ExtractionResult,
+    IngestResult,
+)
 from cograph_client.resolver.schema_resolver import SchemaResolver
 from cograph_client.web_sources import (
     DiscoverResult,
@@ -31,6 +37,29 @@ from cograph_client.web_sources import (
 
 URL_A = "https://example.com/catalog"
 URL_B = "https://docs.example.org/models"
+
+
+@pytest.fixture(autouse=True)
+def _patch_preview(monkeypatch):
+    """Make the plan-time multi-type preview deterministic so URL-routing tests
+    don't depend on a real LLM extractor: a fresh ontology + a single Model type."""
+
+    async def fake_fetch_ontology(self, graph_uri):
+        return {}, {}
+
+    async def fake_extract(self, content, content_type, existing=None):
+        return ExtractionResult(
+            entities=[
+                ExtractedEntity(
+                    type_name="Model", id="row-0",
+                    attributes=[ExtractedAttribute(name="description", value="x")],
+                )
+            ],
+            relationships=[],
+        )
+
+    monkeypatch.setattr(SchemaResolver, "_fetch_ontology", fake_fetch_ontology)
+    monkeypatch.setattr(SchemaResolver, "_extract", fake_extract)
 
 # Spec as the LLM resolver would return it (already normalized). In URL mode the
 # query is still "what to pull from these pages".
@@ -224,11 +253,12 @@ async def test_execute_repasses_urls_to_provider(monkeypatch):
 
     captured: dict = {}
 
-    async def fake_ingest(self, rows, mapping, tenant_id, source="", instance_graph=None):
-        captured.update(rows=rows, mapping=mapping, source=source)
+    async def fake_ingest(self, content, tenant_id, content_type="text", source="", instance_graph=None):
+        captured.update(content=content, content_type=content_type, source=source)
+        rows = json.loads(content)
         return IngestResult(entities_extracted=len(rows), entities_resolved=len(rows))
 
-    monkeypatch.setattr(SchemaResolver, "ingest_mapped_records", fake_ingest)
+    monkeypatch.setattr(SchemaResolver, "ingest", fake_ingest)
 
     spawned: dict = {}
     monkeypatch.setattr(
@@ -249,9 +279,10 @@ async def test_execute_repasses_urls_to_provider(monkeypatch):
     full_call = provider.calls[-1]
     assert full_call["sample"] is False
     assert full_call["urls"] == [URL_A, URL_B]
-    # The extracted rows were committed through the persisted mapping.
-    assert len(captured["rows"]) == 2
-    assert isinstance(captured["mapping"], CSVSchemaMapping)
+    # The extracted rows were committed through the multi-type ingest path; the
+    # JSON content round-trips back to the extracted rows.
+    assert captured["content_type"] == "json"
+    assert len(json.loads(captured["content"])) == 2
 
 
 async def test_query_path_unchanged_when_no_urls():

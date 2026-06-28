@@ -16,14 +16,16 @@ accurately and the user doesn't have to run a separate enrichment afterward:
    (a clicked option carrying the list, or free text) enters the accumulated
    instruction so the next turn converges.
 2. Once attributes are confirmed, ``plan`` fetches a cheap SAMPLE constrained to
-   those attributes, builds a deterministic :class:`CSVSchemaMapping` from the
-   CONFIRMED (type, attributes) — not just whatever the web returned — and
-   returns a plan card (sample rows + sources + cost). The mapping is PERSISTED
-   so the schema previewed is exactly the schema committed (preview == commit).
+   those attributes and runs the SAME multi-type + relationship extractor the
+   commit uses against it — so the plan card previews the real ontology shape the
+   ingest will mint (the distinct entity types, their attributes, and the edges
+   between them), not a flat pre-named type. If the extractor can't run the
+   preview degrades to a flat single-type card (the turn never 500s).
 3. ``execute`` fetches the FULL set (targeting the same attributes) and ingests
-   it through :meth:`SchemaResolver.ingest_mapped_records` — the identical
-   resolve→dedup→batch-insert path CSV ingest commits through — as a background
-   job. Returns an ack.
+   it through :meth:`SchemaResolver.ingest` (``content_type="json"``) — the
+   identical extract→resolve→insert path document ingest commits through, which
+   infers MULTIPLE types and registers relationships as object-properties — as a
+   background job. Returns an ack.
 
 OSS ships with NO web-source provider registered, so the capability degrades
 gracefully: ``plan`` returns a plain "not enabled" answer until a downstream
@@ -50,13 +52,9 @@ from cograph_client.enrichment.models import (
     JobCategory,
     JobStatus,
 )
-from cograph_client.graph.queries import kg_graph_uri
+from cograph_client.graph.kg_writer import refresh_after_write
+from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
 from cograph_client.resolver.llm_router import PRIMARY_MODEL, openrouter_chat
-from cograph_client.resolver.models import (
-    ColumnMapping,
-    ColumnRole,
-    CSVSchemaMapping,
-)
 from cograph_client.web_sources.base import (
     WebSourceProvider,
     get_web_source,
@@ -180,13 +178,25 @@ class WebIngestCapability:
                 )
             ]
 
-        # 3. Build a DETERMINISTIC mapping from the confirmed (type, attributes) so
-        #    the ontology expands exactly as confirmed (not whatever the web
-        #    returned). Datatypes are inferred from the sample values only.
-        mapping = _build_mapping(type_name, key_attr, attributes, sample.rows)
+        # 3. Preview the DISCOVERED ontology shape from the sample — run the same
+        #    multi-type + relationship extractor the commit will, so the plan card
+        #    shows the real types/edges the ingest will mint (not a flat mapping).
         est_total = sample.estimated_total or len(sample.rows)
         cap = _DEFAULT_PLAN_CAP
         cost = _estimate_cost(provider, est_total, cap)
+        resolver = _build_resolver(ctx)
+        try:
+            existing_types, _existing_attrs = await resolver._fetch_ontology(
+                tenant_graph_uri(ctx.tenant_id)
+            )
+            shape = await _preview_shape(
+                resolver, sample.rows, set(existing_types.keys())
+            )
+        except Exception:  # noqa: BLE001 — preview must NEVER 500 the turn
+            logger.warning("web_ingest_preview_failed", exc_info=True)
+            shape = _flat_shape(type_name, attributes, set())
+        discovered_types = shape["discovered_types"]
+        relationships = shape["relationships"]
 
         step = PlanStep(
             capability=self.name,
@@ -195,7 +205,6 @@ class WebIngestCapability:
                 "query": query,
                 "proposed_type": type_name,
                 "attributes": attributes,
-                "mapping": mapping.model_dump(mode="json"),
                 "max_rows": cap,
                 "kg_name": ctx.kg_name,
                 "provider": provider.name,
@@ -210,13 +219,12 @@ class WebIngestCapability:
             confidence=0.7,
             preview={
                 "summary": (
-                    f"Capturing {_and_join(attributes)} for each. "
-                    f"~{est_total} found so far; capped at {cap} and staged for "
-                    f"your review before anything goes live."
+                    f"Discovered {len(discovered_types)} type(s) and "
+                    f"{len(relationships)} relationship(s) from a sample; "
+                    f"capped at {cap}, staged for review."
                 ),
-                "proposed_type": type_name,
-                "attributes": attributes,
-                "columns": _column_preview(mapping),
+                "discovered_types": discovered_types,
+                "relationships": relationships,
                 "sample_rows": sample.rows[:_PREVIEW_SAMPLE],
                 "sources": sample.sources[:_PREVIEW_SOURCES],
                 "estimated_total": est_total,
@@ -238,10 +246,9 @@ class WebIngestCapability:
         if provider is None:
             raise RuntimeError("web-source provider not available at execute time")
 
-        mapping = CSVSchemaMapping.model_validate(p["mapping"])
         query = p["query"]
         attributes = p.get("attributes") or []
-        proposed_type = p.get("proposed_type") or mapping.entity_type
+        proposed_type = p.get("proposed_type") or "WebRecord"
         cap = int(p.get("max_rows") or _DEFAULT_PLAN_CAP)
         kg_name = p.get("kg_name") or ctx.kg_name
         instance_graph = kg_graph_uri(ctx.tenant_id, kg_name) if kg_name else None
@@ -305,8 +312,12 @@ class WebIngestCapability:
                         platforms=platforms,
                     )
                     return
-                result = await resolver.ingest_mapped_records(
-                    rows, mapping, ctx.tenant_id, source=source,
+                content = json.dumps(rows, default=str, ensure_ascii=False)
+                result = await resolver.ingest(
+                    content,
+                    ctx.tenant_id,
+                    content_type="json",
+                    source=source,
                     instance_graph=instance_graph,
                 )
                 entities = int(getattr(result, "entities_resolved", 0) or 0)
@@ -317,6 +328,25 @@ class WebIngestCapability:
                     entities=entities,
                     types=getattr(result, "types_created", None),
                 )
+                # Single shared post-write housekeeping path (graph/kg_writer.py) —
+                # the SAME refresh ingestion + enrichment run: invalidate the
+                # NL-planning ontology cache, re-embed affected types (new types +
+                # types that gained an attribute), and recompute Explorer type-stats.
+                # Without this the web-discovery ontology expansion stays invisible to
+                # query planning + Explorer. Best-effort: a refresh hiccup must NOT
+                # present as a failed ingest — the data + ontology already landed.
+                affected_types = set(result.types_created)
+                for attr_added in result.attributes_added:
+                    affected_types.add(attr_added.split(".")[0])
+                try:
+                    await refresh_after_write(
+                        ctx.neptune,
+                        tenant_id=ctx.tenant_id,
+                        kg_name=kg_name,
+                        affected_types=affected_types,
+                    )
+                except Exception:  # noqa: BLE001 — refresh failure must not fail a landed ingest
+                    logger.warning("web_ingest_refresh_failed", exc_info=True)
                 await _finish_job(
                     job, job_store, processed=len(rows), entities=entities,
                     platforms=platforms,
@@ -458,40 +488,72 @@ def _clarify_step(type_name: str, key_attr: str, suggested: list[str]) -> PlanSt
     )
 
 
-def _build_mapping(
-    type_name: str, key_attr: str, attributes: list[str], sample_rows: list[dict]
-) -> CSVSchemaMapping:
-    """Deterministic mapping from the CONFIRMED shape: the key column is the
-    type id, every other confirmed attribute is an attribute column with a
-    datatype inferred from the sample values."""
-    cols: list[ColumnMapping] = [
-        ColumnMapping(
-            column_name=key_attr, role=ColumnRole.TYPE_ID,
-            datatype="string", attribute_name=key_attr,
-        )
-    ]
-    for a in attributes:
-        if a == key_attr:
+async def _preview_shape(
+    resolver, sample_rows: list[dict], existing_types: set[str]
+) -> dict:
+    """Run the SAME multi-type extractor the commit uses against the sample so the
+    plan card previews the real ontology shape the ingest will mint: the distinct
+    entity types (with their attributes + parent chain + is_new flag) and the
+    relationships between them, mapped from entity ids to their types.
+
+    Mirrors the engine that document ingest routes through — instead of forcing
+    one flat pre-named type. Caller wraps this in try/except so any extractor
+    failure degrades to a flat single-type preview (the turn never 500s)."""
+    extraction = await resolver._extract(
+        json.dumps(sample_rows, default=str, ensure_ascii=False),
+        "json",
+        existing_types,
+    )
+    id_to_type: dict[str, str] = {e.id: e.type_name for e in extraction.entities}
+
+    discovered: list[dict] = []
+    seen_types: set[str] = set()
+    for e in extraction.entities:
+        if e.type_name in seen_types:
             continue
-        cols.append(
-            ColumnMapping(
-                column_name=a, role=ColumnRole.ATTRIBUTE,
-                datatype=_infer_datatype(a, sample_rows), attribute_name=a,
-            )
+        seen_types.add(e.type_name)
+        discovered.append(
+            {
+                "name": e.type_name,
+                "attributes": [a.name for a in e.attributes],
+                "parent_chain": list(e.parent_chain),
+                "is_new": e.type_name not in existing_types,
+            }
         )
-    return CSVSchemaMapping(entity_type=type_name, columns=cols)
+
+    relationships: list[dict] = []
+    seen_edges: set[tuple[str, str, str]] = set()
+    for r in extraction.relationships:
+        src = id_to_type.get(r.source_id)
+        tgt = id_to_type.get(r.target_id)
+        if not src or not tgt:
+            continue
+        edge = (src, r.predicate, tgt)
+        if edge in seen_edges:
+            continue
+        seen_edges.add(edge)
+        relationships.append({"source": src, "predicate": r.predicate, "target": tgt})
+
+    return {"discovered_types": discovered, "relationships": relationships}
 
 
-def _infer_datatype(attr: str, rows: list[dict]) -> str:
-    """Cheap datatype guess from the sample values for one column."""
-    vals = [str(r.get(attr, "")).strip() for r in rows if r.get(attr) not in (None, "")]
-    if not vals:
-        return "string"
-    if all(_is_int(v) for v in vals):
-        return "integer"
-    if all(_is_float(v) for v in vals):
-        return "float"
-    return "string"
+def _flat_shape(
+    type_name: str, attributes: list[str], existing_types: set[str]
+) -> dict:
+    """Degraded preview when the multi-type extractor can't run: a single
+    discovered type carrying the confirmed/suggested attributes, no relationships.
+    Keeps the plan card confirmable so the turn never 500s."""
+    return {
+        "discovered_types": [
+            {
+                "name": type_name,
+                "attributes": list(attributes),
+                "parent_chain": [],
+                "is_new": type_name not in existing_types,
+            }
+        ],
+        "relationships": [],
+    }
 
 
 # --- helpers ----------------------------------------------------------------- #
@@ -545,18 +607,6 @@ def _clean_query(instruction: str) -> str:
     )
     q = _LEAD_FILLER.sub("", first, count=1).strip()
     return q or first
-
-
-def _column_preview(mapping: CSVSchemaMapping) -> list[dict]:
-    out: list[dict] = []
-    seen: set[str] = set()
-    for c in mapping.columns:
-        name = (c.attribute_name or c.column_name or "").strip()
-        if not name or name.lower() in seen:
-            continue
-        seen.add(name.lower())
-        out.append({"name": name, "datatype": c.datatype})
-    return out
 
 
 def _estimate_cost(
@@ -726,19 +776,3 @@ def _dedupe(items: list[str]) -> list[str]:
             seen.add(s.lower())
             out.append(s)
     return out
-
-
-def _is_int(v: str) -> bool:
-    try:
-        int(v.replace(",", ""))
-        return True
-    except (ValueError, AttributeError):
-        return False
-
-
-def _is_float(v: str) -> bool:
-    try:
-        float(v.replace(",", ""))
-        return True
-    except (ValueError, AttributeError):
-        return False

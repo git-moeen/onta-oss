@@ -3,13 +3,16 @@
 No network and no LLM: the web-source provider is a fake returning canned rows,
 and the entity/attribute spec is injected via plan()'s ``parsed`` hook (so the
 LLM resolver never runs). These exercise the full rail — graceful degradation,
-the attribute-confirmation clarify, the confirmed-attributes plan (deterministic
-mapping, preview == commit), and execute → SchemaResolver.ingest_mapped_records.
+the attribute-confirmation clarify, the confirmed-attributes plan (which now
+previews the DISCOVERED multi-type ontology shape from the sample), and
+execute → SchemaResolver.ingest (the same multi-type extract→resolve→insert path
+document ingest commits through).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from unittest.mock import MagicMock
@@ -17,7 +20,13 @@ from unittest.mock import MagicMock
 from cograph_client.agent.capabilities import web_ingest_cap
 from cograph_client.agent.capabilities.web_ingest_cap import WebIngestCapability
 from cograph_client.agent.registry import AgentContext
-from cograph_client.resolver.models import CSVSchemaMapping, IngestResult
+from cograph_client.resolver.models import (
+    ExtractedAttribute,
+    ExtractedEntity,
+    ExtractedRelationship,
+    ExtractionResult,
+    IngestResult,
+)
 from cograph_client.resolver.schema_resolver import SchemaResolver
 from cograph_client.web_sources import (
     DiscoverResult,
@@ -84,6 +93,37 @@ def _ctx(prior_clarify: int = 0) -> AgentContext:
     )
 
 
+def _patch_preview(monkeypatch, *, entities, relationships=(), existing=None):
+    """Make plan-time previewing deterministic: stub _fetch_ontology (existing
+    types) and _extract (the multi-type extraction the preview reads)."""
+    existing_types = {name: "" for name in (existing or [])}
+
+    async def fake_fetch_ontology(self, graph_uri):
+        return existing_types, {}
+
+    async def fake_extract(self, content, content_type, existing=None):
+        return ExtractionResult(
+            entities=list(entities), relationships=list(relationships)
+        )
+
+    monkeypatch.setattr(SchemaResolver, "_fetch_ontology", fake_fetch_ontology)
+    monkeypatch.setattr(SchemaResolver, "_extract", fake_extract)
+
+
+# A simple single-type extraction the FakeProvider rows would yield.
+def _single_type_entities():
+    return [
+        ExtractedEntity(
+            type_name="OpenRouterModel",
+            id=r["name"],
+            attributes=[
+                ExtractedAttribute(name="context_length", value=r["context_length"])
+            ],
+        )
+        for r in FULL_ROWS[:5]
+    ]
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     reset_web_sources()
@@ -113,9 +153,11 @@ async def test_entity_only_asks_to_confirm_attributes():
     assert opts[1] == "Just the name"
 
 
-async def test_confirmed_attributes_builds_deterministic_plan():
+async def test_confirmed_attributes_builds_discovery_plan(monkeypatch):
     provider = FakeProvider()
     register_web_source(provider)
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+
     steps = await WebIngestCapability().plan(
         _ctx(), "can we ingest the models OpenRouter currently offers?",
         parsed=CONFIRMED_SPEC,
@@ -134,21 +176,86 @@ async def test_confirmed_attributes_builds_deterministic_plan():
     assert "OpenRouter models" in step.rationale
     assert "can we ingest" not in step.rationale
 
-    # Preview surfaces the confirmed shape.
-    assert step.preview["proposed_type"] == "OpenRouterModel"
-    assert step.preview["attributes"] == ["name", "context_length"]
-    assert {c["name"] for c in step.preview["columns"]} == {"name", "context_length"}
-
-    # Deterministic mapping built from confirmed (type, attributes) — persisted
-    # and round-trippable (preview == commit).
-    m = CSVSchemaMapping.model_validate(step.params["mapping"])
-    assert m.entity_type == "OpenRouterModel"
-    assert {c.column_name for c in m.columns} == {"name", "context_length"}
+    # Preview surfaces the DISCOVERED ontology shape (multi-type engine output).
+    names = {t["name"] for t in step.preview["discovered_types"]}
+    assert "OpenRouterModel" in names
+    assert step.preview["relationships"] == []
+    # No more flat mapping persisted; proposed_type stays as a useful label.
+    assert "mapping" not in step.params
+    assert step.params["proposed_type"] == "OpenRouterModel"
     assert step.params["attributes"] == ["name", "context_length"]
 
 
-async def test_commit_to_suggested_after_prior_clarify():
+async def test_preview_surfaces_multiple_types_and_relationships(monkeypatch):
+    """The plan card previews the multi-type ontology + the relationship the
+    extractor inferred between two distinct entity types."""
+    provider = FakeProvider()
+    register_web_source(provider)
+    entities = [
+        ExtractedEntity(
+            type_name="Model", id="claude-opus",
+            attributes=[ExtractedAttribute(name="context_length", value="200000")],
+        ),
+        ExtractedEntity(
+            type_name="Provider", id="anthropic",
+            attributes=[ExtractedAttribute(name="homepage", value="anthropic.com")],
+        ),
+    ]
+    rels = [ExtractedRelationship(
+        source_id="claude-opus", predicate="provided_by", target_id="anthropic",
+    )]
+    _patch_preview(monkeypatch, entities=entities, relationships=rels, existing=["Provider"])
+
+    steps = await WebIngestCapability().plan(
+        _ctx(), "models OpenRouter offers", parsed=CONFIRMED_SPEC
+    )
+    step = steps[0]
+    types = {t["name"]: t for t in step.preview["discovered_types"]}
+    assert set(types) == {"Model", "Provider"}
+    # is_new reflects the existing ontology (Provider exists, Model is new).
+    assert types["Model"]["is_new"] is True
+    assert types["Provider"]["is_new"] is False
+    assert "context_length" in types["Model"]["attributes"]
+
+    rels_out = step.preview["relationships"]
+    assert len(rels_out) == 1
+    assert rels_out[0] == {
+        "source": "Model", "predicate": "provided_by", "target": "Provider",
+    }
+
+
+async def test_preview_degrades_to_flat_when_extract_fails(monkeypatch):
+    """If the plan-time extractor raises, plan() still returns a confirmable plan
+    card (degraded flat single-type preview) — no exception propagates."""
+    provider = FakeProvider()
+    register_web_source(provider)
+
+    async def fake_fetch_ontology(self, graph_uri):
+        return {}, {}
+
+    async def boom_extract(self, content, content_type, existing=None):
+        raise RuntimeError("extractor unavailable")
+
+    monkeypatch.setattr(SchemaResolver, "_fetch_ontology", fake_fetch_ontology)
+    monkeypatch.setattr(SchemaResolver, "_extract", boom_extract)
+
+    steps = await WebIngestCapability().plan(
+        _ctx(), "models OpenRouter offers", parsed=CONFIRMED_SPEC
+    )
+    assert len(steps) == 1
+    step = steps[0]
+    assert step.action == "discover_ingest"
+    # Degraded: one flat discovered type = the proposed type with the attributes.
+    dts = step.preview["discovered_types"]
+    assert len(dts) == 1
+    assert dts[0]["name"] == "OpenRouterModel"
+    assert dts[0]["attributes"] == ["name", "context_length"]
+    assert step.preview["relationships"] == []
+
+
+async def test_commit_to_suggested_after_prior_clarify(monkeypatch):
     register_web_source(FakeProvider())
+    _patch_preview(monkeypatch, entities=_single_type_entities())
     # Entity-only spec, but we've already asked once → commit to suggested,
     # don't clarify again.
     steps = await WebIngestCapability().plan(
@@ -159,8 +266,9 @@ async def test_commit_to_suggested_after_prior_clarify():
     assert steps[0].params["attributes"] == ["name", "provider", "context_length", "pricing"]
 
 
-async def test_paid_provider_quotes_cost():
+async def test_paid_provider_quotes_cost(monkeypatch):
     register_web_source(FakeProvider(is_paid=True, cost_per_call=0.01))
+    _patch_preview(monkeypatch, entities=_single_type_entities())
     steps = await WebIngestCapability().plan(
         _ctx(), "list of OpenRouter models", parsed=CONFIRMED_SPEC
     )
@@ -182,14 +290,19 @@ async def test_empty_sample_returns_message():
 async def test_execute_runs_full_discover_and_ingests(monkeypatch):
     provider = FakeProvider()
     register_web_source(provider)
+    _patch_preview(monkeypatch, entities=_single_type_entities())
 
     captured: dict = {}
 
-    async def fake_ingest(self, rows, mapping, tenant_id, source="", instance_graph=None):
-        captured.update(rows=rows, mapping=mapping, tenant_id=tenant_id, source=source)
+    async def fake_ingest(self, content, tenant_id, content_type="text", source="", instance_graph=None):
+        captured.update(
+            content=content, tenant_id=tenant_id,
+            content_type=content_type, source=source,
+        )
+        rows = json.loads(content)
         return IngestResult(entities_extracted=len(rows), entities_resolved=len(rows))
 
-    monkeypatch.setattr(SchemaResolver, "ingest_mapped_records", fake_ingest)
+    monkeypatch.setattr(SchemaResolver, "ingest", fake_ingest)
 
     spawned: dict = {}
     monkeypatch.setattr(
@@ -205,15 +318,59 @@ async def test_execute_runs_full_discover_and_ingests(monkeypatch):
     await spawned["task"]
 
     # Full pull (sample=False) with the confirmed attributes, committed through
-    # ingest_mapped_records with the persisted mapping.
+    # the multi-type ingest path (content_type="json").
     assert provider.calls[-1][1] is False
     assert set(provider.calls[-1][3]) == {"name", "context_length"}
-    assert len(captured["rows"]) == len(FULL_ROWS)
-    assert set(captured["rows"][0].keys()) == {"name", "context_length"}
-    assert isinstance(captured["mapping"], CSVSchemaMapping)
-    assert captured["mapping"].entity_type == "OpenRouterModel"
+    assert captured["content_type"] == "json"
+    # The JSON round-trips back to the rows the provider returned.
+    rows_back = json.loads(captured["content"])
+    assert len(rows_back) == len(FULL_ROWS)
+    assert set(rows_back[0].keys()) == {"name", "context_length"}
     # The clean search subject (spec.query) is what the provider + source use.
     assert captured["source"] == "web:fake:OpenRouter models"
+
+
+async def test_run_routes_multi_type_and_refreshes(monkeypatch):
+    """The commit routes through ingest (content_type="json") and the post-write
+    refresh is driven by the multi-type result: every type the ingest created or
+    extended is in the affected_types passed to refresh_after_write."""
+    provider = FakeProvider()
+    register_web_source(provider)
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+
+    ingest_calls: dict = {}
+
+    async def spy_ingest(self, content, tenant_id, content_type="text", source="", instance_graph=None):
+        ingest_calls.update(content=content, content_type=content_type)
+        return IngestResult(
+            types_created=["Model", "Provider"],
+            attributes_added=["Model.provided_by"],
+            entities_resolved=4,
+        )
+
+    monkeypatch.setattr(SchemaResolver, "ingest", spy_ingest)
+
+    refreshed: dict = {}
+
+    async def fake_refresh(neptune, *, tenant_id, kg_name, affected_types):
+        refreshed.update(affected_types=affected_types, kg_name=kg_name)
+
+    monkeypatch.setattr(web_ingest_cap, "refresh_after_write", fake_refresh)
+
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    cap = WebIngestCapability()
+    step = (await cap.plan(_ctx(), "list of OpenRouter models", parsed=CONFIRMED_SPEC))[0]
+    await cap.execute(_ctx(), step)
+    await spawned["task"]
+
+    assert ingest_calls["content_type"] == "json"
+    # affected_types = types_created ∪ owning-types of attributes_added.
+    assert refreshed["affected_types"] == {"Model", "Provider"}
 
 
 def _ctx_with_store(store) -> AgentContext:
@@ -237,11 +394,13 @@ async def test_execute_tracks_job_with_results_and_platforms(monkeypatch):
 
     provider = FakeProvider(is_paid=True, cost_per_call=0.09)
     register_web_source(provider)
+    _patch_preview(monkeypatch, entities=_single_type_entities())
 
-    async def fake_ingest(self, rows, mapping, tenant_id, source="", instance_graph=None):
+    async def fake_ingest(self, content, tenant_id, content_type="text", source="", instance_graph=None):
+        rows = json.loads(content)
         return IngestResult(entities_extracted=len(rows), entities_resolved=len(rows))
 
-    monkeypatch.setattr(SchemaResolver, "ingest_mapped_records", fake_ingest)
+    monkeypatch.setattr(SchemaResolver, "ingest", fake_ingest)
 
     spawned: dict = {}
     monkeypatch.setattr(
@@ -286,11 +445,12 @@ async def test_execute_marks_job_failed_on_error(monkeypatch):
     from cograph_client.enrichment.models import JobStatus
 
     register_web_source(FakeProvider())
+    _patch_preview(monkeypatch, entities=_single_type_entities())
 
     async def boom(self, *a, **k):
         raise RuntimeError("ingest exploded")
 
-    monkeypatch.setattr(SchemaResolver, "ingest_mapped_records", boom)
+    monkeypatch.setattr(SchemaResolver, "ingest", boom)
     spawned: dict = {}
     monkeypatch.setattr(
         web_ingest_cap, "_spawn",
