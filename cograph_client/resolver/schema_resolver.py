@@ -33,6 +33,7 @@ from cograph_client.graph.ontology_queries import (
     set_object_property_range,
     type_uri,
     upsert_type,
+    upsert_type_comment,
     attr_uri,
 )
 from cograph_client.graph.layers import LayerStack, type_name_from_uri
@@ -1211,11 +1212,15 @@ class SchemaResolver:
 
         # The caller's top-level mint wrote NO comment (FIX 3): subtype_description
         # may only describe a real subtype. Now that a parent linkage has made
-        # this type a genuine subtype, upsert the description here (FIX 4: upsert
-        # replaces the single-valued comment, so it stays idempotent on re-ingest).
+        # this type a genuine subtype, write the description here. Use the
+        # COMMENT-ONLY upsert: the subClassOf edge was just created above (by
+        # insert_subtype / _synthesize_ancestors), and plain upsert_type would
+        # DELETE it (it clears subClassOf when no parent_type is passed) — the
+        # new-parent-edge bug. upsert_type_comment touches only rdfs:comment, so
+        # the edge survives while the description stays idempotent on re-ingest.
         if linked_as_subtype and entity.subtype_description:
             await self._neptune.update(
-                upsert_type(graph_uri, entity.type_name, entity.subtype_description)
+                upsert_type_comment(graph_uri, entity.type_name, entity.subtype_description)
             )
 
     async def _refresh_ontology(
@@ -1292,14 +1297,16 @@ class SchemaResolver:
         idempotently (FIX 3 + FIX 4).
 
         When a ``subtype_description`` is present it is written via
-        :func:`upsert_type`, which REPLACES the single-valued ``rdfs:comment``
-        instead of appending — so re-minting the same subtype across ingests
-        can't accumulate duplicate comments. With no description we emit a plain
-        ``insert_type`` (no comment), keeping the common no-description write
+        :func:`upsert_type_comment`, which REPLACES the single-valued
+        ``rdfs:comment`` instead of appending — so re-minting the same subtype
+        across ingests can't accumulate duplicate comments — while leaving
+        ``rdfs:subClassOf`` untouched (plain :func:`upsert_type` would CLEAR the
+        edge a caller's ``insert_subtype`` creates). With no description we emit a
+        plain ``insert_type`` (no comment), keeping the common no-description write
         byte-identical to before.
         """
         if subtype_description:
-            await self._neptune.update(upsert_type(graph_uri, type_name, subtype_description))
+            await self._neptune.update(upsert_type_comment(graph_uri, type_name, subtype_description))
         else:
             await self._neptune.update(insert_type(graph_uri, type_name, ""))
 

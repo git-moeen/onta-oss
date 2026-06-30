@@ -105,6 +105,40 @@ def upsert_type(graph_uri: str, name: str, description: str = "", parent_type: s
     return " ;\n".join(ops)
 
 
+def upsert_type_comment(graph_uri: str, name: str, description: str = "") -> str:
+    """Idempotently set ONLY a type's ``rdfs:comment`` (single-valued), leaving
+    ``rdfs:subClassOf`` and every other triple untouched.
+
+    Unlike :func:`upsert_type` — which also REPLACES ``rdfs:subClassOf`` and so
+    CLEARS it when called with no ``parent_type`` — this never touches the
+    hierarchy. Writing a subtype's description must not be able to wipe a
+    ``subClassOf`` edge that a separate step (``insert_subtype`` /
+    ``_synthesize_ancestors``) just created. Re-asserts ``rdf:type rdfs:Class`` +
+    ``rdfs:label`` idempotently so the type exists; an empty ``description``
+    clears any existing comment without inserting a replacement.
+    """
+    uri = type_uri(name)
+    insert_block = (
+        f"INSERT DATA {{\n"
+        f"  GRAPH <{graph_uri}> {{\n"
+        f'    <{uri}> <{RDF}#type> <{RDFS}#Class> .\n'
+        f'    <{uri}> <{RDFS}#label> "{_esc(name)}" .\n'
+        f"  }}\n"
+        f"}}"
+    )
+    comment_insert = (
+        f"INSERT {{ GRAPH <{graph_uri}> {{ <{uri}> <{RDFS}#comment> \"{_esc(description)}\" }} }}\n"
+        if description
+        else ""
+    )
+    comment_block = (
+        f"DELETE {{ GRAPH <{graph_uri}> {{ <{uri}> <{RDFS}#comment> ?c }} }}\n"
+        f"{comment_insert}"
+        f"WHERE {{ GRAPH <{graph_uri}> {{ OPTIONAL {{ <{uri}> <{RDFS}#comment> ?c }} }} }}"
+    )
+    return f"{insert_block} ;\n{comment_block}"
+
+
 def upsert_attribute(graph_uri: str, type_name: str, attr_name: str, description: str = "", datatype: str = "string") -> str:
     """Atomically UPSERT an attribute declaration — idempotent under agent retries.
 

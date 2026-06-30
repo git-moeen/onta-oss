@@ -155,6 +155,47 @@ async def test_brand_new_lineage_via_parent_chain_writes_description(mock_neptun
     assert any("DELETE" in w and "WHERE" in w for w in writes), "must be upsert (idempotent)"
 
 
+@pytest.mark.asyncio
+async def test_brand_new_parent_subclassof_edge_survives_description_write(mock_neptune, mock_cache):
+    """REGRESSION (live): minting a subtype under a BRAND-NEW parent creates the
+    subClassOf edge (via _synthesize_ancestors), then writes the description. The
+    description write must NOT wipe that edge.
+
+    The bug: the description was written with ``upsert_type``, which DELETEs
+    ``rdfs:subClassOf`` when given no parent_type — so it silently dropped the
+    edge a moment after _synthesize_ancestors created it. Only the comment
+    survived (the exact `HumannessIndexScore` got a description but no `⊂ Score`
+    edge symptom). The write is now comment-only.
+    """
+    resolver = SchemaResolver(mock_neptune, "fake-key", mock_cache)
+    resolver._type_matcher = FakeTypeMatcher(MatchVerdict.DIFFERENT)
+
+    desc = "a score measuring how human-like a TTS voice sounds"
+    entity = ExtractedEntity(
+        type_name="HumannessIndexScore", id="his-1",
+        parent_chain=["Score"],  # Score is BRAND NEW (not in existing_types)
+        subtype_description=desc,
+    )
+    await _ingest_one(resolver, entity)
+
+    updates = _update_strings(mock_neptune)
+    # 1. The subClassOf edge to the brand-new parent was created (insert_subtype
+    #    is a pure INSERT DATA — no DELETE).
+    assert any(
+        "types/HumannessIndexScore" in u and "types/Score" in u
+        and "subClassOf" in u and "INSERT" in u and "DELETE" not in u
+        for u in updates
+    ), "the HumannessIndexScore subClassOf Score edge must be created"
+    # 2. The description write is COMMENT-ONLY — it must not touch subClassOf at
+    #    all, so it can't wipe the edge created above.
+    comment_writes = _comment_writes_for(mock_neptune, "HumannessIndexScore", desc)
+    assert comment_writes, "the subtype description must be written"
+    assert all("subClassOf" not in w for w in comment_writes), (
+        "the description write must be comment-only — touching subClassOf would "
+        "wipe the brand-new-parent edge (the new-parent-edge bug)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level branches must NOT write the description
 # ---------------------------------------------------------------------------
