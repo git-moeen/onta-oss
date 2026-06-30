@@ -124,3 +124,74 @@ def test_guard_version_strings_not_promoted():
 def test_guard_decimals_and_ellipses_not_promoted():
     assert extract_urls("pi is about 3.14 here") == []
     assert extract_urls("wait for it... then go") == []
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review regressions (ONTA-152 follow-up).
+# ---------------------------------------------------------------------------
+
+
+# P1-1: a bare multi-part public suffix is a registry, not a registrable host.
+def test_bare_public_suffix_registry_rejected():
+    assert extract_urls("see api domain co.uk here") == []
+    assert extract_urls("registered under com.au somewhere") == []
+
+
+# P1-1: but a real host *under* such a suffix still promotes.
+def test_registrable_host_under_public_suffix_promoted():
+    assert extract_urls("check api.example.co.uk for the spec") == [
+        "https://api.example.co.uk"
+    ]
+    assert extract_urls("the site example.co.uk is up") == ["https://example.co.uk"]
+
+
+# P1-1 decision: a bare `word.tld` with a real public TLD IS promoted. We can't
+# distinguish a real domain from an unlucky abbreviation without DNS, and the
+# URL-targeting feature prefers treating it as a link. Documented in the module.
+def test_bare_word_tld_is_promoted_by_design():
+    assert extract_urls("He said etc.com is funny") == ["https://etc.com"]
+    assert extract_urls("End. Next.com starts") == ["https://next.com"]
+
+
+# P1-1: the headline legit cases must NOT regress.
+def test_legit_bare_domains_still_promote():
+    assert extract_urls("example.com") == ["https://example.com"]
+    assert extract_urls("data.gov has datasets") == ["https://data.gov"]
+    assert extract_urls("from this page humannessindex.vapi.ai") == [
+        "https://humannessindex.vapi.ai"
+    ]
+    assert extract_urls("open example.com/path now") == ["https://example.com/path"]
+
+
+# P1-2: a bare host that also appears scheme-qualified must emit ONCE (by host).
+def test_same_host_scheme_and_bare_deduped():
+    assert extract_urls("see http://example.com and bare example.com later") == [
+        "http://example.com"
+    ]
+    assert extract_urls("compare https://one.com/a with one.com today") == [
+        "https://one.com/a"
+    ]
+
+
+# P1-2 boundary: distinct *paths* on the same host are different pages — keep both.
+def test_same_host_distinct_paths_both_kept():
+    assert extract_urls(
+        "enrich from https://acme.example/a and https://acme.example/b"
+    ) == ["https://acme.example/a", "https://acme.example/b"]
+
+
+# P2-1: the host is lower-cased on normalisation; the path stays case-sensitive.
+def test_bare_host_lowercased_path_preserved():
+    assert extract_urls("see HUMANNESSINDEX.VAPI.AI") == [
+        "https://humannessindex.vapi.ai"
+    ]
+    assert extract_urls("open Example.COM/Path/MixedCase") == [
+        "https://example.com/Path/MixedCase"
+    ]
+
+
+# P2-2: ccTLD trade-off — sh/rs/go are deny-listed as source-file extensions,
+# so genuine ccTLD domains under them are intentionally dropped (documented).
+def test_cctld_extension_conflict_dropped_by_design():
+    assert extract_urls("clone rust-lang.rs for the source") == []
+    assert extract_urls("run deploy.sh and main.go") == []
