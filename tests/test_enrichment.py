@@ -949,6 +949,9 @@ def test_executor_end_to_end_filled_verified_conflict():
             str(c.args[0]) if c.args else "" for c in neptune.update.call_args_list
         )
         assert "Robert Bosch GmbH" in writes  # the conflict-free fill landed
+        # Prove the conflict was held by asserting its EXISTING value ("Acme
+        # Tools") wasn't written. We can't assert on p3's PROPOSED verdict
+        # ("Bosch") because it's a substring of the fill value above.
         assert "Acme Tools" not in writes  # the conflict was held, not overwritten
 
     asyncio.run(run())
