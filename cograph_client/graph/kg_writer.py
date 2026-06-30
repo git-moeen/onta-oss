@@ -35,6 +35,8 @@ non-blocking behavior the ingest routes already had.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 from typing import Iterable, Optional
 
@@ -51,6 +53,17 @@ from cograph_client.graph.queries import (
 logger = structlog.stdlib.get_logger("cograph.graph.kg_writer")
 
 Triple = tuple[str, str, str]
+
+# Hard cap on the synchronous spatio-temporal index upsert inside insert_facts.
+# The index is a DERIVED, eventually-consistent companion store; Neptune (the
+# source of truth) is already written by the time we reach it. Catching exceptions
+# isn't enough — a hung/partitioned Postgres (pool exhaustion, Aurora failover)
+# would otherwise block the KG-write request on this await with no exception. The
+# timeout converts a hang into a caught TimeoutError → logged, index skipped, the
+# write proceeds. Env-overridable for ops.
+_INDEX_UPSERT_TIMEOUT_S = float(
+    os.environ.get("COGRAPH_SPATIOTEMPORAL_UPSERT_TIMEOUT_S", "10")
+)
 
 # KG-registration triple shape — the `<kg_uri> <onto/kg_name> "name"` record in
 # the tenant metadata graph that ``list_kgs`` reads to populate the Explorer
@@ -190,7 +203,12 @@ async def _index_spatiotemporal(
             instance_triples, tenant_id=tenant_id, kg_name=kg_name
         )
         if facts:
-            await get_spatiotemporal_index().upsert_many(facts)
+            # Time-bounded so a hung backend can't block the write (see the
+            # _INDEX_UPSERT_TIMEOUT_S note); TimeoutError is caught below.
+            await asyncio.wait_for(
+                get_spatiotemporal_index().upsert_many(facts),
+                timeout=_INDEX_UPSERT_TIMEOUT_S,
+            )
     except Exception:  # noqa: BLE001 — never fail a KG write on a derived-index hiccup
         logger.warning(
             "spatiotemporal_index_update_failed",

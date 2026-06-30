@@ -11,8 +11,13 @@ def kg_graph_uri(tenant_id: str, kg_name: str) -> str:
     return f"https://cograph.tech/graphs/{tenant_id}/kg/{kg_name}"
 
 
+# The kg segment is anchored to a single path component ([^/]+, no slashes) so a
+# COMPANION graph URI — e.g. a provenance graph ".../kg/<kg>/provenance" — does NOT
+# greedily parse to kg_name="<kg>/provenance"; it correctly returns None (matching
+# the docstring contract). KG names can't contain "/" (KGCreate enforces
+# ^[a-zA-Z0-9_-]+$), so this never rejects a real KG.
 _KG_GRAPH_RE = re.compile(
-    r"^https://cograph\.tech/graphs/(?P<tenant>[^/]+)/kg/(?P<kg>.+)$"
+    r"^https://cograph\.tech/graphs/(?P<tenant>[^/]+)/kg/(?P<kg>[^/]+)$"
 )
 
 

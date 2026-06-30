@@ -95,6 +95,16 @@ class PostGISSpatioTemporalIndex:
                             extension=ext,
                             error=str(exc),
                         )
+                # Schema note (ONTA-157): the ``kg_name`` column + 4-col PK were
+                # added on top of the original COG-103 3-col schema. This is a bare
+                # ``CREATE TABLE IF NOT EXISTS`` with NO migration — load-bearing
+                # assumption: the table has never been materialized in prod (the
+                # index had zero callers before this change and the pool/table are
+                # created lazily on first use, so nothing ever created it). If an
+                # OLD-schema ``entity_spatiotemporal`` table somehow pre-exists, the
+                # IF NOT EXISTS is a no-op and inserts will fail on the missing
+                # ``kg_name`` / mismatched ON CONFLICT target — drop that empty
+                # table so this DDL recreates it. (See the PR deploy note.)
                 await conn.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {self._TABLE} (
@@ -143,7 +153,7 @@ class PostGISSpatioTemporalIndex:
                     await self._upsert_conn(conn, fact)
 
     async def _upsert_conn(self, conn: Any, fact: SpatioTemporalFact) -> None:
-        """Idempotent upsert on the (tenant_id, entity_uri, valid_time) PK.
+        """Idempotent upsert on the (tenant_id, kg_name, entity_uri, valid_time) PK.
 
         Geometry built via ``ST_SetSRID(ST_MakePoint($lon, $lat), 4326)``; ``attrs``
         re-denormalized on conflict so a replay refreshes display fields.

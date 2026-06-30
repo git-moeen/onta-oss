@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from cograph_client.graph.kg_writer import insert_facts
-from cograph_client.graph.queries import kg_graph_uri
+from cograph_client.graph.queries import kg_graph_uri, parse_kg_graph_uri
 from cograph_client.spatiotemporal.extract import extract_spatiotemporal_facts
 from cograph_client.spatiotemporal.registry import (
     get_spatiotemporal_index,
@@ -87,6 +87,28 @@ def test_start_end_pair_becomes_validity():
     ]
     f = extract_spatiotemporal_facts(triples, tenant_id=TENANT, kg_name=KG)[0]
     assert f.valid_from == _dt(2024, 6, 1) and f.valid_to == _dt(2024, 6, 10)
+
+
+def test_inverted_start_end_pair_opens_validity():
+    """from > to would make PostGIS tstzrange raise and drop the write batch — the
+    extractor discards an inverted range to open validity instead (entity still
+    indexed by its geometry)."""
+    triples = [
+        _geom("e:bad", 2.30, 48.86),
+        ("e:bad", "https://cograph.tech/types/Event/start_date", f"2024-06-10T00:00:00^^{DT}"),
+        ("e:bad", "https://cograph.tech/types/Event/end_date", f"2024-06-01T00:00:00^^{DT}"),
+    ]
+    facts = extract_spatiotemporal_facts(triples, tenant_id=TENANT, kg_name=KG)
+    assert len(facts) == 1  # still indexed
+    assert facts[0].valid_from is None and facts[0].valid_to is None
+
+
+def test_parse_kg_graph_uri_rejects_companion_graph():
+    """A provenance/companion graph (extra path segment) must NOT greedily parse to
+    kg_name='<kg>/provenance' — it returns None so only true per-KG graphs route."""
+    assert parse_kg_graph_uri(kg_graph_uri(TENANT, KG)) == (TENANT, KG)
+    assert parse_kg_graph_uri(kg_graph_uri(TENANT, KG) + "/provenance") is None
+    assert parse_kg_graph_uri("https://cograph.tech/graphs/demo-tenant") is None
 
 
 def test_explicit_valid_from_only_open_ended():

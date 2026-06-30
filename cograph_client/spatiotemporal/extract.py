@@ -150,12 +150,24 @@ class _EntityAccumulator:
 
     def validity(self) -> tuple[Optional[datetime], Optional[datetime]]:
         """Resolve (valid_from, valid_to): explicit validity bounds win; otherwise
-        a complete start+end pair; otherwise open/open."""
+        a complete start+end pair; otherwise open/open.
+
+        An INVERTED range (from > to — a data-entry slip, or an ``end``-named
+        predicate that doesn't actually bound validity) is discarded to an open
+        range rather than passed through: PostGIS ``tstzrange(lo, hi)`` raises when
+        ``lo > hi``, and because the upsert is batched that error would abort the
+        whole write batch's index rows. Better to index the entity with open
+        validity than to silently drop a batch of geometry facts.
+        """
         if self.from_dt is not None or self.to_dt is not None:
-            return self.from_dt, self.to_dt
-        if self.start_dt is not None and self.end_dt is not None:
-            return self.start_dt, self.end_dt
-        return None, None
+            lo, hi = self.from_dt, self.to_dt
+        elif self.start_dt is not None and self.end_dt is not None:
+            lo, hi = self.start_dt, self.end_dt
+        else:
+            return None, None
+        if lo is not None and hi is not None and lo > hi:
+            return None, None
+        return lo, hi
 
 
 def extract_spatiotemporal_facts(
