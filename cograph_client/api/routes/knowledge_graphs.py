@@ -18,7 +18,11 @@ from cograph_client.graph.ontology_queries import (
     type_uri,
 )
 from cograph_client.graph.parser import parse_sparql_results
-from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
+from cograph_client.graph.queries import (
+    _escape_literal,
+    kg_graph_uri,
+    tenant_graph_uri,
+)
 
 router = APIRouter(prefix="/graphs/{tenant}/kgs")
 
@@ -272,17 +276,28 @@ async def create_kg(
     shared write path performs via ``ensure_kg_registered`` (ONTA-153) — here we
     additionally write the description, which only the explicit "New KG" flow
     supplies.
+
+    On a re-POST of an existing KG the guarded INSERT no-ops; we then return the
+    *existing* KGInfo (real description + triple count) rather than claiming an
+    empty/zero KG, so the response never lies about a KG that may already hold
+    real data.
+
+    Safety: ``body.name`` is pattern-validated by ``KGCreate`` (``[a-zA-Z0-9_-]``)
+    so it's URI-safe, but the free-text ``description`` and (defensively) the name
+    are escaped via the canonical ``_escape_literal`` before going into a SPARQL
+    literal — no statement-breakout on a ``"`` / ``\\`` / newline.
     """
     base = tenant_graph_uri(tenant.tenant_id)
     kg_uri = _kg_meta_uri(tenant.tenant_id, body.name)
 
     insert_lines = [
-        f'    <{kg_uri}> <{OMNIX_ONTO}/kg_name> "{body.name}" .',
+        f'    <{kg_uri}> <{OMNIX_ONTO}/kg_name> "{_escape_literal(body.name)}" .',
         f"    <{kg_uri}> <{KG_TRIPLE_COUNT}> 0 .",
     ]
     if body.description:
         insert_lines.append(
-            f'    <{kg_uri}> <{OMNIX_ONTO}/kg_description> "{body.description}" .'
+            f'    <{kg_uri}> <{OMNIX_ONTO}/kg_description> '
+            f'"{_escape_literal(body.description)}" .'
         )
     insert_block = "\n".join(insert_lines)
     sparql = (
@@ -294,6 +309,32 @@ async def create_kg(
     )
 
     await client.update(sparql)
+
+    # The INSERT is idempotent, so a re-POST no-ops it. Read the registration
+    # back and report what's actually stored: a pre-existing KG keeps its real
+    # description + triple count; a freshly-created one reads back as the values
+    # we just wrote (description as given, count 0).
+    read = (
+        f"SELECT ?desc ?count FROM <{base}> WHERE {{\n"
+        f"  <{kg_uri}> <{OMNIX_ONTO}/kg_name> ?n .\n"
+        f"  OPTIONAL {{ <{kg_uri}> <{OMNIX_ONTO}/kg_description> ?desc }}\n"
+        f"  OPTIONAL {{ <{kg_uri}> <{KG_TRIPLE_COUNT}> ?count }}\n"
+        f"}}"
+    )
+    try:
+        _, rows = parse_sparql_results(await client.query(read))
+    except Exception:
+        rows = []
+    if rows:
+        row = rows[0]
+        raw_count = row.get("count")
+        count = int(raw_count) if raw_count not in (None, "") and raw_count.isdigit() else 0
+        return KGInfo(
+            name=body.name,
+            description=row.get("desc", "") or "",
+            triple_count=count,
+        )
+    # Read-back failed (e.g. Neptune hiccup) — fall back to the values we wrote.
     return KGInfo(name=body.name, description=body.description, triple_count=0)
 
 
