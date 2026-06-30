@@ -53,7 +53,9 @@ TYPE_URI_PREFIX = "https://cograph.tech/types/"
 
 # Primitive datatypes a relationship is NOT: anything else as a datatype_hint
 # (or a populated target_phrase) marks the intent as a relationship to a type.
-PRIMITIVE_DATATYPES = {"string", "integer", "float", "boolean", "datetime", "uri"}
+# ``geo`` (WKT point, ``geo:wktLiteral``) is a primitive attribute range, not a
+# relationship target — keep it here so a geo hint isn't read as a type reference.
+PRIMITIVE_DATATYPES = {"string", "integer", "float", "boolean", "datetime", "uri", "geo"}
 
 # Confidence band below which an otherwise-clean SAME match is still routed to
 # PROPOSE (the embedding/TypeMatcher signal is mid-band/ambiguous). TypeMatcher

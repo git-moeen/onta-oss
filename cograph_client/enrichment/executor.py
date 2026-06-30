@@ -57,7 +57,7 @@ from cograph_client.graph.queries import (
     tenant_graph_uri,
 )
 from cograph_client.resolver.models import ValidatedTriple
-from cograph_client.resolver.validator import validate_triple
+from cograph_client.resolver.validator import _to_wkt_point, validate_triple
 
 logger = structlog.stdlib.get_logger("cograph.enrichment")
 
@@ -363,12 +363,18 @@ def _infer_datatype_from_values(values: list[str]) -> str:
          ``:``, so an all-integer column like ``2026`` is never misread as a
          date). ``datetime`` is the name ``_datatype_to_xsd`` maps to
          ``xsd:dateTime``.
-      4. a bare ``<TypeName>`` (a RELATIONSHIP range) — every value is a
+      4. ``geo`` — every value is a WGS84 coordinate: a WKT ``POINT(lon lat)`` or
+         a ``"lat,lon"`` pair in range (the Wikidata globecoordinate form). Maps
+         to ``geo:wktLiteral``; the spatio-temporal index reads it directly. The
+         WGS84 range gate (lat ≤ 90, lon ≤ 180) keeps a non-coordinate ``"x,y"``
+         pair from being misread, and a bare float column never reaches here
+         (caught by float above).
+      5. a bare ``<TypeName>`` (a RELATIONSHIP range) — every value is a
          canonical entity IRI (``…/entities/<TypeName>/<id>``) AND they all share
          the SAME ``<TypeName>``. ``_datatype_to_xsd`` maps that bare name to the
          ``types/<TypeName>`` URI (an object-property range). Mixed IRI types →
          no single range, so we fall through to string (don't guess).
-      5. ``string`` — the safe floor (also for empty / all-blank).
+      6. ``string`` — the safe floor (also for empty / all-blank).
 
     Date and relationship detection (E2) are now attempted because they DO
     round-trip reliably: an ISO date and a canonical entity IRI are both exact,
@@ -386,6 +392,11 @@ def _infer_datatype_from_values(values: list[str]) -> str:
     # not numeric — guards an all-integer column from a date false-positive.
     if all(any(c in v for c in "-T:") and _is_iso_datetime(v) for v in vals):
         return "datetime"
+    # Geo: a WKT POINT or an in-range "lat,lon" pair (Wikidata globecoordinate).
+    # Reached only after int/float/datetime fail, so a plain number is never a
+    # coordinate here; _to_wkt_point enforces the WGS84 range.
+    if all(_to_wkt_point(v) is not None for v in vals):
+        return "geo"
     # Relationship: all values are entity IRIs sharing one target type.
     iri_types = [_entity_iri_type(v) for v in vals]
     if all(t is not None for t in iri_types) and len(set(iri_types)) == 1:

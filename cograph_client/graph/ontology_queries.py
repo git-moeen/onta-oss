@@ -4,6 +4,11 @@ OMNIX_ONTO = "https://cograph.tech/onto"
 RDFS = "http://www.w3.org/2000/01/rdf-schema"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns"
 XSD = "http://www.w3.org/2001/XMLSchema"
+# OGC GeoSPARQL — the standard vocabulary for geometry literals. A `geo` attribute
+# carries the range ``geo:wktLiteral`` and stores its value as WKT ("POINT(lon lat)")
+# so coordinates are a first-class, datatype-tagged literal the spatio-temporal index
+# can read directly (rather than guessing from attribute names at read time).
+GEOSPARQL = "http://www.opengis.net/ont/geosparql"
 
 
 def type_uri(type_name: str) -> str:
@@ -653,7 +658,7 @@ def _esc(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-PRIMITIVE_TYPES = {"string", "integer", "float", "boolean", "datetime", "uri"}
+PRIMITIVE_TYPES = {"string", "integer", "float", "boolean", "datetime", "uri", "geo"}
 
 
 def entity_exists_query(graph_uri: str, entity_uri: str) -> str:
@@ -693,6 +698,8 @@ _DATATYPE_TO_XSD = {
     "boolean": f"{XSD}#boolean",
     "datetime": f"{XSD}#dateTime",
     "uri": f"{RDFS}#Resource",
+    # WGS84 point/geometry as WKT — read by the spatio-temporal index.
+    "geo": f"{GEOSPARQL}#wktLiteral",
 }
 
 

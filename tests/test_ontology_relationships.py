@@ -124,7 +124,9 @@ class TestInsertAttributeTypeRef:
 
 class TestPrimitiveTypes:
     def test_contains_all_primitives(self):
-        expected = {"string", "integer", "float", "boolean", "datetime", "uri"}
+        # `geo` (geo:wktLiteral, WKT point) is a primitive attribute range — its
+        # values are literals, not entity references.
+        expected = {"string", "integer", "float", "boolean", "datetime", "uri", "geo"}
         assert PRIMITIVE_TYPES == expected
 
     def test_type_names_not_primitive(self):

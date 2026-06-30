@@ -15,8 +15,11 @@ they produce* (ingest mints entities; enrichment fills attributes on existing
 ones) but are identical in *how those facts get written and refreshed*:
 
 - :func:`insert_facts` — batched instance-triple write, plus the optional
-  canonical companion-provenance graph (ADR 0002 §4). Always batched so a large
-  write can never blow past Neptune's per-statement size limit.
+  canonical companion-provenance graph (ADR 0002 §4) AND the spatio-temporal
+  secondary index (another companion store derived from the same facts: every
+  geometry-bearing entity is auto-indexed for geo/time queries, best-effort).
+  Always batched so a large write can never blow past Neptune's per-statement
+  size limit.
 - :func:`refresh_after_write` — invalidate the NL-planning ontology cache,
   re-embed the affected types (so semantic retrieval never serves a stale schema
   embedding after a new attribute lands), and schedule the Explorer type-stats
@@ -32,6 +35,8 @@ non-blocking behavior the ingest routes already had.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 from typing import Iterable, Optional
 
@@ -41,12 +46,24 @@ from cograph_client.graph.provenance import provenance_graph_uri
 from cograph_client.graph.queries import (
     _escape_literal,
     batched_insert_triples,
+    parse_kg_graph_uri,
     tenant_graph_uri,
 )
 
 logger = structlog.stdlib.get_logger("cograph.graph.kg_writer")
 
 Triple = tuple[str, str, str]
+
+# Hard cap on the synchronous spatio-temporal index upsert inside insert_facts.
+# The index is a DERIVED, eventually-consistent companion store; Neptune (the
+# source of truth) is already written by the time we reach it. Catching exceptions
+# isn't enough — a hung/partitioned Postgres (pool exhaustion, Aurora failover)
+# would otherwise block the KG-write request on this await with no exception. The
+# timeout converts a hang into a caught TimeoutError → logged, index skipped, the
+# write proceeds. Env-overridable for ops.
+_INDEX_UPSERT_TIMEOUT_S = float(
+    os.environ.get("COGRAPH_SPATIOTEMPORAL_UPSERT_TIMEOUT_S", "10")
+)
 
 # KG-registration triple shape — the `<kg_uri> <onto/kg_name> "name"` record in
 # the tenant metadata graph that ``list_kgs`` reads to populate the Explorer
@@ -154,6 +171,50 @@ async def insert_facts(
         prov_graph = provenance_graph_uri(instance_graph)
         for sparql in batched_insert_triples(prov_graph, provenance_triples):
             await neptune.update(sparql)
+    if instance_triples:
+        await _index_spatiotemporal(instance_graph, instance_triples)
+
+
+async def _index_spatiotemporal(
+    instance_graph: str, instance_triples: list[Triple]
+) -> None:
+    """Populate the spatio-temporal secondary index from the just-written triples.
+
+    A companion store derived from the same facts (like the provenance graph) —
+    kept HERE in the single insertion primitive so EVERY converged writer (ingest,
+    enrichment, normalization, dedupe, …) auto-indexes its geometry-bearing
+    entities with no per-caller wiring. Datatype-driven: ``extract_spatiotemporal_facts``
+    only emits a fact for an entity carrying a ``geo:wktLiteral``, so a write with
+    no coordinates does ~no work and pays only a list scan.
+
+    Best-effort and fully isolated: a derived-index hiccup must NEVER fail the
+    primary KG write (Neptune is the source of truth; this index is eventually
+    consistent). Skips non-KG graphs (the URI doesn't parse to a tenant/KG).
+    """
+    scope = parse_kg_graph_uri(instance_graph)
+    if scope is None:
+        return  # not a per-KG instance graph → nothing to scope an index row to
+    tenant_id, kg_name = scope
+    try:
+        from cograph_client.spatiotemporal.extract import extract_spatiotemporal_facts
+        from cograph_client.spatiotemporal.registry import get_spatiotemporal_index
+
+        facts = extract_spatiotemporal_facts(
+            instance_triples, tenant_id=tenant_id, kg_name=kg_name
+        )
+        if facts:
+            # Time-bounded so a hung backend can't block the write (see the
+            # _INDEX_UPSERT_TIMEOUT_S note); TimeoutError is caught below.
+            await asyncio.wait_for(
+                get_spatiotemporal_index().upsert_many(facts),
+                timeout=_INDEX_UPSERT_TIMEOUT_S,
+            )
+    except Exception:  # noqa: BLE001 — never fail a KG write on a derived-index hiccup
+        logger.warning(
+            "spatiotemporal_index_update_failed",
+            instance_graph=instance_graph,
+            exc_info=True,
+        )
 
 
 async def refresh_after_write(

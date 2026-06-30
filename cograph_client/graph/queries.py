@@ -1,3 +1,6 @@
+import re
+
+
 def tenant_graph_uri(tenant_id: str) -> str:
     """Base graph URI for a tenant. Used as the ontology graph."""
     return f"https://cograph.tech/graphs/{tenant_id}"
@@ -6,6 +9,31 @@ def tenant_graph_uri(tenant_id: str) -> str:
 def kg_graph_uri(tenant_id: str, kg_name: str) -> str:
     """Named graph URI for a specific knowledge graph within a tenant."""
     return f"https://cograph.tech/graphs/{tenant_id}/kg/{kg_name}"
+
+
+# The kg segment is anchored to a single path component ([^/]+, no slashes) so a
+# COMPANION graph URI — e.g. a provenance graph ".../kg/<kg>/provenance" — does NOT
+# greedily parse to kg_name="<kg>/provenance"; it correctly returns None (matching
+# the docstring contract). KG names can't contain "/" (KGCreate enforces
+# ^[a-zA-Z0-9_-]+$), so this never rejects a real KG.
+_KG_GRAPH_RE = re.compile(
+    r"^https://cograph\.tech/graphs/(?P<tenant>[^/]+)/kg/(?P<kg>[^/]+)$"
+)
+
+
+def parse_kg_graph_uri(graph_uri: str) -> tuple[str, str] | None:
+    """Inverse of :func:`kg_graph_uri`: ``(tenant_id, kg_name)`` or ``None``.
+
+    Returns ``None`` for anything that is not a per-KG instance-graph URI (e.g. the
+    tenant ontology graph or a provenance companion graph), so callers can detect
+    a non-KG graph and skip per-KG work rather than mis-deriving a scope.
+    """
+    if not isinstance(graph_uri, str):
+        return None
+    m = _KG_GRAPH_RE.match(graph_uri)
+    if not m:
+        return None
+    return m.group("tenant"), m.group("kg")
 
 
 def _escape_value(value: str) -> str:
