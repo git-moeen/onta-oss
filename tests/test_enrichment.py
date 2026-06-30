@@ -941,8 +941,15 @@ def test_executor_end_to_end_filled_verified_conflict():
         assert {r.action for r in final.results} == {"filled", "verified", "conflict"}
         conflict = next(r for r in final.results if r.action == "conflict")
         assert conflict.existing_value == "Acme Tools"
-        # No SPARQL update should happen for stage policy.
-        neptune.update.assert_not_called()
+        # NEW (ONTA-159): a conflict-free fill is APPLIED even under stage — only
+        # the conflict is held for review. So a write DID happen and it carried
+        # the p1 fill value; the conflicting p3 value was NOT written.
+        neptune.update.assert_called()
+        writes = " ".join(
+            str(c.args[0]) if c.args else "" for c in neptune.update.call_args_list
+        )
+        assert "Robert Bosch GmbH" in writes  # the conflict-free fill landed
+        assert "Acme Tools" not in writes  # the conflict was held, not overwritten
 
     asyncio.run(run())
 
@@ -1080,9 +1087,9 @@ def test_executor_apply_routes_through_shared_writer(monkeypatch):
 
 
 def test_executor_stage_with_no_results_completes_applied():
-    """stage policy + all no_match → ``applied`` (nothing to review), while
-    stage policy + a staged value → ``review``. The two halves pin the boundary
-    so an empty stage run never lands in a perpetual pending state."""
+    """stage policy boundaries (ONTA-159): all no_match → ``applied`` (nothing to
+    do); a conflict-free FILL → ``applied`` (auto-applied, nothing to reconcile);
+    only a real value-vs-value CONFLICT → ``review``."""
 
     async def run():
         rows = [
@@ -1102,21 +1109,46 @@ def test_executor_stage_with_no_results_completes_applied():
         assert done_empty.status == JobStatus.applied
         assert done_empty.results == []
 
-        # A confident verdict → one staged value → still goes to review.
+        # A confident verdict into an EMPTY field → conflict-free fill → APPLIED.
         neptune2 = AsyncMock()
         neptune2.query.return_value = _entities_query_response(rows)
+        neptune2.update.return_value = None
         store2 = InMemoryJobStore()
-        staged_job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.stage)
-        await store2.create(staged_job)
+        fill_job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.stage)
+        await store2.create(fill_job)
         wikidata = FakeWikidata(
             {("Unknown", "manufacturer"): [Verdict(value="Acme", confidence=0.95, source="wikidata")]}
         )
         await EnrichmentExecutor(
             neptune2, store2, EnrichmentCache(), wikidata
-        ).run(staged_job, "test-tenant")
-        done_staged = await store2.get(staged_job.id)
-        assert done_staged.status == JobStatus.review
-        assert len(done_staged.results) == 1
+        ).run(fill_job, "test-tenant")
+        done_fill = await store2.get(fill_job.id)
+        assert done_fill.status == JobStatus.applied  # ONTA-159: fills auto-apply
+        assert done_fill.progress.filled == 1
+        neptune2.update.assert_called()
+
+        # A verdict that DIFFERS from an existing value → real conflict → REVIEW.
+        mfr_pred = "https://cograph.tech/types/Product/attrs/manufacturer"
+        rows3 = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Widget",
+             "vals": f"{mfr_pred}::Acme Tools"},
+        ]
+        neptune3 = AsyncMock()
+        neptune3.query.return_value = _entities_query_response(rows3)
+        neptune3.update.return_value = None
+        store3 = InMemoryJobStore()
+        conflict_job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.stage)
+        await store3.create(conflict_job)
+        wikidata3 = FakeWikidata(
+            {("Widget", "manufacturer"): [Verdict(value="Globex", confidence=0.95, source="wikidata")]}
+        )
+        await EnrichmentExecutor(
+            neptune3, store3, EnrichmentCache(), wikidata3
+        ).run(conflict_job, "test-tenant")
+        done_conflict = await store3.get(conflict_job.id)
+        assert done_conflict.status == JobStatus.review
+        assert done_conflict.progress.conflicts == 1
+        assert done_conflict.results[0].action == "conflict"
 
     asyncio.run(run())
 
@@ -1333,7 +1365,7 @@ def test_executor_sources_override_uses_named_chain():
         await executor.run(job, "test-tenant")
 
         final = await store.get(job.id)
-        assert final.status == JobStatus.review
+        assert final.status == JobStatus.applied  # ONTA-159: conflict-free fill auto-applies
         assert final.progress.filled == 1
         # The override adapter was used; the tier-default wikidata was not.
         assert custom.calls and custom.calls[0][1] == "manufacturer"
@@ -1399,7 +1431,7 @@ def test_executor_sources_unknown_provider_falls_back_to_tier_chain():
         final = await store.get(job.id)
         # The all-unavailable override falls back to the tier chain, so wikidata
         # is consulted and the attribute is filled (not a silent empty job).
-        assert final.status == JobStatus.review
+        assert final.status == JobStatus.applied  # ONTA-159: conflict-free fill auto-applies
         assert final.progress.filled == 1
         assert final.progress.processed == 1
         assert wikidata.calls != []
@@ -2254,7 +2286,9 @@ def test_executor_apply_schedules_stats_recompute(monkeypatch):
 
 
 def test_executor_no_apply_does_not_recompute(monkeypatch):
-    """A stage-only job writes nothing → no recompute should be scheduled."""
+    """A stage job whose only result is a CONFLICT writes nothing (the conflict
+    is held for review) → no recompute should be scheduled. (ONTA-159: a stage
+    FILL now DOES write + recompute, so the no-write case must be a conflict.)"""
     import cograph_client.api.routes.explore as explore_mod
 
     calls: list[tuple[str, str]] = []
@@ -2265,8 +2299,10 @@ def test_executor_no_apply_does_not_recompute(monkeypatch):
     )
 
     async def run():
+        mfr_pred = "https://cograph.tech/types/Product/attrs/manufacturer"
         rows = [
-            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch",
+             "vals": f"{mfr_pred}::Acme Tools"},  # existing value → verdict will conflict
         ]
         neptune = AsyncMock()
         neptune.query.return_value = _entities_query_response(rows)
@@ -2283,10 +2319,13 @@ def test_executor_no_apply_does_not_recompute(monkeypatch):
         )
         executor = EnrichmentExecutor(neptune, store, cache, wikidata)
 
-        # stage policy never writes triples (it routes to review and returns).
-        job = _make_job(policy=ConflictPolicy.stage)
+        # stage + a sole conflict → held for review, nothing written.
+        job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.stage)
         await store.create(job)
         await executor.run(job, "test-tenant")
+        final = await store.get(job.id)
+        assert final.status == JobStatus.review
+        assert final.progress.conflicts == 1
 
     asyncio.run(run())
     assert calls == []
@@ -2455,15 +2494,18 @@ def test_executor_apply_declares_attribute_in_ontology(monkeypatch):
 
 
 def test_executor_stage_mode_does_not_declare(monkeypatch):
-    """Review (stage) mode writes nothing yet → it must NOT declare attributes in
-    the ontology."""
+    """A stage job whose only result is a CONFLICT writes nothing yet → it must
+    NOT declare attributes in the ontology. (ONTA-159: a stage FILL now writes +
+    declares, so the no-declare case must be a held conflict.)"""
     import cograph_client.api.routes.explore as explore_mod
 
     monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
 
     async def run():
+        company_pred = "https://cograph.tech/types/Product/attrs/company"
         rows = [
-            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch",
+             "vals": f"{company_pred}::Old Holdings"},  # existing → verdict conflicts
         ]
         neptune = AsyncMock()
         neptune.query.return_value = _entities_query_response(rows)
@@ -2486,7 +2528,7 @@ def test_executor_stage_mode_does_not_declare(monkeypatch):
 
         final = await store.get(job.id)
         assert final.status == JobStatus.review
-        # Nothing written, nothing declared.
+        # The conflict is held, not written → nothing written, nothing declared.
         assert _declaration_updates(neptune) == []
         neptune.update.assert_not_called()
 
@@ -3462,7 +3504,9 @@ def test_aliases_resolve_conflicts_to_verified():
 
         final = await store.get(job.id)
         assert final is not None
-        assert final.status == JobStatus.review
+        # ONTA-159: the alias resolved the would-be conflict to VERIFIED, so there
+        # is no conflict left to review → the run completes APPLIED (nothing to do).
+        assert final.status == JobStatus.applied
         assert final.progress.verified == 1, (
             f"expected verified, got progress={final.progress}"
         )
