@@ -19,8 +19,9 @@ Design (mirrors the existing swappable-backend pattern — ``JobStore`` /
   Aurora/Neon connection + infra that *provides* that DSN stay proprietary.
 
 Consistency model: Neptune stays the source of truth; this index is **eventually
-consistent**. Writes are idempotent upserts keyed on ``(entity_uri, valid_time)``
-so replaying the same fact is a no-op. The full ingest/enrichment outbox reconciler
+consistent**. Writes are idempotent upserts keyed on
+``(tenant_id, kg_name, entity_uri, valid_time)`` so replaying the same fact is a
+no-op. The full ingest/enrichment outbox reconciler
 that keeps the index in lock-step with Neptune is **out of scope** here — see the
 TODO seam at the bottom of this file.
 
@@ -52,6 +53,12 @@ class SpatioTemporalFact(BaseModel):
     ``valid_to`` bound the half-open validity range ``[valid_from, valid_to)``;
     either may be ``None`` for an open-ended side (e.g. "valid from 2020 onward").
 
+    ``kg_name`` scopes the fact to ONE knowledge graph within the tenant. Instance
+    data lives in per-KG named graphs (``…/kg/<kg_name>``), so the index carries
+    the same dimension: dropping a single KG must clear only its facts, never a
+    sibling KG's, and a query may be narrowed to one KG. ``(tenant_id, kg_name)``
+    is the isolation boundary; ``tenant_id`` alone is never enough.
+
     ``attrs`` holds **denormalized display fields** (label, type, thumbnail, …) so
     the hot read path returns everything the UI needs without a Neptune round-trip.
     Keep it small — it is stored verbatim as ``jsonb`` and shipped on every hit.
@@ -59,6 +66,7 @@ class SpatioTemporalFact(BaseModel):
 
     entity_uri: str
     tenant_id: str
+    kg_name: str
     lon: float = Field(..., ge=-180.0, le=180.0)
     lat: float = Field(..., ge=-90.0, le=90.0)
     valid_from: Optional[datetime] = None
@@ -82,7 +90,8 @@ class SpatioTemporalIndex(Protocol):
     """Swappable spatio-temporal secondary index over entity URIs.
 
     All methods are ``async``. Queries are always scoped to a single ``tenant_id``
-    (tenant isolation is mandatory — a query MUST NEVER cross tenants). Spatial
+    (tenant isolation is mandatory — a query MUST NEVER cross tenants) and may be
+    further narrowed to one ``kg_name`` (``None`` = every KG in the tenant). Spatial
     predicates select candidate geometries; the optional temporal predicate further
     restricts by validity range:
 
@@ -114,10 +123,13 @@ class SpatioTemporalIndex(Protocol):
         lat: float,
         radius_m: float,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
-        """Entities within ``radius_m`` **metres** of ``(lon, lat)`` (geodesic)."""
+        """Entities within ``radius_m`` **metres** of ``(lon, lat)`` (geodesic).
+
+        ``kg_name`` narrows to one KG; ``None`` searches every KG in the tenant."""
         ...
 
     async def query_bbox(
@@ -128,6 +140,7 @@ class SpatioTemporalIndex(Protocol):
         max_lon: float,
         max_lat: float,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
@@ -139,18 +152,23 @@ class SpatioTemporalIndex(Protocol):
         tenant_id: str,
         wkt_polygon: str,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
         """Entities inside the WGS84 polygon given as WKT (``POLYGON((...))``)."""
         ...
 
-    async def delete(self, entity_uri: str, tenant_id: str) -> None:
-        """Remove all facts for one entity within a tenant."""
+    async def delete(
+        self, entity_uri: str, tenant_id: str, *, kg_name: Optional[str] = None
+    ) -> None:
+        """Remove all facts for one entity. ``kg_name`` narrows to a single KG;
+        ``None`` removes the entity's facts across every KG in the tenant."""
         ...
 
-    async def clear(self, tenant_id: str) -> None:
-        """Remove every fact for a tenant (e.g. on KG delete)."""
+    async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
+        """Remove facts for a tenant. ``kg_name`` clears just that KG (the KG-delete
+        path); ``None`` clears the whole tenant (e.g. tenant teardown)."""
         ...
 
 

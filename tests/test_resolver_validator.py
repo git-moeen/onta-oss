@@ -99,3 +99,55 @@ class TestValidateTriple:
         )
         assert isinstance(result, RejectedValue)
         assert result.expected_datatype == "integer"
+
+
+GEO_WKT = "http://www.opengis.net/ont/geosparql#wktLiteral"
+
+
+class TestGeoDatatype:
+    """`geo` coerces a 'lat,lon' pair or a WKT POINT to a typed geo:wktLiteral."""
+
+    def test_validate_value_wkt_conforms(self):
+        # An already-canonical WKT POINT conforms (no coercion).
+        assert validate_value("POINT(2.29 48.85)", "geo") is True
+
+    def test_validate_value_latlon_not_conforming(self):
+        # "lat,lon" is coercible, not conforming — so it gets normalized, not stored verbatim.
+        assert validate_value("48.85,2.29", "geo") is False
+
+    def test_validate_value_out_of_range(self):
+        # lat 1920 is out of WGS84 range → not a coordinate.
+        assert validate_value("1920,1080", "geo") is False
+
+    def test_coerce_latlon_to_wkt(self):
+        # Comma form is lat,lon; WKT is lon-then-lat.
+        assert coerce_value("48.85,2.29", "geo") == "POINT(2.29 48.85)"
+
+    def test_coerce_wkt_passthrough(self):
+        assert coerce_value("POINT(2.29 48.85)", "geo") == "POINT(2.29 48.85)"
+
+    def test_coerce_rejects_non_coord(self):
+        assert coerce_value("Paris", "geo") is None
+        assert coerce_value("1920,1080", "geo") is None  # out of range
+
+    def test_triple_latlon_coerced_to_typed_wkt(self):
+        result = validate_triple("s", "p", "48.85,2.29", "geo")
+        assert isinstance(result, ValidatedTriple)
+        assert result.outcome == ValidationOutcome.COERCED
+        assert result.object == f"POINT(2.29 48.85)^^{GEO_WKT}"
+
+    def test_triple_wkt_ok_and_typed(self):
+        result = validate_triple("s", "p", "POINT(2.29 48.85)", "geo")
+        assert isinstance(result, ValidatedTriple)
+        assert result.outcome == ValidationOutcome.OK
+        assert result.object == f"POINT(2.29 48.85)^^{GEO_WKT}"
+
+    def test_triple_non_coord_rejected(self):
+        result = validate_triple("s", "p", "somewhere", "geo")
+        assert isinstance(result, RejectedValue)
+
+    def test_precision_preserved(self):
+        # No float re-formatting → exact lexical precision is kept.
+        assert coerce_value("-33.8688197,151.2092955", "geo") == (
+            "POINT(151.2092955 -33.8688197)"
+        )

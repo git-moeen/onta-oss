@@ -375,7 +375,7 @@ Return STRICT JSON only (no markdown):
   "op": "inspect" | "declare_attribute" | "declare_type",
   "type_name": "<type name>" | null,
   "attribute": "<new attribute leaf name, for declare_attribute>" | null,
-  "datatype": "string" | "integer" | "float" | "boolean" | "datetime" | "uri" | \
+  "datatype": "string" | "integer" | "float" | "boolean" | "datetime" | "uri" | "geo" | \
 "<another type name for a relationship>",
   "parent_type": "<parent type name, for declare_type>" | null,
   "description": "<short description>" | null,

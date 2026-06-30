@@ -140,14 +140,20 @@ class InMemorySpatioTemporalIndex:
     """Non-durable, per-process :class:`SpatioTemporalIndex` — the registered default."""
 
     def __init__(self) -> None:
-        # keyed by (tenant_id, entity_uri, valid_from, valid_to) → fact, so upsert
-        # is idempotent on (entity_uri, valid_time).
+        # keyed by (tenant_id, kg_name, entity_uri, valid_from, valid_to) → fact, so
+        # upsert is idempotent on (tenant_id, kg_name, entity_uri, valid_time).
         self._facts: dict[tuple, SpatioTemporalFact] = {}
         self._lock = asyncio.Lock()
 
     @staticmethod
     def _key(fact: SpatioTemporalFact) -> tuple:
-        return (fact.tenant_id, fact.entity_uri, fact.valid_from, fact.valid_to)
+        return (
+            fact.tenant_id,
+            fact.kg_name,
+            fact.entity_uri,
+            fact.valid_from,
+            fact.valid_to,
+        )
 
     async def upsert(self, fact: SpatioTemporalFact) -> None:
         async with self._lock:
@@ -161,12 +167,15 @@ class InMemorySpatioTemporalIndex:
     def _scan(
         self,
         tenant_id: str,
+        kg_name: Optional[str],
         time_window: Optional[TimeWindow],
         as_of: Optional[datetime],
     ):
         for fact in self._facts.values():
             if fact.tenant_id != tenant_id:
                 continue  # tenant isolation: never cross tenants
+            if kg_name is not None and fact.kg_name != kg_name:
+                continue  # optional per-KG narrowing
             if _temporal_ok(fact, time_window, as_of):
                 yield fact
 
@@ -181,13 +190,14 @@ class InMemorySpatioTemporalIndex:
         lat: float,
         radius_m: float,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
         async with self._lock:
             return [
                 self._result(f)
-                for f in self._scan(tenant_id, time_window, as_of)
+                for f in self._scan(tenant_id, kg_name, time_window, as_of)
                 if _haversine_m(lon, lat, f.lon, f.lat) <= radius_m
             ]
 
@@ -199,13 +209,14 @@ class InMemorySpatioTemporalIndex:
         max_lon: float,
         max_lat: float,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
         async with self._lock:
             return [
                 self._result(f)
-                for f in self._scan(tenant_id, time_window, as_of)
+                for f in self._scan(tenant_id, kg_name, time_window, as_of)
                 if min_lon <= f.lon <= max_lon and min_lat <= f.lat <= max_lat
             ]
 
@@ -214,6 +225,7 @@ class InMemorySpatioTemporalIndex:
         tenant_id: str,
         wkt_polygon: str,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
@@ -243,20 +255,31 @@ class InMemorySpatioTemporalIndex:
         async with self._lock:
             return [
                 self._result(f)
-                for f in self._scan(tenant_id, time_window, as_of)
+                for f in self._scan(tenant_id, kg_name, time_window, as_of)
                 if test(f)
             ]
 
-    async def delete(self, entity_uri: str, tenant_id: str) -> None:
+    async def delete(
+        self, entity_uri: str, tenant_id: str, *, kg_name: Optional[str] = None
+    ) -> None:
         async with self._lock:
             self._facts = {
                 k: v
                 for k, v in self._facts.items()
-                if not (v.tenant_id == tenant_id and v.entity_uri == entity_uri)
+                if not (
+                    v.tenant_id == tenant_id
+                    and v.entity_uri == entity_uri
+                    and (kg_name is None or v.kg_name == kg_name)
+                )
             }
 
-    async def clear(self, tenant_id: str) -> None:
+    async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
         async with self._lock:
             self._facts = {
-                k: v for k, v in self._facts.items() if v.tenant_id != tenant_id
+                k: v
+                for k, v in self._facts.items()
+                if not (
+                    v.tenant_id == tenant_id
+                    and (kg_name is None or v.kg_name == kg_name)
+                )
             }

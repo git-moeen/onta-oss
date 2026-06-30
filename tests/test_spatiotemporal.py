@@ -32,6 +32,8 @@ NYC_TIMES_SQ = (-73.9855, 40.7580)  # New York — ~4000 km away
 
 TENANT = "demo-tenant"
 OTHER_TENANT = "spider-bench"
+KG = "kg1"
+OTHER_KG = "kg2"
 
 
 def _dt(y: int, m: int = 1, d: int = 1) -> datetime:
@@ -44,6 +46,7 @@ def _fact(
     lat: float,
     *,
     tenant: str = TENANT,
+    kg: str = KG,
     valid_from: datetime | None = None,
     valid_to: datetime | None = None,
     attrs: dict | None = None,
@@ -51,6 +54,7 @@ def _fact(
     return SpatioTemporalFact(
         entity_uri=uri,
         tenant_id=tenant,
+        kg_name=kg,
         lon=lon,
         lat=lat,
         valid_from=valid_from,
@@ -252,6 +256,52 @@ async def test_tenant_isolation(idx):
 
 
 # ---------------------------------------------------------------------------
+# Per-KG dimension (memory)
+# ---------------------------------------------------------------------------
+
+
+async def test_kg_narrowing_on_query(idx):
+    await idx.upsert(_fact("e:a", *SF_FERRY, kg=KG))
+    await idx.upsert(_fact("e:b", *SF_CITY_HALL, kg=OTHER_KG))
+    # No kg_name → both KGs in the tenant.
+    assert _uris(await idx.query_radius(TENANT, *SF_FERRY, 5_000)) == {"e:a", "e:b"}
+    # Narrowed to one KG.
+    assert _uris(await idx.query_radius(TENANT, *SF_FERRY, 5_000, kg_name=KG)) == {"e:a"}
+    assert (
+        _uris(await idx.query_bbox(TENANT, -123, 37, -122, 38, kg_name=OTHER_KG))
+        == {"e:b"}
+    )
+
+
+async def test_clear_one_kg_leaves_sibling(idx):
+    """The crux of the kg_name dimension: dropping one KG must not wipe a sibling."""
+    await idx.upsert(_fact("e:a", *SF_FERRY, kg=KG))
+    await idx.upsert(_fact("e:b", *SF_CITY_HALL, kg=OTHER_KG))
+    await idx.clear(TENANT, kg_name=KG)
+    assert _uris(await idx.query_radius(TENANT, *SF_FERRY, 50_000)) == {"e:b"}
+    # A tenant-wide clear (no kg_name) still removes everything.
+    await idx.clear(TENANT)
+    assert _uris(await idx.query_radius(TENANT, *SF_FERRY, 50_000)) == set()
+
+
+async def test_same_uri_distinct_per_kg(idx):
+    """Same entity URI in two KGs are distinct rows (kg_name is part of the key)."""
+    await idx.upsert(_fact("e:shared", *SF_FERRY, kg=KG, attrs={"v": "a"}))
+    await idx.upsert(_fact("e:shared", *SF_FERRY, kg=OTHER_KG, attrs={"v": "b"}))
+    assert len(await idx.query_radius(TENANT, *SF_FERRY, 1_000)) == 2
+    one = await idx.query_radius(TENANT, *SF_FERRY, 1_000, kg_name=OTHER_KG)
+    assert one[0].attrs == {"v": "b"}
+
+
+async def test_delete_scoped_to_kg(idx):
+    await idx.upsert(_fact("e:shared", *SF_FERRY, kg=KG))
+    await idx.upsert(_fact("e:shared", *SF_FERRY, kg=OTHER_KG))
+    await idx.delete("e:shared", TENANT, kg_name=KG)
+    remaining = await idx.query_radius(TENANT, *SF_FERRY, 1_000)
+    assert len(remaining) == 1  # only the OTHER_KG row survives
+
+
+# ---------------------------------------------------------------------------
 # Factory + registration
 # ---------------------------------------------------------------------------
 
@@ -367,9 +417,10 @@ async def test_postgis_ddl_and_extensions(pg):
     assert "geometry(Geometry, 4326)" in ddl
     assert "valid_time tstzrange" in ddl
     assert "attrs      jsonb" in ddl
-    # Composite GiST index over (tenant_id, geom, valid_time).
-    assert "USING GIST (tenant_id, geom, valid_time)" in ddl
-    assert "PRIMARY KEY (tenant_id, entity_uri, valid_time)" in ddl
+    # Composite GiST index over (tenant_id, kg_name, geom, valid_time).
+    assert "USING GIST (tenant_id, kg_name, geom, valid_time)" in ddl
+    assert "PRIMARY KEY (tenant_id, kg_name, entity_uri, valid_time)" in ddl
+    assert "kg_name    text NOT NULL" in ddl
 
 
 async def test_postgis_extension_failure_tolerated(monkeypatch):
@@ -413,13 +464,14 @@ async def test_postgis_upsert_sql(pg):
     sql, args = inserts[-1]
     assert "ST_SetSRID(ST_MakePoint($6, $7), 4326)" in sql
     assert "tstzrange($4::timestamptz, $5::timestamptz, '[)')" in sql
-    assert "ON CONFLICT (tenant_id, entity_uri, valid_time) DO UPDATE" in sql
-    # args order: uri, tenant, attrs_json, from, to, lon, lat
+    assert "ON CONFLICT (tenant_id, kg_name, entity_uri, valid_time) DO UPDATE" in sql
+    # args order: uri, tenant, attrs_json, from, to, lon, lat, kg_name
     assert args[0] == "e:ferry"
     assert args[1] == TENANT
     assert '"label": "Ferry"' in args[2]
     assert args[3] == _dt(2025) and args[4] == _dt(2026)
     assert args[5] == SF_FERRY[0] and args[6] == SF_FERRY[1]
+    assert args[7] == KG
 
 
 async def test_postgis_upsert_many_uses_transaction(pg):
@@ -522,6 +574,31 @@ async def test_postgis_delete_and_clear_sql(pg):
     assert any(
         "DELETE FROM entity_spatiotemporal WHERE tenant_id = $1" in s
         and "entity_uri" not in s
+        for s in deletes
+    )
+
+
+async def test_postgis_kg_predicate_sql(pg):
+    """Passing kg_name appends an ``AND kg_name = $n`` after the spatial params,
+    with the temporal predicate renumbered to follow it."""
+    store, recorder, conn = pg
+    conn.rows = []
+    await store.query_radius(
+        TENANT, SF_FERRY[0], SF_FERRY[1], 5_000, kg_name=KG, as_of=_dt(2026)
+    )
+    sql, args = next((s, a) for (op, s, a) in recorder if op == "fetch")
+    # tenant $1, lon/lat $2/$3, radius $4, kg_name $5, as_of $6.
+    assert "AND kg_name = $5" in sql
+    assert "$6::timestamptz <@ valid_time" in sql
+    assert args == (TENANT, SF_FERRY[0], SF_FERRY[1], 5_000.0, KG, _dt(2026))
+
+
+async def test_postgis_clear_kg_scoped_sql(pg):
+    store, recorder, _conn = pg
+    await store.clear(TENANT, kg_name=KG)
+    deletes = _sqls(recorder, "execute")
+    assert any(
+        "DELETE FROM entity_spatiotemporal WHERE tenant_id = $1 AND kg_name = $2" in s
         for s in deletes
     )
 

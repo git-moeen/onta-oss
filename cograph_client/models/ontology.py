@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 class AttributeDefinition(BaseModel):
     name: str = Field(min_length=1)
     description: str = ""
-    datatype: str = Field(default="string", description="string, integer, float, boolean, datetime, uri, or a type name for relationships")
+    datatype: str = Field(default="string", description="string, integer, float, boolean, datetime, uri, geo (WKT point / 'lat,lon'), or a type name for relationships")
 
 
 class TypeCreate(BaseModel):

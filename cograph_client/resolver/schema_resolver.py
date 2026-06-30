@@ -74,7 +74,8 @@ ontology, extract structured entities, their attributes, and relationships.
 Rules:
 - Each entity must have a type_name (PascalCase, singular noun, e.g. "Property" not "properties")
 - Each entity must have an id (use the most natural identifier: name, address, etc.)
-- Attributes have a name (snake_case), value (string), and datatype (string, integer, float, boolean, datetime, uri)
+- Attributes have a name (snake_case), value (string), and datatype (string, integer, float, boolean, datetime, uri, geo)
+- Use datatype "geo" only for a SINGLE coordinate value (a WKT "POINT(lon lat)" or a "lat,lon" pair); keep separate latitude/longitude columns as float
 - Relationships connect two entities by their id with a predicate (snake_case)
 
 Type placement:

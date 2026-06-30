@@ -10,17 +10,19 @@ Schema::
     CREATE TABLE entity_spatiotemporal (
         entity_uri text NOT NULL,
         tenant_id  text NOT NULL,
+        kg_name    text NOT NULL,
         geom       geometry(Geometry, 4326) NOT NULL,
         valid_time tstzrange NOT NULL,
         attrs      jsonb NOT NULL DEFAULT '{}'::jsonb,
-        PRIMARY KEY (tenant_id, entity_uri, valid_time)
+        PRIMARY KEY (tenant_id, kg_name, entity_uri, valid_time)
     );
-    CREATE INDEX ... USING GIST (tenant_id, geom, valid_time);  -- needs btree_gist
+    CREATE INDEX ... USING GIST (tenant_id, kg_name, geom, valid_time);  -- btree_gist
 
-The ``GIST(tenant_id, geom, valid_time)`` composite index serves the hot path —
-spatial predicate + temporal predicate scoped to one tenant — in one index scan
-(``btree_gist`` lets the scalar ``tenant_id`` participate in a GiST index). Writes are
-idempotent upserts keyed on the ``(tenant_id, entity_uri, valid_time)`` PK.
+The ``GIST(tenant_id, kg_name, geom, valid_time)`` composite index serves the hot
+path — spatial predicate + temporal predicate scoped to one tenant (and optionally
+one KG) — in one index scan (``btree_gist`` lets the scalar ``tenant_id`` /
+``kg_name`` participate in a GiST index). Writes are idempotent upserts keyed on the
+``(tenant_id, kg_name, entity_uri, valid_time)`` PK.
 
 Pool + DDL are created lazily on first use, so importing this module / constructing
 the store never touches the network. DDL is idempotent (``IF NOT EXISTS``).
@@ -98,18 +100,21 @@ class PostGISSpatioTemporalIndex:
                     CREATE TABLE IF NOT EXISTS {self._TABLE} (
                         entity_uri text NOT NULL,
                         tenant_id  text NOT NULL,
+                        kg_name    text NOT NULL,
                         geom       geometry(Geometry, 4326) NOT NULL,
                         valid_time tstzrange NOT NULL,
                         attrs      jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-                        PRIMARY KEY (tenant_id, entity_uri, valid_time)
+                        PRIMARY KEY (tenant_id, kg_name, entity_uri, valid_time)
                     )
                     """
                 )
-                # Composite GiST over (tenant_id, geom, valid_time) — requires
-                # btree_gist for the scalar tenant_id to live in a GiST index.
+                # Composite GiST over (tenant_id, kg_name, geom, valid_time) —
+                # requires btree_gist for the scalar tenant_id/kg_name to live in a
+                # GiST index. Serves "this KG, near here, valid then" in one scan.
                 await conn.execute(
                     f"CREATE INDEX IF NOT EXISTS {self._INDEX} "
-                    f"ON {self._TABLE} USING GIST (tenant_id, geom, valid_time)"
+                    f"ON {self._TABLE} USING GIST "
+                    f"(tenant_id, kg_name, geom, valid_time)"
                 )
             self._pool = pool
             return self._pool
@@ -146,14 +151,14 @@ class PostGISSpatioTemporalIndex:
         await conn.execute(
             f"""
             INSERT INTO {self._TABLE}
-                (entity_uri, tenant_id, geom, valid_time, attrs)
+                (entity_uri, tenant_id, kg_name, geom, valid_time, attrs)
             VALUES (
-                $1, $2,
+                $1, $2, $8,
                 ST_SetSRID(ST_MakePoint($6, $7), 4326),
                 {self._valid_time_sql()},
                 $3::jsonb
             )
-            ON CONFLICT (tenant_id, entity_uri, valid_time) DO UPDATE SET
+            ON CONFLICT (tenant_id, kg_name, entity_uri, valid_time) DO UPDATE SET
                 geom  = EXCLUDED.geom,
                 attrs = EXCLUDED.attrs
             """,
@@ -164,9 +169,23 @@ class PostGISSpatioTemporalIndex:
             fact.valid_to,
             fact.lon,
             fact.lat,
+            fact.kg_name,
         )
 
     # ---------------------------------------------------------------- queries
+    @staticmethod
+    def _kg_predicate(
+        kg_name: Optional[str], start_param: int
+    ) -> tuple[str, list[Any]]:
+        """Optional per-KG narrowing (``AND kg_name = $n``).
+
+        ``None`` → no predicate (search every KG in the tenant). Returns
+        ("", []) so callers can concatenate unconditionally.
+        """
+        if kg_name is not None:
+            return f" AND kg_name = ${start_param}", [kg_name]
+        return "", []
+
     @staticmethod
     def _temporal_predicate(
         time_window: Optional[TimeWindow],
@@ -215,10 +234,11 @@ class PostGISSpatioTemporalIndex:
         lat: float,
         radius_m: float,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
-        # $1 tenant, $2 lon, $3 lat, $4 radius; temporal params start at $5.
+        # $1 tenant, $2 lon, $3 lat, $4 radius; kg + temporal params follow.
         spatial = (
             "tenant_id = $1 AND ST_DWithin("
             "geom::geography, "
@@ -226,8 +246,10 @@ class PostGISSpatioTemporalIndex:
             "$4)"
         )
         params: list[Any] = [tenant_id, lon, lat, radius_m]
+        kpred, kparams = self._kg_predicate(kg_name, len(params) + 1)
+        params += kparams
         tpred, tparams = self._temporal_predicate(time_window, as_of, len(params) + 1)
-        return await self._run_query(spatial + tpred, params + tparams)
+        return await self._run_query(spatial + kpred + tpred, params + tparams)
 
     async def query_bbox(
         self,
@@ -237,6 +259,7 @@ class PostGISSpatioTemporalIndex:
         max_lon: float,
         max_lat: float,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
@@ -245,14 +268,17 @@ class PostGISSpatioTemporalIndex:
             "geom, ST_MakeEnvelope($2, $3, $4, $5, 4326))"
         )
         params: list[Any] = [tenant_id, min_lon, min_lat, max_lon, max_lat]
+        kpred, kparams = self._kg_predicate(kg_name, len(params) + 1)
+        params += kparams
         tpred, tparams = self._temporal_predicate(time_window, as_of, len(params) + 1)
-        return await self._run_query(spatial + tpred, params + tparams)
+        return await self._run_query(spatial + kpred + tpred, params + tparams)
 
     async def query_polygon(
         self,
         tenant_id: str,
         wkt_polygon: str,
         *,
+        kg_name: Optional[str] = None,
         time_window: Optional[TimeWindow] = None,
         as_of: Optional[datetime] = None,
     ) -> list[STQueryResult]:
@@ -261,26 +287,33 @@ class PostGISSpatioTemporalIndex:
             "geom, ST_GeomFromText($2, 4326))"
         )
         params: list[Any] = [tenant_id, wkt_polygon]
+        kpred, kparams = self._kg_predicate(kg_name, len(params) + 1)
+        params += kparams
         tpred, tparams = self._temporal_predicate(time_window, as_of, len(params) + 1)
-        return await self._run_query(spatial + tpred, params + tparams)
+        return await self._run_query(spatial + kpred + tpred, params + tparams)
 
     # ----------------------------------------------------------------- delete
-    async def delete(self, entity_uri: str, tenant_id: str) -> None:
+    async def delete(
+        self, entity_uri: str, tenant_id: str, *, kg_name: Optional[str] = None
+    ) -> None:
         pool = await self._ensure_pool()
+        sql = f"DELETE FROM {self._TABLE} WHERE tenant_id = $1 AND entity_uri = $2"
+        params: list[Any] = [tenant_id, entity_uri]
+        if kg_name is not None:
+            params.append(kg_name)
+            sql += f" AND kg_name = ${len(params)}"
         async with pool.acquire() as conn:
-            await conn.execute(
-                f"DELETE FROM {self._TABLE} "
-                f"WHERE tenant_id = $1 AND entity_uri = $2",
-                tenant_id,
-                entity_uri,
-            )
+            await conn.execute(sql, *params)
 
-    async def clear(self, tenant_id: str) -> None:
+    async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
         pool = await self._ensure_pool()
+        sql = f"DELETE FROM {self._TABLE} WHERE tenant_id = $1"
+        params: list[Any] = [tenant_id]
+        if kg_name is not None:
+            params.append(kg_name)
+            sql += f" AND kg_name = ${len(params)}"
         async with pool.acquire() as conn:
-            await conn.execute(
-                f"DELETE FROM {self._TABLE} WHERE tenant_id = $1", tenant_id
-            )
+            await conn.execute(sql, *params)
 
 
 def _attrs_json(attrs: dict[str, Any]) -> str:

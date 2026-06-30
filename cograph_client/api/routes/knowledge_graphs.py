@@ -385,6 +385,16 @@ async def delete_kg(
     except Exception:
         pass  # Bank purge is best-effort, don't fail the delete
 
+    # Clear this KG's rows from the spatio-temporal secondary index. Scoped to
+    # (tenant_id, kg_name) so a sibling KG's geometry facts are untouched — the
+    # whole reason the index carries a kg_name dimension. Best-effort: the
+    # eventually-consistent derived index must never block the KG delete.
+    try:
+        from cograph_client.spatiotemporal.registry import get_spatiotemporal_index
+        await get_spatiotemporal_index().clear(tenant.tenant_id, kg_name=kg_name)
+    except Exception:
+        pass  # Derived-index cleanup is best-effort, don't fail the delete
+
     return {"deleted": kg_name}
 
 
