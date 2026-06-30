@@ -86,7 +86,7 @@ _INTERNAL_ONTO_MARKERS: frozenset[str] = frozenset({
 })
 
 
-def _is_internal_predicate(p_uri: str) -> bool:
+def _is_internal_predicate(p_uri: str, is_relationship: bool = False) -> bool:
     """True if ``p_uri`` is an internal/housekeeping predicate, not a user-facing
     domain attribute or relationship.
 
@@ -96,15 +96,34 @@ def _is_internal_predicate(p_uri: str) -> bool:
     with a coverage %. Kept namespace-based on purpose — see
     ``_INTERNAL_ONTO_MARKERS`` for why the whole `…/onto/` namespace can't be
     excluded.
+
+    ``is_relationship``: the curated ``_INTERNAL_ONTO_MARKERS`` (onto/source,
+    onto/batch_id, …) are ALWAYS literal-valued housekeeping. A real RELATIONSHIP
+    predicate that happens to share one of those leaf names — e.g. a measurement
+    minted with predicate ``…/onto/source`` pointing at an Organization entity —
+    must NOT be hidden. So when the caller knows this predicate is a relationship
+    (its object is an entity IRI / the ontology declares an entity range), pass
+    ``is_relationship=True`` and the marker check is skipped. The namespace
+    exclusions (ER, onto/norm, rdf/rdfs) still apply to relationships, since those
+    are never legitimate domain edges.
     """
     if not p_uri:
         return True
-    if p_uri == RDF_TYPE or p_uri in SYSTEM_PREDICATES:
+    if p_uri == RDF_TYPE:
         return True
     # Whole-namespace exclusions: RDF/RDFS system vocab + ER + normalization.
+    # These are never legitimate domain data, attribute OR relationship.
     if p_uri.startswith(RDF_NS) or p_uri.startswith(RDFS_NS):
         return True
     if p_uri.startswith(ER_NS) or p_uri.startswith(ONTO_NORM_PREFIX):
+        return True
+    # A relationship is exempt from the literal-only housekeeping checks below:
+    # SYSTEM_PREDICATES (rdfs:label, onto/ingested_at, onto/source) and
+    # _INTERNAL_ONTO_MARKERS are all literal-valued markers, so a same-named
+    # relationship is a real domain edge, not housekeeping.
+    if is_relationship:
+        return False
+    if p_uri in SYSTEM_PREDICATES:
         return True
     # Curated housekeeping markers under …/onto/ (the namespace also holds real
     # relationship predicates, so we match the specific markers, not the prefix).
@@ -264,15 +283,20 @@ def _assemble_summary(
     relationships = []
     for r in pred_records:
         p_uri = r.get("p", "")
-        if _is_internal_predicate(p_uri):
-            continue
         cnt = r.get("cnt", 0)
         rel = r.get("rel", 0)
         defn = attr_defs.get(p_uri, {})
         name = defn.get("name") or p_uri.rstrip("/").split("/")[-1]
         rng = defn.get("range", "")
         cov = _coverage(cnt, entity_count)
-        if rel > 0 or rng.startswith(TYPE_URI_PREFIX):
+        # A predicate is a relationship when any of its objects are entities
+        # (rel > 0) or the ontology declares an entity range. Determine this
+        # FIRST so the internal-predicate filter can spare a same-named
+        # relationship from the literal-only housekeeping markers (FIX 2).
+        is_rel = rel > 0 or rng.startswith(TYPE_URI_PREFIX)
+        if _is_internal_predicate(p_uri, is_relationship=is_rel):
+            continue
+        if is_rel:
             # Prefer the ontology-declared range; fall back to the target type
             # captured from a sample object's entity URI.
             target = rng[len(TYPE_URI_PREFIX):] if rng.startswith(TYPE_URI_PREFIX) else None
@@ -345,7 +369,10 @@ async def _live_scan(client: NeptuneClient, kg_graph: str, t_uri: str) -> tuple[
             continue
         # Skip internal/housekeeping predicates so they never become user-facing
         # attributes/relationships (onto/batch_id, er/blockKey, er/erSignal_*, …).
-        if _is_internal_predicate(p_uri):
+        # A predicate carrying entity-valued objects (rel > 0) is a relationship,
+        # exempt from the literal-only housekeeping markers (FIX 2) — so a real
+        # relationship named e.g. `onto/source` is kept, not hidden.
+        if _is_internal_predicate(p_uri, is_relationship=rel > 0):
             continue
         records.append({"p": p_uri, "cnt": cnt, "rel": rel,
                         "target": _target_from_entity_uri(r.get("sample", ""))})
@@ -677,8 +704,10 @@ async def recompute_kg_stats(client: NeptuneClient, tenant_id: str, kg_name: str
         # must never reach the Explorer's Attributes/Relationships panel
         # (onto/batch_id, er/blockKey, er/erSignal_*, rdf*/rdfs*). Filtering here
         # keeps freshly recomputed stats clean (assembly filters too, as a
-        # backstop for already-materialized stats).
-        if _is_internal_predicate(p_uri):
+        # backstop for already-materialized stats). A predicate with entity-valued
+        # objects (rel > 0) is a relationship, exempt from the literal-only
+        # housekeeping markers (FIX 2) so a real `onto/source` edge is materialized.
+        if _is_internal_predicate(p_uri, is_relationship=rel > 0):
             continue
         total_edges += rel
         node = _stat_node(type_uri_str, p_uri)
@@ -1369,7 +1398,11 @@ async def get_type_records(
         # filter the summary panel uses. rdfs:label is intercepted above (it is
         # the row name); the real attrs/name predicate (…/onto/name) is NOT
         # internal and still flows through to the name-precedence logic below.
-        if _is_internal_predicate(p_uri):
+        # An entity-valued object marks a relationship, exempt from the
+        # literal-only housekeeping markers (FIX 2) so a real `onto/source` edge
+        # to an entity isn't hidden from the table.
+        is_rel = o_val.startswith(ENTITY_URI_PREFIX)
+        if _is_internal_predicate(p_uri, is_relationship=is_rel):
             continue
         # Resolve display name: check attr_label_by_pred (instance pred) first,
         # then attr_label_by_onto (onto attr URI), then fall back to the URI leaf.

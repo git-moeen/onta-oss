@@ -2,7 +2,12 @@
 
 import json
 
-from cograph_client.resolver.chunker import chunk_text, chunk_json_array
+from cograph_client.resolver.chunker import (
+    chunk_text,
+    chunk_json_array,
+    split_json_array_chunk,
+    json_array_len,
+)
 
 
 class TestChunkText:
@@ -73,3 +78,61 @@ class TestChunkJsonArray:
     def test_empty_array(self):
         chunks = chunk_json_array("[]")
         assert len(chunks) == 1
+
+    def test_default_batch_size_is_25(self):
+        """FIX 1: the default batch was lowered 50 → 25 so a denser reified
+        chunk's JSON output stays under the LLM token cap."""
+        data = [{"id": i} for i in range(60)]
+        content = json.dumps(data)
+        chunks = chunk_json_array(content)  # default batch_size
+        assert len(chunks) == 3  # 25 + 25 + 10
+        all_items = []
+        for c in chunks:
+            all_items.extend(json.loads(c))
+        assert len(all_items) == 60
+
+
+class TestSplitJsonArrayChunk:
+    """FIX 1: the recovery helper that halves a chunk whose extraction failed."""
+
+    def test_splits_in_half_conserving_records(self):
+        data = [{"id": i} for i in range(10)]
+        halves = split_json_array_chunk(json.dumps(data))
+        assert len(halves) == 2
+        left, right = json.loads(halves[0]), json.loads(halves[1])
+        assert len(left) == 5 and len(right) == 5
+        # No record lost, order preserved.
+        assert left + right == data
+
+    def test_odd_length_splits_lower_then_upper(self):
+        data = [{"id": i} for i in range(7)]
+        halves = split_json_array_chunk(json.dumps(data))
+        left, right = json.loads(halves[0]), json.loads(halves[1])
+        assert len(left) == 3 and len(right) == 4
+        assert left + right == data
+
+    def test_single_record_cannot_split(self):
+        assert split_json_array_chunk(json.dumps([{"id": 1}])) == []
+
+    def test_empty_array_cannot_split(self):
+        assert split_json_array_chunk("[]") == []
+
+    def test_non_array_cannot_split(self):
+        assert split_json_array_chunk(json.dumps({"k": "v"})) == []
+
+    def test_invalid_json_cannot_split(self):
+        assert split_json_array_chunk("not json") == []
+
+
+class TestJsonArrayLen:
+    def test_counts_array_records(self):
+        assert json_array_len(json.dumps([{"a": 1}, {"b": 2}, {"c": 3}])) == 3
+
+    def test_empty_array_is_zero(self):
+        assert json_array_len("[]") == 0
+
+    def test_non_array_is_zero(self):
+        assert json_array_len(json.dumps({"k": "v"})) == 0
+
+    def test_invalid_json_is_zero(self):
+        assert json_array_len("garbage") == 0

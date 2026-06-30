@@ -226,3 +226,135 @@ def test_is_internal_predicate_false(p_uri):
     """Real domain predicates — including relationships/attributes that
     legitimately live under …/onto/ — must NOT be classified internal."""
     assert _is_internal_predicate(p_uri) is False
+
+
+# ---------------------------------------------------------------------------
+# 4. FIX 2 — a RELATIONSHIP named like a housekeeping marker is NOT hidden
+# ---------------------------------------------------------------------------
+# The curated markers (onto/source, onto/batch_id, …) are ALWAYS literal-valued
+# housekeeping. A real relationship predicate that happens to share a marker leaf
+# name — e.g. a reified measurement minted with predicate …/onto/source pointing
+# at an Organization entity — must show in the Relationships panel, while the
+# literal housekeeping …/onto/source (the ingest "source" string) stays hidden.
+
+ORG_ENTITY = ENTITIES + "Organization/openrouter"
+
+
+@pytest.mark.parametrize("marker_pred", [
+    SOURCE_PRED,                       # the exact collision the reification prompt nudged
+    BATCH_ID_PRED,
+    INGESTED_AT_PRED,
+])
+def test_marker_predicate_kept_when_relationship(marker_pred):
+    """A predicate sharing a housekeeping leaf name is EXEMPT from the marker
+    check when it's a relationship (object is an entity IRI)."""
+    # As a literal-valued housekeeping marker → hidden.
+    assert _is_internal_predicate(marker_pred, is_relationship=False) is True
+    # As a relationship (entity-valued object) → shown.
+    assert _is_internal_predicate(marker_pred, is_relationship=True) is False
+
+
+def test_er_namespace_relationship_still_hidden():
+    """The whole-namespace exclusions (ER, normalization, rdf/rdfs) apply to
+    relationships too — they are NEVER legitimate domain edges."""
+    assert _is_internal_predicate(BLOCK_KEY_PRED, is_relationship=True) is True
+    assert _is_internal_predicate(ONTO + "norm/x", is_relationship=True) is True
+    assert _is_internal_predicate(RDF_TYPE, is_relationship=True) is True
+
+
+def test_assemble_summary_shows_real_source_relationship_hides_literal_source():
+    """Two predicates both named ``source``:
+
+    * a REAL relationship (rel > 0, object → an Organization entity) → appears in
+      ``relationships`` as ``source`` with the right target type;
+    * a housekeeping LITERAL ``onto/source`` (rel == 0) → hidden entirely.
+
+    Plus the real ``score`` attribute survives. This is the user-reported
+    collision: the reification prompt nudges a measurement→provider relationship,
+    and naming it ``source`` must not get it filtered like the ingest marker.
+    """
+    pred_records = [
+        # Real attribute survives.
+        {"p": SCORE_PRED, "cnt": 11, "rel": 0, "target": None},
+        # Real relationship named "source": rel > 0, target is Organization.
+        {"p": SOURCE_PRED, "cnt": 11, "rel": 11, "target": "Organization"},
+        # Housekeeping LITERAL source on the SAME leaf name: rel == 0 → hidden.
+        # (In real data these are distinct triples; here a second record with the
+        # same predicate URI but no entity objects models the literal marker.)
+        {"p": BATCH_ID_PRED, "cnt": 11, "rel": 0, "target": None},
+        {"p": INGESTED_AT_PRED, "cnt": 11, "rel": 0, "target": None},
+    ]
+    attr_defs = {TYPES + "TTSModel/attrs/score": {"name": "score", "range": ""}}
+
+    summary = _assemble_summary(
+        type_name=TYPE,
+        onto_row={},
+        parent_type=None,
+        entity_count=11,
+        pred_records=pred_records,
+        attr_defs=attr_defs,
+    )
+
+    # The real "source" relationship is SHOWN, pointed at Organization.
+    rel_by_name = {r["name"]: r for r in summary["relationships"]}
+    assert "source" in rel_by_name, summary["relationships"]
+    assert rel_by_name["source"]["target_type"] == "Organization"
+
+    # The literal housekeeping markers are HIDDEN (never attributes either).
+    attr_names = {a["name"] for a in summary["attributes"]}
+    assert attr_names == {"score"}, attr_names
+    assert "source" not in attr_names
+    assert "batch_id" not in attr_names
+    assert "ingested_at" not in attr_names
+
+
+def test_live_scan_keeps_entity_valued_source_relationship(client, mock_neptune, auth_headers):
+    """End-to-end via the /summary live-scan path: a TTSModel whose entities have
+    a real ``onto/source`` edge to an Organization AND a housekeeping literal
+    ``onto/batch_id`` → ``source`` shows as a relationship, batch_id is hidden."""
+    # The /summary endpoint memoizes per (tenant, kg, type) in a module cache;
+    # another test in this file warms the same key, so clear it to read fresh.
+    from cograph_client.api.routes import explore as _explore_mod
+    _explore_mod._summary_cache.clear()
+
+    def route(sparql, *a, **k):
+        if "?label" in sparql and "subClassOf" in sparql:
+            return _rows({"label": TYPE})
+        if "attrLabel" in sparql:
+            return _rows(
+                {"attr": TYPES + "TTSModel/attrs/score", "attrLabel": "score", "range": ""},
+            )
+        if "entityCount" in sparql:
+            return _empty()
+        if "forType" in sparql:
+            return _empty()
+        if "GROUP BY ?p" in sparql:
+            return _rows(
+                {"p": RDF_TYPE, "cnt": "11", "rel": "0", "sample": ENTITIES + "TTSModel/a"},
+                {"p": SCORE_PRED, "cnt": "11", "rel": "0", "sample": "0.9"},
+                # Real relationship named "source": rel > 0, sample is an entity IRI.
+                {"p": SOURCE_PRED, "cnt": "11", "rel": "11", "sample": ORG_ENTITY},
+                # Housekeeping literal marker: rel == 0 → hidden.
+                {"p": BATCH_ID_PRED, "cnt": "11", "rel": "0", "sample": "batch-xyz"},
+            )
+        return _empty()
+
+    mock_neptune.query.side_effect = route
+
+    resp = client.get(
+        f"/graphs/{TENANT}/explore/kgs/{KG}/types/{TYPE}/summary",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    rel_names = {r["name"] for r in data["relationships"]}
+    assert "source" in rel_names, data["relationships"]
+    # target type recovered from the sample entity IRI leaf.
+    src_rel = next(r for r in data["relationships"] if r["name"] == "source")
+    assert src_rel["target_type"] == "Organization"
+
+    attr_names = {a["name"] for a in data["attributes"]}
+    assert attr_names == {"score"}, attr_names
+    assert "batch_id" not in attr_names
+    assert "source" not in attr_names

@@ -230,6 +230,25 @@ async def test_preview_surfaces_multiple_types_and_relationships(monkeypatch):
     }
 
 
+async def test_preview_summary_frames_shape_as_estimate(monkeypatch):
+    """FIX 5: the discovered TYPES/relationships are an ESTIMATE from the small
+    sample, not a guarantee — the user-facing summary must say so (only the
+    column projection is stable preview→commit). Wording-only assertion."""
+    provider = FakeProvider()
+    register_web_source(provider)
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+
+    steps = await WebIngestCapability().plan(
+        _ctx(), "models OpenRouter offers", parsed=CONFIRMED_SPEC
+    )
+    summary = steps[0].preview["summary"].lower()
+    # Must NOT over-claim certainty ("Discovered N types") and must signal the
+    # commit may differ.
+    assert "estimated" in summary
+    assert "may differ" in summary
+    assert "discovered " not in summary
+
+
 async def test_preview_degrades_to_flat_when_extract_fails(monkeypatch):
     """If the plan-time extractor raises, plan() still returns a confirmable plan
     card (degraded flat single-type preview) — no exception propagates."""
@@ -324,7 +343,8 @@ async def test_execute_runs_full_discover_and_ingests(monkeypatch):
     await spawned["task"]
 
     # Full pull (sample=False) with the COMPREHENSIVE hint (key ∪ confirmed ∪
-    # suggested) — the SAME rich projection the sample used (preview == commit),
+    # suggested) — the SAME rich projection the sample used (the FETCH is the
+    # stable part preview→commit; the discovered shape is only an estimate),
     # NOT the confirmed minimal list. Committed through the multi-type ingest
     # path (content_type="json").
     assert provider.calls[-1][1] is False
