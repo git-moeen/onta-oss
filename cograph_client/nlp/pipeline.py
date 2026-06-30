@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 
 import anthropic
@@ -8,10 +9,19 @@ import structlog
 
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.parser import parse_sparql_results
+from cograph_client.graph.queries import parse_kg_graph_uri
 from cograph_client.models.query import NLResult
 from cograph_client.nlp.prompts import SPARQL_GENERATION_SYSTEM, build_generation_prompt
 from cograph_client.nlp.validator import normalize_sparql, validate_sparql
 from cograph_client.resolver.llm_router import model_chain
+from cograph_client.spatiotemporal.routing import (
+    SPATIAL_INTENT_SCHEMA,
+    SPATIAL_INTENT_SYSTEM,
+    filter_by_type,
+    format_spatial_answer,
+    looks_spatial,
+    parse_spatial_intent,
+)
 
 logger = structlog.stdlib.get_logger("cograph.nlp.pipeline")
 
@@ -56,6 +66,54 @@ def get_embedding_service():
     return _embedding_service
 
 
+# Spatial fast-path helpers (ONTA-157 Phase 2). Module-level + pure so they're
+# trivially testable; the orchestration that uses them lives on NLQueryPipeline.
+_GEO_WKT_URI = "http://www.opengis.net/ont/geosparql#wktLiteral"
+_POINT_RE = re.compile(
+    r"POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", re.IGNORECASE
+)
+
+
+def _parse_iso_dt(s):
+    """ISO-8601 string → tz-aware (UTC-assumed) datetime, or None. Mirrors the
+    extractor so a query bound and an indexed validity compare without raising."""
+    if not s or not isinstance(s, str):
+        return None
+    from datetime import datetime, timezone
+
+    t = s.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _parse_point_wkt(wkt: str):
+    """``"POINT(lon lat)"`` → (lon, lat) in WGS84 range, else None."""
+    if not isinstance(wkt, str):
+        return None
+    m = _POINT_RE.search(wkt)
+    if not m:
+        return None
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+    if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+        return None
+    return lon, lat
+
+
+def _sanitize_sparql_literal(text: str) -> str:
+    """Strip characters that could break out of a SPARQL string literal, and cap
+    length — the anchor description comes from the LLM and is interpolated into a
+    FILTER(CONTAINS(...)) literal."""
+    return re.sub(r'["\\\n\r\t]', " ", text).strip().lower()[:80]
+
+
 class NLQueryPipeline:
     def __init__(self, neptune: NeptuneClient, anthropic_key: str):
         self.neptune = neptune
@@ -69,6 +127,13 @@ class NLQueryPipeline:
         # generated SPARQL. Default OFF so the default Neptune call pattern
         # stays byte-identical (same gating pattern as COGRAPH_ER_ENABLED).
         self._aliases_enabled = os.environ.get("COGRAPH_ALIASES_ENABLED", "0") == "1"
+        # Spatio-temporal read routing (ONTA-157 Phase 2): a geo/proximity question
+        # is answered directly from the secondary index (no Neptune round-trip).
+        # Default OFF — same gating discipline as the aliases flag — so the default
+        # query path (and every eval) stays byte-identical until explicitly enabled.
+        self._spatial_routing_enabled = (
+            os.environ.get("COGRAPH_SPATIAL_ROUTING_ENABLED", "0") == "1"
+        )
 
     async def ask(self, question: str, graph_uri: str, instance_graph: str | None = None, exclude_questions: list[str] | None = None, layer_graph_uris: list[str] | None = None) -> NLResult:
         """Answer a natural-language question over the graph.
@@ -102,6 +167,18 @@ class NLQueryPipeline:
             ontology = await self._fetch_ontology(graph_uri, data_graph)
             timing["ontology_source"] = "full"
         timing["ontology_fetch_ms"] = round((time.time() - t0) * 1000, 1)
+
+        # Spatio-temporal fast path (ONTA-157 Phase 2, gated). For a geo/proximity
+        # question, answer directly from the secondary index — no SPARQL, no Neptune
+        # round-trip. Returns None (and we fall through to the normal path unchanged)
+        # whenever routing is off, the question isn't spatial, the KG can't be
+        # scoped, the intent doesn't parse, or the anchor can't be resolved.
+        if self._spatial_routing_enabled and looks_spatial(question):
+            spatial = await self._try_spatial_fast_path(
+                question, ontology, data_graph, timing, t0
+            )
+            if spatial is not None:
+                return spatial
 
         # Attribute-alias map (ADR 0002 §7). Only fetched when the feature is
         # enabled; an empty map (no aliases registered) leaves every query
@@ -199,6 +276,189 @@ class NLQueryPipeline:
             ontology=ontology,
             timing=timing,
         )
+
+    # ------------------------------------------------------------- spatial path
+    async def _try_spatial_fast_path(
+        self,
+        question: str,
+        ontology: str,
+        data_graph: str,
+        timing: dict,
+        t0: float,
+    ) -> NLResult | None:
+        """Answer a geo/proximity question directly from the spatio-temporal index.
+
+        Returns an ``NLResult`` on success, or ``None`` to fall through to the
+        normal SPARQL path — when the graph isn't a per-KG instance graph, the LLM
+        doesn't return a servable spatial intent, the anchor can't be resolved, or
+        anything errors. Never raises into :meth:`ask` (best-effort fast path).
+        """
+        scope = parse_kg_graph_uri(data_graph)
+        if scope is None:
+            return None  # index rows are scoped per (tenant, kg); can't route otherwise
+        tenant_id, kg_name = scope
+        try:
+            ts = time.time()
+            raw = await self._detect_spatial_intent(question, ontology)
+            intent = parse_spatial_intent(raw) if raw else None
+            timing["spatial_intent_ms"] = round((time.time() - ts) * 1000, 1)
+            if intent is None:
+                return None
+
+            from cograph_client.spatiotemporal.registry import get_spatiotemporal_index
+
+            index = get_spatiotemporal_index()
+
+            # Temporal predicate: a single instant (as_of) wins over a window.
+            as_of = _parse_iso_dt(intent.as_of)
+            window = None
+            if as_of is None and (intent.time_from or intent.time_to):
+                window = (_parse_iso_dt(intent.time_from), _parse_iso_dt(intent.time_to))
+
+            tq = time.time()
+            if intent.kind == "radius":
+                coords = await self._resolve_anchor_coords(intent.anchor, data_graph)
+                if coords is None:
+                    return None  # "near X" but X didn't resolve → fall through
+                lon, lat = coords
+                hits = await index.query_radius(
+                    tenant_id, lon, lat, intent.radius_m,
+                    kg_name=kg_name, time_window=window, as_of=as_of,
+                )
+            else:  # bbox
+                min_lon, min_lat, max_lon, max_lat = intent.bbox
+                hits = await index.query_bbox(
+                    tenant_id, min_lon, min_lat, max_lon, max_lat,
+                    kg_name=kg_name, time_window=window, as_of=as_of,
+                )
+            timing["spatial_index_ms"] = round((time.time() - tq) * 1000, 1)
+
+            hits = filter_by_type(hits, intent.target_type)
+            answer = format_spatial_answer(hits, intent)
+            timing["spatial_routed"] = "true"
+            timing["total_ms"] = round((time.time() - t0) * 1000, 1)
+            return NLResult(
+                answer=answer,
+                sparql="",
+                explanation="Answered from the spatio-temporal index (no SPARQL).",
+                ontology=ontology,
+                narrative_answer=answer,
+                functions_invoked=[],
+                timing=timing,
+            )
+        except Exception:
+            logger.warning("spatial_fast_path_failed", exc_info=True)
+            return None
+
+    async def _detect_spatial_intent(self, question: str, ontology: str) -> dict | None:
+        """LLM classify: is this a servable spatial lookup, and with what params?
+        Returns the raw JSON dict (caller parses) or None on error."""
+        user = (
+            f"Question: {question}\n\n"
+            f"Knowledge-graph types/attributes (for the target type, if any):\n"
+            f"{ontology[:2000]}"
+        )
+        try:
+            return await self._structured_llm(
+                SPATIAL_INTENT_SYSTEM, user, "spatial_intent", SPATIAL_INTENT_SCHEMA
+            )
+        except Exception:
+            logger.warning("spatial_intent_detect_failed", exc_info=True)
+            return None
+
+    async def _resolve_anchor_coords(self, anchor, data_graph: str):
+        """Resolve a radius anchor to ``(lon, lat)``: explicit coords, else a KG
+        entity matched by ``entity_description`` (one Neptune lookup). None if
+        unresolved — the caller then falls through to the SPARQL path."""
+        if anchor is None:
+            return None
+        if anchor.has_coords():
+            return (anchor.lon, anchor.lat)
+        if not anchor.entity_description:
+            return None
+        return await self._resolve_anchor_via_neptune(
+            anchor.entity_description, data_graph
+        )
+
+    async def _resolve_anchor_via_neptune(self, description: str, data_graph: str):
+        """Find a KG entity whose label/text contains ``description`` AND that
+        carries a ``geo:wktLiteral``; return that point's ``(lon, lat)`` or None.
+
+        One scoped SELECT, LIMIT 1. The description is sanitized before it is
+        interpolated into the FILTER literal."""
+        desc = _sanitize_sparql_literal(description)
+        for article in ("the ", "a ", "an "):
+            if desc.startswith(article):
+                desc = desc[len(article):]
+        if not desc:
+            return None
+        q = (
+            f"SELECT ?wkt FROM <{data_graph}> WHERE {{ "
+            f"?e ?lp ?lbl . "
+            f'FILTER(isLiteral(?lbl) && CONTAINS(LCASE(STR(?lbl)), "{desc}")) '
+            f"?e ?gp ?wkt . "
+            f"FILTER(datatype(?wkt) = <{_GEO_WKT_URI}>) "
+            f"}} LIMIT 1"
+        )
+        try:
+            raw = await self.neptune.query(q)
+            _, rows = parse_sparql_results(raw)
+        except Exception:
+            logger.warning("anchor_resolve_failed", exc_info=True)
+            return None
+        if not rows:
+            return None
+        return _parse_point_wkt(rows[0].get("wkt", ""))
+
+    async def _structured_llm(
+        self, system: str, user: str, schema_name: str, schema: dict
+    ) -> dict:
+        """Provider-agnostic structured-JSON call for non-SPARQL classifiers (e.g.
+        spatial-intent detection). Mirrors :meth:`_generate_sparql`'s provider
+        selection but is a SEPARATE method on purpose — the SPARQL generators stay
+        byte-identical so evals are unaffected."""
+        if self._query_provider == "cerebras" and self._cerebras_key:
+            endpoint = "https://api.cerebras.ai/v1/chat/completions"
+            key, model = self._cerebras_key, self._query_model
+        elif self._openrouter_key:
+            endpoint = f"{OPENROUTER_BASE}/chat/completions"
+            key, model = self._openrouter_key, self._query_model
+        else:
+            return await self._structured_via_anthropic(system, user, schema)
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "temperature": 0,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+                    },
+                },
+            )
+            res.raise_for_status()
+            text = res.json()["choices"][0]["message"]["content"].strip()
+            if text.startswith("```"):
+                text = "\n".join(
+                    l for l in text.split("\n") if not l.strip().startswith("```")
+                )
+            return json.loads(text)
+
+    async def _structured_via_anthropic(self, system: str, user: str, schema: dict) -> dict:
+        message = await self.anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+        )
+        return json.loads(message.content[0].text)
 
     async def select_entity_uris(
         self,
