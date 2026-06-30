@@ -323,6 +323,14 @@ class WebIngestCapability:
             )
             await job_store.create(job)
 
+        # Thread the tracked job id into the provider context so a URL-targeted
+        # provider that resumes asynchronously (e.g. a webhook-driven adapter) can
+        # correlate its callback back to THIS job. Generic + optional: providers
+        # that don't need it ignore the key, and it's absent when discovery runs
+        # without a job store (bare/test context), so nothing depends on it.
+        if job is not None:
+            pctx = {**pctx, "job_id": job.id}
+
         async def _run() -> None:
             if job is not None and job_store is not None:
                 job.status = JobStatus.running
