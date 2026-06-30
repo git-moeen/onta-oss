@@ -282,10 +282,20 @@ class SchemaResolver:
         rows_dropped = 0
 
         if len(chunks) <= 1:
-            # Small content — single extraction (original path)
-            extraction = await self._extract(content, content_type, existing_types)
+            # Small content — single extraction. JSON STILL routes through the
+            # truncation-recovery helper (FIX 1): even one chunk's reified output
+            # (each row → Model + reified Score + Organization + relationships) can
+            # exceed max_tokens and get truncated, and bare _extract would then
+            # silently return ZERO entities for the whole pull. Recovery splits +
+            # retries down to the floor so a single chunk can't vanish.
             if is_json:
                 rows_in = json_array_len(content)
+                extraction, dropped = await self._extract_json_chunk_with_recovery(
+                    content, existing_types,
+                )
+                rows_dropped += dropped
+            else:
+                extraction = await self._extract(content, content_type, existing_types)
         else:
             # Multiple chunks — extract each, deduplicate entities
             merged_entities = []

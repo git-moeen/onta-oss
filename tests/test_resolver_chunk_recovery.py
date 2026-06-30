@@ -110,6 +110,35 @@ async def test_dense_chunk_recovers_by_splitting_no_records_lost(mock_neptune, m
 
 
 @pytest.mark.asyncio
+async def test_single_chunk_json_recovers_by_splitting(mock_neptune, mock_cache):
+    """REGRESSION (live): 11 records fit in ONE 25-record chunk, so ingest takes
+    the ``len(chunks) <= 1`` branch — which previously used bare _extract with NO
+    recovery, so a truncated reified output silently returned ZERO entities and
+    the whole pull vanished. The single-chunk JSON path must now route through
+    recovery too: the 11-record chunk fails, splits, and every record lands."""
+    resolver = SchemaResolver(mock_neptune, "fake-key", mock_cache)
+    records = _make_records(11)
+    content = json.dumps(records)
+
+    calls: list[int] = []
+    # Succeeds at <=6: the single 11-record chunk fails (truncates), each half wins.
+    fake_extract = _fake_extract_factory(success_max=6, calls=calls)
+
+    with patch.object(resolver, "_extract", side_effect=fake_extract):
+        with patch.object(resolver, "_fetch_ontology", return_value=({}, {})):
+            result = await resolver.ingest(content, "test-tenant", content_type="json")
+
+    assert result.rows_in == 11
+    assert result.rows_dropped == 0
+    assert result.entities_extracted == 11
+    assert result.entities_resolved == 11
+    # The full single chunk was attempted (11) then split smaller — recovery ran
+    # on the single-chunk path (the bug was that it didn't).
+    assert 11 in calls, calls
+    assert any(0 < c < 11 for c in calls), calls
+
+
+@pytest.mark.asyncio
 async def test_unrecoverable_chunk_is_accounted_not_silently_dropped(mock_neptune, mock_cache):
     """If a chunk can NEVER be extracted (fails even at the minimum size), its
     records must surface in rows_dropped — the run is not presented as complete
