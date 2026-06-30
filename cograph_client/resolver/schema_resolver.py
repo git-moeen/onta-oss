@@ -127,7 +127,14 @@ manufacturer, organization, or brand (a value that repeats across records and \
 names a real-world actor), create an "Organization" entity per distinct value and \
 relate to it (e.g. provided_by / published_by / made_by) instead of leaving it a \
 string. Do NOT lift free-form descriptive text or a one-off label that names no \
-actor.
+actor. Also do NOT mint as an Organization: (a) the data SOURCE, benchmark, \
+leaderboard, dataset, index, or publication name ITSELF — that names the artifact, \
+not an actor; the publisher is the company that OPERATES it, so attribute \
+publication to that operating company, never to the dataset's own name; or (b) \
+baseline, placeholder, or null-like values ("Human", "Unknown", "N/A", "None", \
+"-", "other", "self", "none"). When the only provider/source string available is \
+the dataset's own name or such a placeholder, OMIT the organization rather than \
+inventing one.
 
 Subtypes with a description:
 When a measurement or entity is a SPECIALIZED KIND of a more general type (e.g. a \
