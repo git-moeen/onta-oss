@@ -48,14 +48,18 @@ def chunk_text(content: str, max_chars: int = 3000, overlap: int = 200) -> list[
     return chunks if chunks else [content]
 
 
-def chunk_json_array(content: str, batch_size: int = 50) -> list[str]:
+def chunk_json_array(content: str, batch_size: int = 25) -> list[str]:
     """Split a JSON array into batches of objects.
 
     If the root is not an array, returns the content as a single chunk.
 
     Args:
         content: JSON string.
-        batch_size: Number of objects per chunk.
+        batch_size: Number of objects per chunk. Defaults to 25 (down from 50):
+            the reification/lift extraction prompt emits several
+            entities+relationships PER record, so a denser chunk's JSON output
+            can exceed the LLM's max_tokens and get truncated — a smaller batch
+            keeps each extraction comfortably under the cap.
 
     Returns:
         List of JSON string chunks.
@@ -77,3 +81,41 @@ def chunk_json_array(content: str, batch_size: int = 50) -> list[str]:
         chunks.append(json.dumps(batch, default=str))
 
     return chunks
+
+
+def split_json_array_chunk(chunk: str) -> list[str]:
+    """Split one JSON-array chunk string into two halves (recovery helper).
+
+    Used by the ingest extraction loop to RECOVER a chunk whose extraction
+    yielded nothing (e.g. the LLM output was truncated at max_tokens, so the
+    JSON failed to parse and the whole batch would otherwise be silently lost).
+    Splitting and retrying each half shrinks the per-call output until it fits.
+
+    Returns the two half-chunks (as JSON strings). Returns ``[]`` if the chunk
+    isn't a JSON array or holds fewer than 2 records — i.e. it can't be split
+    further, signalling the caller to stop recursing.
+    """
+    try:
+        data = json.loads(chunk)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list) or len(data) < 2:
+        return []
+    mid = len(data) // 2
+    return [
+        json.dumps(data[:mid], default=str),
+        json.dumps(data[mid:], default=str),
+    ]
+
+
+def json_array_len(chunk: str) -> int:
+    """Number of records in a JSON-array chunk string; 0 if not an array.
+
+    Lets the ingest loop tell "this chunk genuinely had records but extraction
+    returned zero" (a loss to recover) from "this chunk was legitimately empty".
+    """
+    try:
+        data = json.loads(chunk)
+    except json.JSONDecodeError:
+        return 0
+    return len(data) if isinstance(data, list) else 0

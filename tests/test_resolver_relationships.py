@@ -69,6 +69,19 @@ class TestExtractionPrompt:
     def test_user_template_has_parent_type_field(self):
         assert "parent_type" in EXTRACTION_USER_TEMPLATE
 
+    def test_system_prompt_has_domain_modeling_guidance(self):
+        """The new domain-modeling blocks must be present (Cause 2): reify
+        measurements, lift providers/orgs, subtypes with a description."""
+        assert "Reify measurements" in EXTRACTION_SYSTEM
+        assert "Lift providers / organizations" in EXTRACTION_SYSTEM
+        assert "Subtypes with a description" in EXTRACTION_SYSTEM
+        # The guidance names the concrete signals the resolver downstream relies on.
+        assert "subtype_description" in EXTRACTION_SYSTEM
+        assert "Organization" in EXTRACTION_SYSTEM
+
+    def test_user_template_has_subtype_description_field(self):
+        assert "subtype_description" in EXTRACTION_USER_TEMPLATE
+
 
 # ---------------------------------------------------------------------------
 # 2. Type placement: same_as
@@ -310,3 +323,202 @@ class TestRelationshipRegistration:
         update_calls = [str(c) for c in mock_neptune.update.call_args_list]
         insert_calls = " ".join(update_calls)
         assert "onto/lives_in" in insert_calls
+
+
+# ---------------------------------------------------------------------------
+# 5. Domain modeling: reified measurements, lifted orgs, described subtypes
+# ---------------------------------------------------------------------------
+
+
+class TestDomainModeling:
+    """The extraction pipeline (Cause 2) must normalize a web/document ingest into
+    a richer ontology — a Model, a lifted Organization, a Score REIFIED as its own
+    entity, and a HumannessIndex SUBTYPE of Score carrying an rdfs:comment — rather
+    than flattening everything onto one type. _extract is mocked, so this asserts
+    the RESOLVE→INSERT behavior the strengthened prompt is meant to drive."""
+
+    @staticmethod
+    def _new_type_matcher(monkeypatch, resolver):
+        """Force every proposed type to resolve as genuinely-new (DIFFERENT),
+        hermetically — no LLM, no embeddings. Real behavior for brand-new types;
+        subtyping is then driven by parent_chain in _link_parent."""
+        from cograph_client.resolver.models import MatchVerdict, TypeMatch
+
+        async def fake_match(proposed_type, proposed_description, existing_types):
+            return TypeMatch(
+                proposed=proposed_type, resolved=proposed_type,
+                verdict=MatchVerdict.DIFFERENT, confidence=1.0, is_new=True,
+            )
+
+        monkeypatch.setattr(resolver._type_matcher, "match", fake_match)
+
+    @pytest.mark.asyncio
+    async def test_json_ingest_reifies_score_lifts_org_and_describes_subtype(
+        self, mock_neptune, mock_cache, monkeypatch,
+    ):
+        resolver = SchemaResolver(mock_neptune, "fake-key", mock_cache)
+        self._new_type_matcher(monkeypatch, resolver)
+
+        DESC = "a score measuring how human a generated voice sounds"
+        # The normalized shape the strengthened extractor is meant to produce from
+        # a "TTS models and their scores" leaderboard ingest.
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedEntity(
+                    type_name="Model", id="eleven-v3",
+                    attributes=[ExtractedAttribute(name="modality", value="tts")],
+                ),
+                ExtractedEntity(
+                    type_name="Organization", id="ElevenLabs",
+                    attributes=[ExtractedAttribute(name="homepage", value="elevenlabs.io")],
+                ),
+                ExtractedEntity(
+                    type_name="HumannessIndex", id="eleven-v3-humanness",
+                    parent_chain=["Score"],
+                    subtype_description=DESC,
+                    attributes=[
+                        ExtractedAttribute(name="value", value="87.5", datatype="float"),
+                        ExtractedAttribute(
+                            name="timestamp", value="2026-06-01T00:00:00Z",
+                            datatype="datetime",
+                        ),
+                    ],
+                ),
+            ],
+            relationships=[
+                ExtractedRelationship(
+                    source_id="eleven-v3", predicate="has_score",
+                    target_id="eleven-v3-humanness",
+                ),
+                ExtractedRelationship(
+                    source_id="eleven-v3-humanness", predicate="provided_by",
+                    target_id="ElevenLabs",
+                ),
+            ],
+        )
+
+        content = json.dumps([{"name": "Eleven v3", "humanness": "87.5"}])
+        with patch.object(resolver, "_extract", return_value=extraction):
+            with patch.object(resolver, "_fetch_ontology", return_value=({}, {})):
+                result = await resolver.ingest(content, "test-tenant", content_type="json")
+
+        update_calls = " ".join(str(c) for c in mock_neptune.update.call_args_list)
+
+        # --- types: Model, Organization, Score (synthesized parent) + the
+        #     HumannessIndex subtype were all created.
+        for t in ("Model", "Organization", "Score", "HumannessIndex"):
+            assert t in result.types_created, f"{t} not created: {result.types_created}"
+
+        # --- the subtype edge HumannessIndex subClassOf Score.
+        assert (
+            f"<{type_uri('HumannessIndex')}> "
+            "<http://www.w3.org/2000/01/rdf-schema#subClassOf> "
+            f"<{type_uri('Score')}>"
+        ) in update_calls
+
+        # --- HumannessIndex carries the description as an rdfs:comment, threaded
+        #     through insert_type(graph, name, subtype_description). Score (the
+        #     synthesized ancestor) gets NO comment — only the minted subtype does.
+        assert (
+            f"<{type_uri('HumannessIndex')}> "
+            f'<http://www.w3.org/2000/01/rdf-schema#comment> "{DESC}"'
+        ) in update_calls
+        assert (
+            f"<{type_uri('Score')}> "
+            "<http://www.w3.org/2000/01/rdf-schema#comment>"
+        ) not in update_calls
+
+        # --- relationships became object properties (entity→entity edges), not
+        #     scalar attributes: has_score (Model→HumannessIndex) and provided_by
+        #     (HumannessIndex→Organization).
+        assert "Model.has_score" in result.attributes_added
+        assert "HumannessIndex.provided_by" in result.attributes_added
+        assert "onto/has_score" in update_calls
+        assert "onto/provided_by" in update_calls
+        # provided_by's ontology range points at the Organization type.
+        assert (
+            f"HumannessIndex/attrs/provided_by" in update_calls
+            and type_uri("Organization") in update_calls
+        )
+
+        # --- the reified Score's measurement values are TYPED literals on the
+        #     HumannessIndex entity (value:float, timestamp:datetime) — the
+        #     measurement is an entity with its own attributes, not a bare scalar.
+        assert (
+            'HumannessIndex/attrs/value> "87.5"'
+            "^^<http://www.w3.org/2001/XMLSchema#float>"
+        ) in update_calls
+        # (the validator coerces the datetime to xsd form, dropping the 'Z').
+        assert (
+            "HumannessIndex/attrs/timestamp> "
+            '"2026-06-01T00:00:00"'
+            "^^<http://www.w3.org/2001/XMLSchema#dateTime>"
+        ) in update_calls
+
+        # --- all three entities resolved (Model, Organization, HumannessIndex).
+        assert result.entities_resolved == 3
+
+    @pytest.mark.asyncio
+    async def test_plain_json_ingest_without_domain_signals_still_works(
+        self, mock_neptune, mock_cache, monkeypatch,
+    ):
+        """Regression: an ordinary ingest whose extraction sets NO
+        subtype_description / parent_chain / reified measurement still ingests
+        cleanly — the new field + prompt must not break the common case."""
+        resolver = SchemaResolver(mock_neptune, "fake-key", mock_cache)
+        self._new_type_matcher(monkeypatch, resolver)
+
+        extraction = ExtractionResult(
+            entities=[
+                ExtractedEntity(
+                    type_name="Article", id="a1",
+                    attributes=[ExtractedAttribute(name="title", value="Hello")],
+                ),
+            ],
+            relationships=[],
+        )
+
+        content = json.dumps([{"title": "Hello"}])
+        with patch.object(resolver, "_extract", return_value=extraction):
+            with patch.object(resolver, "_fetch_ontology", return_value=({}, {})):
+                result = await resolver.ingest(content, "test-tenant", content_type="json")
+
+        assert "Article" in result.types_created
+        assert result.entities_resolved == 1
+        # The minted type carries NO comment (subtype_description defaulted None →
+        # insert_type got "" → no rdfs:comment triple).
+        update_calls = " ".join(str(c) for c in mock_neptune.update.call_args_list)
+        assert (
+            f"<{type_uri('Article')}> "
+            "<http://www.w3.org/2000/01/rdf-schema#comment>"
+        ) not in update_calls
+
+
+# ---------------------------------------------------------------------------
+# 6. ExtractedEntity model round-trips the new subtype_description field
+# ---------------------------------------------------------------------------
+
+
+class TestExtractedEntityModel:
+    def test_subtype_description_round_trips(self):
+        desc = "a score measuring how human a generated voice sounds"
+        e = ExtractedEntity(
+            type_name="HumannessIndex",
+            id="x",
+            parent_chain=["Score"],
+            subtype_description=desc,
+            attributes=[ExtractedAttribute(name="value", value="9.1", datatype="float")],
+        )
+        dumped = e.model_dump()
+        assert dumped["subtype_description"] == desc
+        # Round-trips back through validation unchanged.
+        again = ExtractedEntity(**dumped)
+        assert again.subtype_description == desc
+        assert again.parent_chain == ["Score"]
+
+    def test_subtype_description_defaults_none(self):
+        e = ExtractedEntity(type_name="Article", id="a1")
+        assert e.subtype_description is None
+        # Parses from a payload that omits the field entirely (back-compat).
+        from_payload = ExtractedEntity(**{"type_name": "Article", "id": "a1"})
+        assert from_payload.subtype_description is None

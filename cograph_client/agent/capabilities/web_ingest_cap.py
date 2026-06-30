@@ -17,10 +17,15 @@ accurately and the user doesn't have to run a separate enrichment afterward:
    instruction so the next turn converges.
 2. Once attributes are confirmed, ``plan`` fetches a cheap SAMPLE constrained to
    those attributes and runs the SAME multi-type + relationship extractor the
-   commit uses against it — so the plan card previews the real ontology shape the
-   ingest will mint (the distinct entity types, their attributes, and the edges
-   between them), not a flat pre-named type. If the extractor can't run the
-   preview degrades to a flat single-type card (the turn never 500s).
+   commit uses against it — so the plan card shows an ESTIMATE of the ontology
+   shape the ingest will mint (the distinct entity types, their attributes, and
+   the edges between them), not a flat pre-named type. The estimate comes from an
+   8-row sample run through a non-deterministic extractor, so the full commit
+   (over many more records) may surface additional types/relationships or differ
+   in detail. What IS stable across preview and commit is the FETCH hint
+   (``hint_columns``) — the column projection sent to the provider. If the
+   extractor can't run, the preview degrades to a flat single-type card (the turn
+   never 500s).
 3. ``execute`` fetches the FULL set (targeting the same attributes) and ingests
    it through :meth:`SchemaResolver.ingest` (``content_type="json"``) — the
    identical extract→resolve→insert path document ingest commits through, which
@@ -150,17 +155,30 @@ class WebIngestCapability:
             return [_clarify_step(type_name, key_attr, suggested)]
 
         # Commit: use the confirmed set, or fall back to the suggested set if we
-        # already asked once (don't loop).
+        # already asked once (don't loop). These drive entity naming + the
+        # preview card — NOT the fetch breadth.
         attributes = confirmed if len(confirmed) > 1 else suggested
 
-        # 2. Cheap sample, constrained to the chosen attributes. In URL mode the
-        #    provider extracts the sample FROM the supplied pages.
+        # Decouple the PROVIDER FETCH from the user's minimal named attributes
+        # (Cause 1): every provider PROJECTS rows to hint_columns, so passing the
+        # confirmed minimal set (e.g. [name, score]) drops the rest of the table
+        # (provider, rating, latency, price, votes) before extraction can model
+        # the domain. Build a COMPREHENSIVE hint = key ∪ confirmed ∪ suggested
+        # (the suggested set is the LLM's richer guess at web-discoverable
+        # columns), so the provider returns a rich table the extractor can
+        # normalize into Model/Organization/Score/etc. The confirmed set still
+        # drives naming + preview above.
+        hint_columns = _dedupe([key_attr, *confirmed, *suggested])
+
+        # 2. Cheap sample fetched with the COMPREHENSIVE hint so the preview sees
+        #    the same rich table the commit will. In URL mode the provider
+        #    extracts the sample FROM the supplied pages.
         try:
             sample = await provider.discover(
                 query,
                 sample=True,
                 max_rows=_SAMPLE_ROWS,
-                hint_columns=attributes,
+                hint_columns=hint_columns,
                 context=_provider_context(ctx),
                 urls=urls or None,
             )
@@ -186,9 +204,11 @@ class WebIngestCapability:
         # the ingest will mint. No-op when the provider supplied no provenance.
         _attach_source_urls(sample.rows, getattr(sample, "provenance", None) or {})
 
-        # 3. Preview the DISCOVERED ontology shape from the sample — run the same
+        # 3. Estimate the DISCOVERED ontology shape from the sample — run the same
         #    multi-type + relationship extractor the commit will, so the plan card
-        #    shows the real types/edges the ingest will mint (not a flat mapping).
+        #    shows the LIKELY types/edges the ingest will mint (not a flat
+        #    mapping). It's an estimate from the small sample, not a guarantee:
+        #    the full commit may surface more types/edges or differ in detail.
         est_total = sample.estimated_total or len(sample.rows)
         cap = _DEFAULT_PLAN_CAP
         cost = _estimate_cost(provider, est_total, cap)
@@ -213,11 +233,17 @@ class WebIngestCapability:
                 "query": query,
                 "proposed_type": type_name,
                 "attributes": attributes,
+                # The COMPREHENSIVE fetch hint (key ∪ confirmed ∪ suggested) —
+                # persisted so the full fetch in execute() uses the SAME rich
+                # projection the sample did. The FETCH is the part that's stable
+                # preview→commit; the discovered TYPES/edges are only an estimate
+                # from the sample.
+                "hint_columns": hint_columns,
                 "max_rows": cap,
                 "kg_name": ctx.kg_name,
                 "provider": provider.name,
-                # Persist the explicit URLs so execute() re-passes them (preview ==
-                # commit). Empty in plain query-discovery mode.
+                # Persist the explicit URLs so execute() re-passes them (the same
+                # pages are fetched at commit). Empty in plain query-discovery mode.
                 "urls": urls,
             },
             rationale=(
@@ -227,9 +253,9 @@ class WebIngestCapability:
             confidence=0.7,
             preview={
                 "summary": (
-                    f"Discovered {len(discovered_types)} type(s) and "
-                    f"{len(relationships)} relationship(s) from a sample; "
-                    f"capped at {cap}, staged for review."
+                    f"Estimated ~{len(discovered_types)} type(s) and "
+                    f"{len(relationships)} relationship(s) from a sample (the "
+                    f"full pull may differ); capped at {cap}, staged for review."
                 ),
                 "discovered_types": discovered_types,
                 "relationships": relationships,
@@ -256,6 +282,12 @@ class WebIngestCapability:
 
         query = p["query"]
         attributes = p.get("attributes") or []
+        # COMPREHENSIVE fetch hint persisted at plan time so the full pull uses the
+        # SAME rich projection the sample did — the column projection is the stable
+        # part of the preview (the discovered shape was only an estimate). Older
+        # persisted steps predate this key — fall back to the named attributes so
+        # they still run (graceful degradation).
+        hint_columns = p.get("hint_columns") or attributes
         proposed_type = p.get("proposed_type") or "WebRecord"
         cap = int(p.get("max_rows") or _DEFAULT_PLAN_CAP)
         kg_name = p.get("kg_name") or ctx.kg_name
@@ -306,7 +338,7 @@ class WebIngestCapability:
                     query,
                     sample=False,
                     max_rows=cap,
-                    hint_columns=attributes,
+                    hint_columns=hint_columns,
                     context=pctx,
                     urls=urls or None,
                 )
@@ -441,7 +473,7 @@ STRICT JSON only (no markdown):
   "key_attribute": "<the natural identifier, usually 'name', snake_case>",
   "query": "<a clean, concise SEARCH SUBJECT — the thing to find on the web, with all conversational framing removed>",
   "confirmed_attributes": ["<attributes the user EXPLICITLY named; [] if they only named the entity>"],
-  "suggested_attributes": ["<3-6 useful, web-discoverable attributes for this entity, snake_case, excluding the key>"]
+  "suggested_attributes": ["<a COMPREHENSIVE set (6-12) of web-discoverable columns for this entity, snake_case, excluding the key>"]
 }
 RULES:
 - query: the SUBJECT to search for, NOT the user's literal sentence. Strip \
@@ -457,8 +489,15 @@ Keep it short and specific; do NOT include words like "ingest", "add", "list of"
 names and pricing" -> ["name","pricing"]; "a list of models" -> []. When the user \
 replies with a list (e.g. "Use these: name, provider, pricing" or "just the name") \
 treat THOSE as confirmed. snake_case; exclude nothing they named.
-- suggested_attributes: a sensible default set the user is likely to want, \
-snake_case, EXCLUDING the key. For Model: ["provider","open_source","context_length","input_price","modality"]."""
+- suggested_attributes: a COMPREHENSIVE set (aim for 6-12) of the columns this \
+entity is typically described by ON THE WEB — every web-discoverable property a \
+rich source table (leaderboard, catalog, listing) would carry, snake_case, \
+EXCLUDING the key. This is the FETCH hint: the provider projects rows to it, so a \
+thin list silently drops the rest of the table before extraction. Be generous and \
+include any recurring provider/vendor/organization column and any score/rating/ \
+price/ranking column (those become reified entities downstream). For Model: \
+["provider","organization","open_source","context_length","input_price",\
+"output_price","modality","latency","rating","score","votes","release_date"]."""
 
 
 async def _resolve_spec(ctx: AgentContext, instruction: str) -> dict:
@@ -549,13 +588,16 @@ async def _preview_shape(
     resolver, sample_rows: list[dict], existing_types: set[str]
 ) -> dict:
     """Run the SAME multi-type extractor the commit uses against the sample so the
-    plan card previews the real ontology shape the ingest will mint: the distinct
+    plan card ESTIMATES the ontology shape the ingest will mint: the distinct
     entity types (with their attributes + parent chain + is_new flag) and the
     relationships between them, mapped from entity ids to their types.
 
-    Mirrors the engine that document ingest routes through — instead of forcing
-    one flat pre-named type. Caller wraps this in try/except so any extractor
-    failure degrades to a flat single-type preview (the turn never 500s)."""
+    This is an estimate from the small sample, not a guarantee — the extractor is
+    non-deterministic and the full commit runs over many more records, so it may
+    surface additional types/relationships or differ in detail. Mirrors the engine
+    that document ingest routes through — instead of forcing one flat pre-named
+    type. Caller wraps this in try/except so any extractor failure degrades to a
+    flat single-type preview (the turn never 500s)."""
     extraction = await resolver._extract(
         json.dumps(sample_rows, default=str, ensure_ascii=False),
         "json",

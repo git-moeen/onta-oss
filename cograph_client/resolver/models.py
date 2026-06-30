@@ -47,6 +47,17 @@ class ExtractedEntity(BaseModel):
             "two unrelated things."
         ),
     )
+    subtype_description: str | None = Field(
+        default=None,
+        description=(
+            "A brief, human-readable definition of type_name, set ONLY when "
+            "type_name is a NEW specialized kind (a subtype) the extractor is "
+            "minting — e.g. a 'HumannessIndex' subtype of Score: \"a score "
+            "measuring how human a generated voice sounds\". Written as the new "
+            "type's rdfs:comment so the ontology carries the definition. Leave "
+            "null for pre-existing types and ordinary top-level types."
+        ),
+    )
     attributes: list[ExtractedAttribute] = Field(default_factory=list)
 
 

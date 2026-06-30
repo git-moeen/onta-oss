@@ -32,6 +32,7 @@ from cograph_client.graph.ontology_queries import (
     parent_map_query,
     set_object_property_range,
     type_uri,
+    upsert_type,
     attr_uri,
 )
 from cograph_client.graph.layers import LayerStack, type_name_from_uri
@@ -106,6 +107,35 @@ attributes and relationships added later; literals are dead ends. Only use liter
 attributes for truly atomic values: numbers, dates, booleans, short enums, or \
 identifiers.
 
+Reify measurements:
+When a value is a MEASUREMENT, METRIC, or other observation that can CHANGE OVER \
+TIME or carries PROVENANCE (a score, rating, price, ranking, benchmark result), \
+model it as its OWN entity (e.g. type_name "Score", "Rating", "Price") with \
+attributes "value" and, when available, "timestamp"/"as_of" — plus relationships \
+linking it to the thing measured and to the provider/publisher that produced it. \
+Name that producer relationship "measured_by" / "reported_by" / "published_by" / \
+"produced_by" (NEVER the bare predicate "source" — that collides with internal \
+housekeeping). Reify INSTEAD of a bare scalar attribute on the parent: a bare \
+number loses its history and its provenance the moment a newer reading arrives. \
+Reify only genuine observations; do NOT reify a fixed intrinsic property (a \
+person's birth_year, a product's sku).
+
+Lift providers / organizations:
+When records carry a recurring CATEGORICAL naming a provider, vendor, publisher, \
+manufacturer, organization, or brand (a value that repeats across records and \
+names a real-world actor), create an "Organization" entity per distinct value and \
+relate to it (e.g. provided_by / published_by / made_by) instead of leaving it a \
+string. Do NOT lift free-form descriptive text or a one-off label that names no \
+actor.
+
+Subtypes with a description:
+When a measurement or entity is a SPECIALIZED KIND of a more general type (e.g. a \
+"Humanness Index" is a kind of Score; a "Condo" is a kind of Property), emit it \
+as a subtype via parent_chain AND set subtype_description to a brief sentence \
+explaining what it is / what it measures. The description becomes the new type's \
+definition in the ontology. Set subtype_description ONLY for a new specialized \
+type you are minting — leave it null otherwise.
+
 Respond with valid JSON only. No markdown."""
 
 EXTRACTION_USER_TEMPLATE = """\
@@ -128,6 +158,7 @@ Return JSON:
       "parent_type": "<existing type name if this is a subtype, else null>",
       "parent_chain": ["<immediate parent>", "<grandparent>", "..."],
       "also_types": ["<independent co-type, rare>"],
+      "subtype_description": "<brief definition when minting a NEW specialized subtype, else null>",
       "attributes": [
         {{"name": "attr_name", "value": "attr_value", "datatype": "string"}}
       ]
@@ -152,6 +183,11 @@ class SchemaResolver:
     # must be a NATIVE Anthropic model id. Env-overridable.
     INFER_MODEL = os.environ.get("OMNIX_INFER_MODEL", "claude-opus-4-8")
     ONTOLOGY_REFRESH_INTERVAL = int(os.environ.get("OMNIX_ONTOLOGY_REFRESH_INTERVAL", "50"))
+    # Output ceiling for one extraction call. Raised 4096 → 8192: the
+    # reification/lift prompt makes each record emit MANY more entities +
+    # relationships, so a chunk's JSON can blow past 4096 tokens, get truncated,
+    # fail to parse, and silently drop the whole batch. Env-overridable.
+    EXTRACT_MAX_TOKENS = int(os.environ.get("OMNIX_EXTRACT_MAX_TOKENS", "8192"))
 
     def __init__(
         self,
@@ -227,22 +263,44 @@ class SchemaResolver:
             return await self._ingest_csv(content, graph_uri, existing_types, existing_attrs, source)
 
         # Text/JSON: chunk and process
-        from cograph_client.resolver.chunker import chunk_text, chunk_json_array
-        if content_type in ("json", "jsonl"):
+        from cograph_client.resolver.chunker import (
+            chunk_text,
+            chunk_json_array,
+            json_array_len,
+        )
+        is_json = content_type in ("json", "jsonl")
+        if is_json:
             chunks = chunk_json_array(content)
         else:
             chunks = chunk_text(content)
 
+        # Row-conservation accounting for the JSON path (ADR 0003 §2): a chunk
+        # whose extraction yields nothing (e.g. truncated output) must not vanish
+        # silently. We count records IN and records DROPPED so the run can never
+        # be presented as complete while a whole batch was lost.
+        rows_in = 0
+        rows_dropped = 0
+
         if len(chunks) <= 1:
             # Small content — single extraction (original path)
             extraction = await self._extract(content, content_type, existing_types)
+            if is_json:
+                rows_in = json_array_len(content)
         else:
             # Multiple chunks — extract each, deduplicate entities
             merged_entities = []
             merged_relationships = []
             seen_ids: set[str] = set()
             for chunk in chunks:
-                extraction = await self._extract(chunk, content_type, existing_types)
+                if is_json:
+                    chunk_rows = json_array_len(chunk)
+                    rows_in += chunk_rows
+                    extraction, dropped = await self._extract_json_chunk_with_recovery(
+                        chunk, existing_types,
+                    )
+                    rows_dropped += dropped
+                else:
+                    extraction = await self._extract(chunk, content_type, existing_types)
                 for e in extraction.entities:
                     if e.id not in seen_ids:
                         merged_entities.append(e)
@@ -254,27 +312,46 @@ class SchemaResolver:
                 source_text=content[:500],
             )
 
-        extraction = extraction  # keep reference for the rest of the pipeline
         logger.info(
             "extraction_complete",
             entities=len(extraction.entities),
             relationships=len(extraction.relationships),
+            rows_in=rows_in,
+            rows_dropped=rows_dropped,
         )
 
         if not extraction.entities:
-            return IngestResult(entities_extracted=0)
+            return IngestResult(
+                entities_extracted=0, rows_in=rows_in, rows_dropped=rows_dropped,
+            )
 
         # Step 3: Resolve types and attributes, validate, insert
         batch_id = str(uuid4())
-        result = IngestResult(entities_extracted=len(extraction.entities), batch_id=batch_id)
+        result = IngestResult(
+            entities_extracted=len(extraction.entities),
+            batch_id=batch_id,
+            rows_in=rows_in,
+            rows_dropped=rows_dropped,
+        )
         entity_uri_map: dict[str, str] = {}  # entity id → URI
         entity_type_map: dict[str, str] = {}  # entity id → resolved type name
 
         try:
-            return await self._resolve_and_insert(
+            final = await self._resolve_and_insert(
                 extraction, graph_uri, existing_types, existing_attrs,
                 source, result, entity_uri_map, entity_type_map, batch_id,
             )
+            # Never present a run as complete while a whole chunk was lost to
+            # truncation (FIX 1): a non-zero drop count after recovery is an
+            # ERROR-level signal carried back on the result for the caller.
+            if final.rows_dropped:
+                logger.error(
+                    "ingest_rows_dropped",
+                    batch_id=batch_id,
+                    rows_in=final.rows_in,
+                    rows_dropped=final.rows_dropped,
+                )
+            return final
         except Exception:
             logger.error(
                 "ingest_failed_rolling_back",
@@ -579,12 +656,16 @@ class SchemaResolver:
         source: str = "",
         instance_graph: str | None = None,
     ) -> IngestResult:
-        """Ingest pre-mapped records (no schema inference) — the web-discovery seam.
+        """Ingest pre-mapped records (no schema inference) — the fixed-mapping seam.
 
         A caller infers a :class:`CSVSchemaMapping` once (e.g. from a sample at
-        plan time) and applies that SAME mapping to the full record set here, so
-        the schema previewed to the user is exactly the schema committed
-        (preview == commit). Records flow through the identical type-resolution,
+        plan time) and applies that SAME mapping to the full record set here. The
+        mapping is applied DETERMINISTICALLY (no LLM, no re-inference), so the
+        schema previewed to the user is exactly the schema committed
+        (preview == commit). This is the CSV path's guarantee; the web-DISCOVERY
+        path instead routes through :meth:`ingest` (the non-deterministic
+        ``_extract``), where the previewed shape is only a sample-based estimate,
+        not an exact match. Records flow through the identical type-resolution,
         batch existence-dedup, ER and batch-insert path CSV ingest uses.
 
         Mirrors :meth:`ingest`'s per-call setup (instance graph, type-matcher
@@ -767,16 +848,25 @@ class SchemaResolver:
             existing_types=types_str,
         )
 
+        truncated = False
         if self.EXTRACT_PROVIDER == "openrouter" and self._openrouter_key:
             text = await self._extract_via_openrouter(user_content)
         else:
             msg = await self._anthropic.messages.create(
                 model=self.INFER_MODEL,
-                max_tokens=4096,
+                max_tokens=self.EXTRACT_MAX_TOKENS,
                 system=EXTRACTION_SYSTEM,
                 messages=[{"role": "user", "content": user_content}],
             )
             text = msg.content[0].text
+            # Explicit truncation signal from the Anthropic SDK: the model hit
+            # the token ceiling mid-output, so the JSON is almost certainly
+            # incomplete. Surface it so a JSON chunk can be split + retried
+            # instead of silently dropping the whole batch. (openrouter_chat
+            # doesn't expose finish_reason; there the json-parse-failure path
+            # below is the truncation signal.)
+            if getattr(msg, "stop_reason", None) == "max_tokens":
+                truncated = True
 
         try:
             # Strip code fences if present
@@ -793,7 +883,16 @@ class SchemaResolver:
                 source_text=content,
             )
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("extraction_parse_error", error=str(e), raw=text[:500])
+            # A parse failure on a TRUNCATED response is the expected symptom of
+            # the output exceeding max_tokens (the recovery loop will split +
+            # retry); log it distinctly so it isn't mistaken for a malformed
+            # model reply.
+            logger.warning(
+                "extraction_parse_error",
+                error=str(e),
+                truncated=truncated,
+                raw=text[:500],
+            )
             return ExtractionResult(source_text=content)
 
     async def _extract_via_openrouter(self, user_content: str) -> str:
@@ -804,8 +903,83 @@ class SchemaResolver:
             user_content,
             model=self.EXTRACT_MODEL,
             temperature=0,
-            max_tokens=4096,
+            max_tokens=self.EXTRACT_MAX_TOKENS,
             timeout=60,
+        )
+
+    # Floor below which a JSON chunk is no longer worth splitting: a handful of
+    # records can't overflow max_tokens, so a still-empty extraction is a genuine
+    # extraction failure to account for, not a truncation to recover.
+    _RECOVERY_MIN_RECORDS = 3
+
+    async def _extract_json_chunk_with_recovery(
+        self, chunk: str, existing_types: dict[str, str],
+    ) -> tuple[ExtractionResult, int]:
+        """Extract one JSON-array chunk, RECOVERING from a silent batch loss.
+
+        The reification/lift prompt makes each record emit many entities +
+        relationships, so a dense chunk's JSON output can exceed the model's
+        ``max_tokens``, get truncated, fail to parse, and return an EMPTY
+        :class:`ExtractionResult` — silently dropping every record in the chunk.
+
+        When that happens (zero entities extracted from a chunk that actually
+        held records) we SPLIT the chunk's JSON array in half and retry each
+        half, recursing down to :attr:`_RECOVERY_MIN_RECORDS`. Smaller chunks
+        produce smaller outputs that fit under the cap. If a minimal chunk still
+        yields nothing it is a real extraction failure: we log at ERROR and
+        return its record count as ``dropped`` so the caller can surface it in
+        row-conservation accounting instead of presenting the run as complete.
+
+        Returns ``(merged_extraction, dropped_record_count)``.
+        """
+        from cograph_client.resolver.chunker import split_json_array_chunk, json_array_len
+
+        extraction = await self._extract(chunk, "json", existing_types)
+        n_records = json_array_len(chunk)
+        # Success, or a genuinely empty chunk (no records to lose) → nothing to recover.
+        if extraction.entities or n_records == 0:
+            return extraction, 0
+
+        # Too small to split further: a few records can't overflow the token
+        # cap, so this is a real extraction failure — account for the loss.
+        if n_records <= self._RECOVERY_MIN_RECORDS:
+            logger.error(
+                "extraction_chunk_dropped",
+                records=n_records,
+                reason="empty_extraction_at_min_chunk",
+            )
+            return extraction, n_records
+
+        halves = split_json_array_chunk(chunk)
+        if not halves:
+            # Couldn't split (not a parseable array) — count the loss.
+            logger.error("extraction_chunk_dropped", records=n_records, reason="unsplittable")
+            return extraction, n_records
+
+        logger.warning(
+            "extraction_chunk_split_retry", records=n_records, halves=len(halves),
+        )
+        merged_entities: list[ExtractedEntity] = []
+        merged_relationships: list[ExtractedRelationship] = []
+        seen_ids: set[str] = set()
+        total_dropped = 0
+        for half in halves:
+            sub_extraction, sub_dropped = await self._extract_json_chunk_with_recovery(
+                half, existing_types,
+            )
+            total_dropped += sub_dropped
+            for e in sub_extraction.entities:
+                if e.id not in seen_ids:
+                    merged_entities.append(e)
+                    seen_ids.add(e.id)
+            merged_relationships.extend(sub_extraction.relationships)
+        return (
+            ExtractionResult(
+                entities=merged_entities,
+                relationships=merged_relationships,
+                source_text=chunk[:500],
+            ),
+            total_dropped,
         )
 
     async def _fetch_ontology(
@@ -1001,6 +1175,7 @@ class SchemaResolver:
           multi-level chain like Condo < Property < Asset in one row (ADR rule 3).
         """
         pt = entity.parent_type
+        linked_as_subtype = False
         if pt and pt in existing_types:
             # Immediate parent exists — link directly, then synthesize any deeper
             # ancestors the extractor named.
@@ -1010,6 +1185,7 @@ class SchemaResolver:
                 parent_chain=entity.parent_chain,
             )
             logger.info("type_new_with_parent", child=entity.type_name, parent=pt)
+            linked_as_subtype = True
         elif entity.parent_chain:
             # Brand-new lineage. We DON'T trust a parent_type that names a
             # non-existing type (preserves the "parent_type must be existing"
@@ -1020,6 +1196,16 @@ class SchemaResolver:
             )
             logger.info(
                 "type_new_lineage", child=entity.type_name, parent=entity.parent_chain[0],
+            )
+            linked_as_subtype = True
+
+        # The caller's top-level mint wrote NO comment (FIX 3): subtype_description
+        # may only describe a real subtype. Now that a parent linkage has made
+        # this type a genuine subtype, upsert the description here (FIX 4: upsert
+        # replaces the single-valued comment, so it stays idempotent on re-ingest).
+        if linked_as_subtype and entity.subtype_description:
+            await self._neptune.update(
+                upsert_type(graph_uri, entity.type_name, entity.subtype_description)
             )
 
     async def _refresh_ontology(
@@ -1089,6 +1275,24 @@ class SchemaResolver:
             seen.add(rt)
         return resolved
 
+    async def _mint_subtype(
+        self, graph_uri: str, type_name: str, subtype_description: str | None,
+    ) -> None:
+        """Create a NEW subtype's type declaration, carrying its description
+        idempotently (FIX 3 + FIX 4).
+
+        When a ``subtype_description`` is present it is written via
+        :func:`upsert_type`, which REPLACES the single-valued ``rdfs:comment``
+        instead of appending — so re-minting the same subtype across ingests
+        can't accumulate duplicate comments. With no description we emit a plain
+        ``insert_type`` (no comment), keeping the common no-description write
+        byte-identical to before.
+        """
+        if subtype_description:
+            await self._neptune.update(upsert_type(graph_uri, type_name, subtype_description))
+        else:
+            await self._neptune.update(insert_type(graph_uri, type_name, ""))
+
     async def _resolve_type(
         self,
         entity: ExtractedEntity,
@@ -1106,8 +1310,11 @@ class SchemaResolver:
                 logger.info("type_same_as_verified", proposed=entity.type_name, resolved=match.resolved)
                 return match.resolved
             elif match.verdict == MatchVerdict.SUBTYPE:
-                sparql = insert_type(graph_uri, entity.type_name, "")
-                await self._neptune.update(sparql)
+                # SUBTYPE branch — subtype_description legitimately describes this
+                # NEW subtype (FIX 3). Written idempotently (FIX 4): upsert
+                # REPLACES the single-valued rdfs:comment so re-minting the same
+                # type across ingests can't accumulate duplicate comments.
+                await self._mint_subtype(graph_uri, entity.type_name, entity.subtype_description)
                 sparql = insert_subtype(graph_uri, match.parent_type, entity.type_name)
                 await self._neptune.update(sparql)
                 logger.info("type_same_as_was_subtype", child=entity.type_name, parent=match.parent_type)
@@ -1128,6 +1335,9 @@ class SchemaResolver:
                 logger.info("type_same_as_trusted", proposed=entity.type_name, resolved=entity.same_as)
                 return entity.same_as
             else:
+                # same_as REJECTED → this is a genuine TOP-LEVEL type, not a
+                # subtype. subtype_description must NOT be written here (FIX 3):
+                # the field's contract is "describes a NEW SUBTYPE" only.
                 sparql = insert_type(graph_uri, entity.type_name, "")
                 await self._neptune.update(sparql)
                 logger.info("type_same_as_rejected", proposed=entity.type_name, claimed=entity.same_as)
@@ -1141,8 +1351,9 @@ class SchemaResolver:
                 logger.info("type_matched_existing", proposed=entity.type_name, resolved=match.resolved)
                 return match.resolved
             elif match.verdict == MatchVerdict.SUBTYPE:
-                sparql = insert_type(graph_uri, entity.type_name, "")
-                await self._neptune.update(sparql)
+                # SUBTYPE branch — subtype_description describes this NEW subtype
+                # (FIX 3), written idempotently via upsert (FIX 4).
+                await self._mint_subtype(graph_uri, entity.type_name, entity.subtype_description)
                 sparql = insert_subtype(graph_uri, match.parent_type, entity.type_name)
                 await self._neptune.update(sparql)
                 logger.info("type_subtype", child=entity.type_name, parent=match.parent_type)
@@ -1156,6 +1367,10 @@ class SchemaResolver:
                 )
                 return entity.type_name
             elif match.verdict == MatchVerdict.FLAGGED:
+                # Top-level mint: do NOT write subtype_description here (FIX 3).
+                # If _link_parent then establishes a parent (the entity carried a
+                # parent_type/parent_chain), it upserts the description there —
+                # the only place the type is actually a subtype.
                 sparql = insert_type(graph_uri, entity.type_name, "")
                 await self._neptune.update(sparql)
                 result.types_created.append(entity.type_name)
@@ -1166,6 +1381,8 @@ class SchemaResolver:
                 result.flagged_types.append(entity.type_name)
                 return entity.type_name
             else:
+                # Top-level mint: no subtype_description here (FIX 3). _link_parent
+                # upserts it iff this turns out to be a subtype (parent_chain).
                 sparql = insert_type(graph_uri, entity.type_name, "")
                 await self._neptune.update(sparql)
                 result.types_created.append(entity.type_name)
