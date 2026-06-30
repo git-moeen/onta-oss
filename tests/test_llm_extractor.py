@@ -80,6 +80,35 @@ async def test_llm_extract_error_collapses_to_none(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_llm_extract_null_content_returns_none(monkeypatch):
+    # OpenRouter can return content: null (empty/refused/tool-only completion),
+    # surfacing here as Python None. Must collapse to None, never raise
+    # (None.strip() in the parser would AttributeError).
+    monkeypatch.setattr(llm_extractor, "_openrouter_key", lambda: "sk-test")
+
+    async def fake_chat(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(llm_extractor, "openrouter_chat", fake_chat)
+
+    out = await llm_extract("ElevenLabs founded 2010", "founded_year", "ElevenLabs")
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_llm_extract_empty_content_returns_none(monkeypatch):
+    monkeypatch.setattr(llm_extractor, "_openrouter_key", lambda: "sk-test")
+
+    async def fake_chat(*args, **kwargs):
+        return ""
+
+    monkeypatch.setattr(llm_extractor, "openrouter_chat", fake_chat)
+
+    out = await llm_extract("ElevenLabs founded 2010", "founded_year", "ElevenLabs")
+    assert out is None
+
+
+@pytest.mark.asyncio
 async def test_llm_extract_no_key_returns_none(monkeypatch):
     monkeypatch.setattr(llm_extractor, "_openrouter_key", lambda: "")
 

@@ -111,6 +111,13 @@ async def llm_extract(
         # than an empty field, so a failed extraction must yield nothing.
         return None
 
+    # OpenRouter can return ``content: null`` (an empty / refused / tool-only
+    # completion), which surfaces here as Python ``None`` — guard before parsing
+    # so the "NEVER raises" contract holds (``_try_parse_json(None)`` would
+    # ``AttributeError`` on ``None.strip()``).
+    if not content:
+        return None
+
     obj = _try_parse_json(content)
     if obj is None or "value" not in obj:
         return None
