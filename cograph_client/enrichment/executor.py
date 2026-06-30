@@ -1170,26 +1170,25 @@ class EnrichmentExecutor:
 
             # Apply phase
             policy = job.conflict_policy
-            if policy == ConflictPolicy.stage:
-                # Stage = hold the found values for human review. But if there
-                # was nothing to stage — every row was a no_match/skip, so
-                # ``job.results`` is empty — there is nothing to review.
-                # Leaving such a run in ``review`` strands it in a pending state
-                # forever and reads as a baffling "In review" with zero results
-                # in the UI (the exact symptom users hit on an attribute the
-                # sources have no data for). Land an empty run as ``applied`` —
-                # a completed run that changed nothing — and only go to
-                # ``review`` when at least one value was actually staged.
-                job.status = JobStatus.review if job.results else JobStatus.applied
-                job.completed_at = _now()
-                await self._jobs.update(job)
-                return
+            # `stage` semantics (ONTA-159): a conflict-free fill (the target field
+            # was empty) has nothing to reconcile, so it is applied immediately —
+            # exactly like `skip`. Only genuine value-vs-value CONFLICTS are held
+            # for human review. Previously `stage` also held fills, but the review
+            # surface (`GET /jobs/{id}/conflicts`) lists ONLY conflict rows, so
+            # conflict-free staged fills were stranded: staged yet invisible and
+            # un-approvable — a job sat "In review" with zero reviewable items.
+            # So under `stage` we WRITE like `skip` (fills only) and land in
+            # `review` only when there is at least one real conflict to resolve.
+            has_conflicts = any(r.action == "conflict" for r in job.results)
+            write_policy = (
+                ConflictPolicy.skip if policy == ConflictPolicy.stage else policy
+            )
 
             # `applied_attr_values` is the source of truth for "was anything
             # applied?" — the attributes (primary + provenance companions) that
-            # actually received a written value under `policy`, mapped to their
-            # values. Empty ⇒ nothing to declare or write.
-            applied_attr_values = self._applied_attribute_values(all_rows, policy)
+            # actually received a written value under `write_policy`, mapped to
+            # their values. Empty ⇒ nothing to declare or write.
+            applied_attr_values = self._applied_attribute_values(all_rows, write_policy)
             if applied_attr_values:
                 # Declare schema, THEN write data. Enrichment must EXTEND THE
                 # ONTOLOGY (COG-112): before writing instance values, upsert the
@@ -1200,9 +1199,10 @@ class EnrichmentExecutor:
                 # the Enrich dialog's predicate dropdown, not just as orphan data.
                 # One idempotent upsert per attribute (not per row), each declared
                 # with a range inferred from its actual applied values and never
-                # downgrading an existing richer range. This runs in the apply
-                # branch only (skip/verify/overwrite); `stage` returned above
-                # before any write, so review-mode declares nothing.
+                # downgrading an existing richer range. Runs for every write
+                # policy AND for `stage`'s conflict-free fills (which now write
+                # via `write_policy=skip`); only true conflicts held for review
+                # declare nothing until accepted.
                 #
                 # `_declare_attributes` RETURNS the {attr -> resolved_datatype} map
                 # it just declared, so we type each INSTANCE value with the SAME
@@ -1217,7 +1217,7 @@ class EnrichmentExecutor:
                 # skip on a non-conforming value); relationships write the entity
                 # IRI directly; provenance companions stay plain string literals.
                 triples = self._select_triples_for_policy(
-                    all_rows, job.type_name, policy, resolved_datatypes
+                    all_rows, job.type_name, write_policy, resolved_datatypes
                 )
                 # Single shared write path — identical to CSV/JSON ingestion
                 # (graph/kg_writer.py): batched insert, then post-write
@@ -1232,7 +1232,14 @@ class EnrichmentExecutor:
                     kg_name=job.kg_name,
                     affected_types={job.type_name},
                 )
-            job.status = JobStatus.applied
+            # `stage` with at least one real conflict stays in `review` — those
+            # conflicts are now the ONLY thing the review queue holds (the fills
+            # were just applied above). Everything else — a `stage` run with no
+            # conflicts, or any write policy — is `applied`.
+            if policy == ConflictPolicy.stage and has_conflicts:
+                job.status = JobStatus.review
+            else:
+                job.status = JobStatus.applied
             job.completed_at = _now()
             await self._jobs.update(job)
 
