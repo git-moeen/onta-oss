@@ -203,3 +203,84 @@ def extract_value(
         extraction_method=EXTRACTION_METHOD,
         calibration_method=CALIBRATION_METHOD,
     )
+
+
+# ---------------------------------------------------------------------------
+# URL-valued attributes
+# ---------------------------------------------------------------------------
+# Enriching a "website" / "homepage" / "*_url" attribute is special: the answer
+# is a URL, and the canonical URL the adapter resolved is the verdict's own
+# ``source_url`` citation — NOT a value lifted from the page body. Running the
+# single-pass extractor over the page text otherwise returns page chrome ("Skip
+# to content", "Platform") or the entity name as the "value". So for URL-valued
+# attributes we prefer a URL: keep the extracted value when it is itself
+# URL-shaped (e.g. Wikidata's official-website P856, where the value IS the site
+# and ``source_url`` is only the Wikidata provenance page), and fall back to
+# ``source_url`` only when the extracted value is not a URL.
+
+_URL_ATTR_NAMES = frozenset({
+    "website", "url", "homepage", "home_page", "webpage", "web_page",
+    "web_site", "website_url", "homepage_url", "web_address", "weburl",
+})
+_URL_ATTR_SUFFIXES = ("_url", "_uri", "_website", "_homepage")
+_URL_DATATYPES = frozenset({"uri", "url", "anyuri"})
+# A scheme'd URL, or a bare domain (labels + a >=2-char TLD) optionally with a
+# path/port/query. Whitespace is rejected by the caller before this is applied.
+_URL_LIKE_RE = re.compile(
+    r"^(?:https?://\S+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/:?#]\S*)?)$", re.IGNORECASE
+)
+
+
+def is_url_attribute(attribute: str, datatype: str | None = None) -> bool:
+    """True when an attribute's value should be a URL (``website``, ``*_url``,
+    or a declared ``uri`` datatype)."""
+    if datatype and str(datatype).strip().lower() in _URL_DATATYPES:
+        return True
+    name = (attribute or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if name in _URL_ATTR_NAMES:
+        return True
+    return name.endswith(_URL_ATTR_SUFFIXES)
+
+
+def looks_like_url(text: str | None) -> bool:
+    """Loose check that ``text`` is a single URL or bare domain (no whitespace)."""
+    if not text:
+        return False
+    t = text.strip()
+    if " " in t or "\n" in t or "\t" in t:
+        return False
+    return bool(_URL_LIKE_RE.match(t))
+
+
+def normalize_url(text: str) -> str:
+    """Trim, drop a trailing slash, and ensure an ``https://`` scheme. The path
+    is preserved (never reduced to origin — a profile/sub-page URL is still the
+    answer for a ``*_url`` attribute)."""
+    t = (text or "").strip().rstrip("/")
+    if t and not re.match(r"^https?://", t, re.IGNORECASE):
+        t = "https://" + t
+    return t
+
+
+def coerce_url_attribute_value(
+    attribute: str, verdict: Verdict, datatype: str | None = None
+) -> Verdict:
+    """For a URL-valued attribute, ensure the verdict's ``value`` is a URL.
+
+    * non-URL attribute → returned unchanged.
+    * value already URL-shaped → normalized (keeps Wikidata's official-website
+      value, which is the site itself, rather than overwriting it with the
+      Wikidata provenance page).
+    * value not URL-shaped (page chrome / entity name) → replaced with the
+      resolved ``source_url`` citation when that is a URL; otherwise unchanged.
+    """
+    if not is_url_attribute(attribute, datatype):
+        return verdict
+    val = (verdict.value or "").strip()
+    if looks_like_url(val):
+        norm = normalize_url(val)
+        return verdict if norm == verdict.value else verdict.model_copy(update={"value": norm})
+    src = (getattr(verdict, "source_url", None) or "").strip()
+    if looks_like_url(src):
+        return verdict.model_copy(update={"value": normalize_url(src)})
+    return verdict

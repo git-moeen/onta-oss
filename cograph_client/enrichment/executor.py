@@ -40,6 +40,7 @@ from cograph_client.enrichment.strategy import (
     TypeStrategy,
     load_strategy,
 )
+from cograph_client.enrichment.extraction import coerce_url_attribute_value
 from cograph_client.enrichment.tiers import get_chain
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.kg_writer import insert_facts, refresh_after_write
@@ -1382,6 +1383,15 @@ class EnrichmentExecutor:
                     job.type_name,
                     strategy_version,
                 )
+            # URL-valued attributes (website, *_url, datatype uri): the answer is
+            # a URL, and a single-pass extractor run over page text otherwise
+            # lifts page chrome ("Skip to content", "Platform") or the entity
+            # name as the value. Coerce to a URL — keeping an already-URL value
+            # (e.g. Wikidata's official site) and only falling back to the
+            # resolved source_url citation when the value isn't a URL (ONTA-157).
+            # Applied here, the one shared post-adapter seam, so it covers every
+            # provider (and re-coerces stale cached verdicts on read).
+            verdicts = [coerce_url_attribute_value(attribute, v) for v in verdicts]
             sufficient = any(v.confidence >= confidence_min for v in verdicts)
             if tally is not None:
                 outcome = (
