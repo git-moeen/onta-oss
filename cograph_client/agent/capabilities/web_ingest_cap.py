@@ -55,7 +55,9 @@ from cograph_client.enrichment.models import (
     EnrichJob,
     EnrichmentTier,
     JobCategory,
+    JobErrorItem,
     JobStatus,
+    ProviderLog,
 )
 from cograph_client.graph.kg_writer import refresh_after_write
 from cograph_client.graph.queries import kg_graph_uri, tenant_graph_uri
@@ -196,6 +198,12 @@ class WebIngestCapability:
                 )
             ]
 
+        # Thread the per-record source URL onto the sampled rows so the PREVIEW
+        # matches the COMMIT (the same invariant the URL persistence keeps): the
+        # discovered-types card + sample rows show the `source_url` citation column
+        # the ingest will mint. No-op when the provider supplied no provenance.
+        _attach_source_urls(sample.rows, getattr(sample, "provenance", None) or {})
+
         # 3. Estimate the DISCOVERED ontology shape from the sample — run the same
         #    multi-type + relationship extractor the commit will, so the plan card
         #    shows the LIKELY types/edges the ingest will mint (not a flat
@@ -320,6 +328,11 @@ class WebIngestCapability:
                 job.status = JobStatus.running
                 job.started_at = datetime.now(timezone.utc)
                 await job_store.update(job)
+            # Per-provider activity log for "which provider we used" + its outcome,
+            # surfaced in the run-detail view alongside the platforms list. A
+            # single provider drives one discovery run, so this is one entry.
+            plog = ProviderLog(provider=provider.name)
+            discover_ok = False
             try:
                 full = await provider.discover(
                     query,
@@ -329,13 +342,34 @@ class WebIngestCapability:
                     context=pctx,
                     urls=urls or None,
                 )
+                discover_ok = True
                 rows = full.rows[:cap]
+                # Per-record source-URL provenance (ONTA-151): stamp each row with
+                # the page it was drawn from (DiscoverResult.provenance) BEFORE
+                # serialization, so it rides through the SAME extract → ingest →
+                # insert_facts path as the rest of the row's data (no bespoke write
+                # path) and lands as a `source_url` citation on the entity. See
+                # SOURCE_URL_ATTR on the best-effort (LLM-carried) reliability.
+                source_urls = _attach_source_urls(
+                    rows, getattr(full, "provenance", None) or {}
+                )
                 platforms = _platforms(getattr(full, "sources", None), provider)
-                # Surface the row count + platforms as soon as discovery returns,
-                # before the (slower) ingest — so a poll mid-run shows progress.
+                # The provider ran: record one attempt with the discovered-record
+                # count as its "matches", or a no_match when it came back empty.
+                plog.attempts = 1
+                plog.matches = len(rows)
+                if rows:
+                    plog.status = "ok"
+                else:
+                    plog.no_match = 1
+                    plog.status = "no_match"
+                # Surface the row count + platforms + provider log as soon as
+                # discovery returns, before the (slower) ingest — so a poll
+                # mid-run already shows progress and which provider was consulted.
                 if job is not None and job_store is not None:
                     job.progress.total = len(rows)
                     job.platforms = platforms
+                    job.provider_logs = [plog]
                     await job_store.update(job)
                 if not rows:
                     logger.info("web_ingest_no_rows", query=query)
@@ -359,6 +393,7 @@ class WebIngestCapability:
                     rows=len(rows),
                     entities=entities,
                     types=getattr(result, "types_created", None),
+                    source_urls=source_urls,
                 )
                 # Single shared post-write housekeeping path (graph/kg_writer.py) —
                 # the SAME refresh ingestion + enrichment run: invalidate the
@@ -385,7 +420,29 @@ class WebIngestCapability:
                 )
             except Exception as exc:  # noqa: BLE001 — background job self-contains errors
                 logger.error("web_ingest_failed", query=query, exc_info=True)
-                await _fail_job(job, job_store, str(exc))
+                msg = str(exc)
+                # Attribute the failure: a crash BEFORE discovery returned is the
+                # provider's; a later crash (ingest/refresh) is a job-level error
+                # while the provider log stays whatever it recorded as "ok".
+                if not discover_ok:
+                    plog.attempts = 1
+                    plog.errors = 1
+                    plog.status = "error"
+                    plog.last_error = msg[:300]
+                if job is not None:
+                    job.provider_logs = [plog]
+                    job.error_summary = [
+                        JobErrorItem(
+                            # A crash before discovery returned is the provider's
+                            # ("error"); a later crash (ingest/refresh) is a
+                            # job-level failure ("job"), matching the enrichment
+                            # executor's fatal-path classification.
+                            provider=provider.name if not discover_ok else None,
+                            kind="error" if not discover_ok else "job",
+                            message=msg[:300],
+                        )
+                    ]
+                await _fail_job(job, job_store, msg)
 
         _spawn(_run())
         ack = {
@@ -676,6 +733,75 @@ def _estimate_cost(
             f"across sub-queries)."
         ),
     }
+
+
+# --- per-record source-URL provenance (ONTA-151) ----------------------------- #
+
+# Attribute minted on each discovered entity citing the exact page it was drawn
+# from — the discovery counterpart to enrichment's `<attr>_source_url` citations
+# and the user-facing source the Explorer renders (any URL-valued attribute is a
+# clickable link in the records table). The run-level provenance the resolver
+# already writes (`onto/source` = web:<provider>:<query>, `onto/ingested_at`, the
+# batch id) is unchanged; this adds the missing PER-RECORD citation so "this exact
+# data point came from this exact page" is answerable, not just "this came from a
+# discovery for query X".
+#
+# Threaded as an ordinary row field so it flows through the SAME ingest →
+# insert_facts write path as every other attribute (write-path convergence) — no
+# bespoke writer, no separate provenance graph. NOTE on the reliability contract:
+# unlike enrichment, which writes `<attr>_source_url` DETERMINISTICALLY onto the
+# entity URI (no LLM), discovery carries `source_url` as a row field THROUGH the
+# multi-type LLM extractor. So it is best-effort: exactly as reliable as the row's
+# OTHER discovered attributes (name, pricing, …) — the same extractor decides them
+# all — but not a hard guarantee, and on a multi-type row the extractor chooses
+# which entity it lands on. `uri` is a declared attribute datatype, so a field
+# named `source_url` is overwhelmingly kept as a literal at temperature 0. If
+# GUARANTEED per-record citations are ever required, stamp this deterministically
+# post-extraction keyed by entity id (a follow-up; would touch the shared resolver).
+SOURCE_URL_ATTR = "source_url"
+
+
+def _row_source_url(
+    row: dict, index: int, provenance: dict[str, str]
+) -> Optional[str]:
+    """Resolve the source URL a discovered ``row`` was drawn from, using the
+    provider's per-row ``provenance`` map (:attr:`DiscoverResult.provenance`).
+
+    Providers key the map by the row's natural name, falling back to the row's
+    positional index as a string — the convention every bundled adapter and the
+    stub use (``{r.get("name", str(i)): url}``). Mirror that exact key here (name
+    when the row carries one, else the index), then fall back to the positional
+    index so an index-keyed provider also resolves. Returns ``None`` when no URL
+    is known for the row (e.g. a free/stub provider that supplied no provenance)."""
+    if not provenance or not isinstance(row, dict):
+        return None
+    key = row.get("name", str(index))
+    url = provenance.get(str(key))
+    if url:
+        return url
+    return provenance.get(str(index))
+
+
+def _attach_source_urls(rows: list[dict], provenance: dict[str, str]) -> int:
+    """Stamp each discovered row (in place) with its per-record ``source_url`` so
+    the entity it mints carries a traceable citation to its origin page. Returns
+    the number of rows stamped.
+
+    A no-op when the provider supplied no provenance (free/stub providers may omit
+    it). Never clobbers a ``source_url`` the provider already set on the row, and
+    leaves a row with no resolvable URL untouched rather than stamping a blank — so
+    the column appears only where there is a real citation to show."""
+    if not provenance:
+        return 0
+    stamped = 0
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get(SOURCE_URL_ATTR):
+            continue
+        url = _row_source_url(row, i, provenance)
+        if url:
+            row[SOURCE_URL_ATTR] = url
+            stamped += 1
+    return stamped
 
 
 # --- job tracking ------------------------------------------------------------ #

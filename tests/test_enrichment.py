@@ -12,6 +12,7 @@ import pytest
 from cograph_client.enrichment.cache import EnrichmentCache
 from cograph_client.enrichment.executor import (
     EnrichmentExecutor,
+    _ProviderTally,
     _build_select_query,
     _entity_iri_type,
     _infer_datatype_from_values,
@@ -4206,3 +4207,121 @@ def test_infer_datatype_does_not_mis_declare_special_tokens():
     assert _infer_datatype_from_values(["inf", "nan"]) == "string"
     assert _infer_datatype_from_values(["1_000"]) == "string"
     assert _infer_datatype_from_values(["1,234", "12,345"]) == "string"
+
+
+# ---------------------------------------------------------------------------
+# Provider logs + error summary (run-detail observability)
+# ---------------------------------------------------------------------------
+
+
+def test_provider_tally_rollup_status_and_errors():
+    """The tally rolls each provider's per-attempt outcomes into a coarse status
+    (ok / no_match / error / skipped) and aggregates failures into an ordered
+    error summary with representative messages + counts."""
+    tally = _ProviderTally()
+    # wikidata: one live match, one cache no_match → produced a usable result → ok
+    tally.record_attempt("wikidata", cache_hit=False, outcome="match")
+    tally.record_attempt("wikidata", cache_hit=True, outcome="no_match")
+    # exa: every attempt failed (a timeout + two errors) → error
+    tally.record_attempt("exa", cache_hit=False, outcome="timeout", error_msg="timed out after 30s")
+    tally.record_attempt("exa", cache_hit=False, outcome="error", error_msg="HTTP 503 a")
+    tally.record_attempt("exa", cache_hit=False, outcome="error", error_msg="HTTP 503 b")
+    # gemini: ran but found nothing → no_match
+    tally.record_attempt("gemini", cache_hit=False, outcome="no_match")
+    # perplexity: named in a chain but not registered here → skipped
+    tally.record_missing("perplexity")
+
+    logs = {p.provider: p for p in tally.to_logs()}
+    assert logs["wikidata"].status == "ok"
+    assert logs["wikidata"].matches == 1
+    assert logs["wikidata"].attempts == 1  # cache hit not counted as an attempt
+    assert logs["wikidata"].cache_hits == 1
+    assert logs["exa"].status == "error"
+    assert logs["exa"].errors == 2
+    assert logs["exa"].timeouts == 1
+    assert logs["exa"].last_error  # carries a representative message
+    assert logs["gemini"].status == "no_match"
+    assert logs["perplexity"].status == "skipped"
+
+    errs = tally.to_error_summary()
+    # exa errors are aggregated with count, ordered most-frequent first.
+    by_kind = {(e.provider, e.kind): e for e in errs}
+    assert by_kind[("exa", "error")].count == 2
+    assert by_kind[("exa", "timeout")].count == 1
+    assert by_kind[("perplexity", "missing")].count == 1
+    assert errs[0].count >= errs[-1].count  # sorted by count desc
+
+
+def test_executor_records_provider_logs_end_to_end():
+    """A completed enrichment run carries a per-provider log: which provider was
+    used, how many lookups matched vs found nothing — surfaced in run detail."""
+    async def run():
+        rows = [
+            {"uri": "https://cograph.tech/entities/Product/p1", "label": "Bosch", "vals": ""},
+            {"uri": "https://cograph.tech/entities/Product/p2", "label": "Unknown Co", "vals": ""},
+        ]
+        neptune = AsyncMock()
+        neptune.query.return_value = _entities_query_response(rows)
+        neptune.update.return_value = None
+
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        # "Bosch" resolves; "Unknown Co" returns nothing (no_match).
+        wikidata = FakeWikidata(
+            {
+                ("Bosch", "manufacturer"): [
+                    Verdict(value="Robert Bosch GmbH", confidence=0.95, source="wikidata")
+                ],
+            }
+        )
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["manufacturer"], policy=ConflictPolicy.stage)
+        await store.create(job)
+        await executor.run(job, "test-tenant")
+
+        final = await store.get(job.id)
+        assert final is not None
+        assert len(final.provider_logs) == 1
+        plog = final.provider_logs[0]
+        assert plog.provider == "wikidata"
+        assert plog.status == "ok"
+        assert plog.attempts == 2
+        assert plog.matches == 1
+        assert plog.no_match == 1
+        # A clean run records no errors.
+        assert final.error_summary == []
+
+    asyncio.run(run())
+
+
+def test_lookup_chain_records_missing_provider():
+    """A chain that names an unregistered provider records it as a 'skipped'
+    provider log + a 'missing' error-summary entry, without failing the run."""
+    async def run():
+        neptune = AsyncMock()
+        store = InMemoryJobStore()
+        cache = EnrichmentCache()
+        wikidata = FakeWikidata({})
+        executor = EnrichmentExecutor(neptune, store, cache, wikidata)
+
+        job = _make_job(attributes=["manufacturer"])
+        tally = _ProviderTally()
+        verdicts = await executor._lookup_chain(
+            "Bosch",
+            "manufacturer",
+            ["ghost-provider"],  # not registered
+            job,
+            set(),
+            0.85,
+            tally=tally,
+        )
+        assert verdicts == []
+        logs = tally.to_logs()
+        assert len(logs) == 1
+        assert logs[0].provider == "ghost-provider"
+        assert logs[0].status == "skipped"
+        errs = tally.to_error_summary()
+        assert errs and errs[0].kind == "missing"
+
+    asyncio.run(run())

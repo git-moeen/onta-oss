@@ -239,6 +239,63 @@ class JobProgress(BaseModel):
     cache_hits: int = 0
 
 
+ProviderStatus = Literal["ok", "no_match", "error", "skipped"]
+
+
+class ProviderLog(BaseModel):
+    """Per-provider activity record for ONE job run — what each provider we used
+    (enrichment adapter or web-source) actually did, surfaced in the run-detail
+    view so a user can see which providers were consulted and how they fared.
+
+    ``provider`` is the adapter / web-source name (``wikidata``, ``exa``,
+    ``perplexity``, the discovery provider name, …). The counters are cumulative
+    over the run:
+
+    - ``attempts``   — live lookups issued to the provider (cache hits excluded).
+    - ``matches``    — lookups that yielded a usable result (a sufficiently
+      confident verdict for enrichment; a discovered record for web discovery).
+    - ``no_match``   — lookups that ran but found nothing usable.
+    - ``errors`` / ``timeouts`` — failed / timed-out lookups.
+    - ``cache_hits`` — answers served from the enrichment cache (no live call).
+
+    ``status`` is a coarse roll-up for the UI pill: ``ok`` (produced at least one
+    usable result), ``no_match`` (ran but found nothing), ``error`` (every
+    attempt failed), or ``skipped`` (named but never reachable — e.g. an
+    unregistered adapter). ``last_error`` carries a representative message for
+    the error/timeout case so the user sees *why* a provider failed without
+    leaving the page.
+
+    All fields default to zero/None so this is purely additive — existing job
+    construction is unchanged and a run that records nothing simply has an empty
+    ``provider_logs`` list.
+    """
+
+    provider: str
+    status: ProviderStatus = "ok"
+    attempts: int = 0
+    matches: int = 0
+    no_match: int = 0
+    errors: int = 0
+    timeouts: int = 0
+    cache_hits: int = 0
+    last_error: Optional[str] = None
+
+
+class JobErrorItem(BaseModel):
+    """One aggregated entry in a job's error summary.
+
+    Groups a provider failure mode (``error`` / ``timeout`` / ``missing``) — or a
+    fatal ``job``-level error — with a representative ``message`` and how many
+    times that failure occurred over the run, so the run-detail view can show "a
+    summary of the potential errors" instead of forcing a log dive.
+    """
+
+    provider: Optional[str] = None
+    kind: Literal["error", "timeout", "missing", "job"] = "error"
+    message: str
+    count: int = 1
+
+
 class EnrichJob(BaseModel):
     id: str
     tenant_id: str
@@ -289,6 +346,13 @@ class EnrichJob(BaseModel):
     # surfaced in the job-details view.
     result_count: Optional[int] = None
     platforms: Optional[list[str]] = None
+    # Observability (run-detail view): a per-provider activity log for whatever
+    # providers this run used, and an aggregated summary of the errors hit. Both
+    # optional with empty defaults so existing job construction is unchanged; the
+    # enrichment executor and the web-discovery capability populate them, and the
+    # job-detail route serializes them verbatim for the UI.
+    provider_logs: list[ProviderLog] = Field(default_factory=list)
+    error_summary: list[JobErrorItem] = Field(default_factory=list)
 
 
 class JobSummary(BaseModel):

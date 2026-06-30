@@ -60,13 +60,22 @@ ENTITY_ONLY_SPEC = {
 
 
 class FakeProvider:
-    """Canned provider that honors hint_columns (projects rows to them)."""
+    """Canned provider that honors hint_columns (projects rows to them).
 
-    def __init__(self, *, is_paid: bool = False, cost_per_call: float = 0.0, rows=None) -> None:
+    When ``provenance=True`` it also returns a per-record provenance map (keyed by
+    the projected row's name → a distinct per-row page URL), mirroring how the real
+    adapters populate ``DiscoverResult.provenance``, so the per-record source-URL
+    threading can be exercised end-to-end."""
+
+    def __init__(
+        self, *, is_paid: bool = False, cost_per_call: float = 0.0,
+        rows=None, provenance: bool = False,
+    ) -> None:
         self.name = "fake"
         self.is_paid = is_paid
         self.cost_per_call = cost_per_call
         self._rows = FULL_ROWS if rows is None else rows
+        self._provenance = provenance
         self.calls: list[tuple] = []
 
     async def discover(self, query, *, sample, max_rows, hint_columns, context, urls=None):
@@ -74,8 +83,17 @@ class FakeProvider:
         rows = self._rows[: (5 if sample else max_rows)]
         if hint_columns:
             rows = [{c: r.get(c, "unknown") for c in hint_columns} for r in rows]
+        prov: dict[str, str] = {}
+        if self._provenance:
+            # Distinct page per row, keyed the way the real adapters key it
+            # (r.get("name", str(i))), so each record traces to its own URL.
+            prov = {
+                r.get("name", str(i)): f"https://src.example/page-{i}"
+                for i, r in enumerate(rows)
+            }
         return DiscoverResult(
             rows=rows,
+            provenance=prov,
             sources=["https://openrouter.ai/models"],
             estimated_total=len(self._rows),
             is_partial=sample,
@@ -507,6 +525,129 @@ def test_capability_registered_by_default():
     assert get_capability("web_ingest") is not None
 
 
+# --- per-record source-URL provenance (ONTA-151) ---------------------------- #
+
+
+def test_row_source_url_resolves_by_name_then_index():
+    """A row's URL resolves by its name first (the adapter keying), then by its
+    positional index (so an index-keyed provider also resolves); unknown → None."""
+    from cograph_client.agent.capabilities.web_ingest_cap import _row_source_url
+
+    prov = {"anthropic/claude-opus-4-8": "https://a", "1": "https://b"}
+    # Name-keyed hit.
+    assert _row_source_url({"name": "anthropic/claude-opus-4-8"}, 0, prov) == "https://a"
+    # Name miss → positional-index fallback (index-keyed provider).
+    assert _row_source_url({"name": "openai/gpt-5"}, 1, prov) == "https://b"
+    # Nothing resolvable for this row → None (left un-stamped by the caller).
+    assert _row_source_url({"name": "x"}, 9, prov) is None
+    # Empty provenance → None.
+    assert _row_source_url({"name": "x"}, 0, {}) is None
+
+
+def test_attach_source_urls_stamps_each_row_and_noop_without_provenance():
+    from cograph_client.agent.capabilities.web_ingest_cap import _attach_source_urls
+
+    rows = [{"name": "m0"}, {"name": "m1"}]
+    assert _attach_source_urls(rows, {"m0": "https://p0", "m1": "https://p1"}) == 2
+    assert rows[0]["source_url"] == "https://p0"
+    assert rows[1]["source_url"] == "https://p1"
+
+    # No provenance → rows untouched, returns 0 (free/stub providers).
+    rows2 = [{"name": "m0"}]
+    assert _attach_source_urls(rows2, {}) == 0
+    assert "source_url" not in rows2[0]
+
+
+def test_attach_source_urls_never_clobbers_and_skips_unknown():
+    """A provider-set source_url is preserved; a row with no resolvable URL is
+    left un-stamped rather than blanked."""
+    from cograph_client.agent.capabilities.web_ingest_cap import _attach_source_urls
+
+    rows = [
+        {"name": "m0", "source_url": "https://provider-set"},
+        {"name": "m1"},  # has a URL in the map
+        {"name": "m2"},  # NO URL in the map → stays un-stamped
+    ]
+    stamped = _attach_source_urls(rows, {"m1": "https://p1"})
+    assert stamped == 1
+    assert rows[0]["source_url"] == "https://provider-set"  # not clobbered
+    assert rows[1]["source_url"] == "https://p1"
+    assert "source_url" not in rows[2]
+
+
+async def test_execute_threads_per_record_source_url(monkeypatch):
+    """Each discovered entity carries its own source_url drawn from the provider's
+    provenance map, committed through the SAME ingest path (content_type="json")
+    — and the plan preview already shows the citation column (preview == commit)."""
+    provider = FakeProvider(provenance=True)
+    register_web_source(provider)
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+
+    captured: dict = {}
+
+    async def fake_ingest(self, content, tenant_id, content_type="text", source="", instance_graph=None):
+        captured.update(content=content, content_type=content_type)
+        rows = json.loads(content)
+        return IngestResult(entities_extracted=len(rows), entities_resolved=len(rows))
+
+    monkeypatch.setattr(SchemaResolver, "ingest", fake_ingest)
+
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    cap = WebIngestCapability()
+    step = (await cap.plan(_ctx(), "find a list of OpenRouter models", parsed=CONFIRMED_SPEC))[0]
+    # Preview == commit: the sampled rows already carry source_url.
+    assert step.preview["sample_rows"]
+    assert all("source_url" in r for r in step.preview["sample_rows"])
+
+    await cap.execute(_ctx(), step)
+    await spawned["task"]
+
+    rows_back = json.loads(captured["content"])
+    assert rows_back, "rows were committed"
+    # Every committed record traces to its OWN page; source_url rides alongside
+    # the confirmed attributes (an extra provenance column, not a replacement).
+    for i, r in enumerate(rows_back):
+        assert r["source_url"] == f"https://src.example/page-{i}"
+        assert "name" in r and "context_length" in r
+
+
+async def test_execute_no_provenance_adds_no_source_url(monkeypatch):
+    """A provider that supplies no provenance (e.g. a free source) yields entities
+    with NO source_url column — the threading degrades silently, never stamping a
+    blank citation."""
+    provider = FakeProvider()  # provenance=False
+    register_web_source(provider)
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+
+    captured: dict = {}
+
+    async def fake_ingest(self, content, tenant_id, content_type="text", source="", instance_graph=None):
+        captured.update(content=content)
+        rows = json.loads(content)
+        return IngestResult(entities_extracted=len(rows), entities_resolved=len(rows))
+
+    monkeypatch.setattr(SchemaResolver, "ingest", fake_ingest)
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    cap = WebIngestCapability()
+    step = (await cap.plan(_ctx(), "list of OpenRouter models", parsed=CONFIRMED_SPEC))[0]
+    await cap.execute(_ctx(), step)
+    await spawned["task"]
+
+    rows_back = json.loads(captured["content"])
+    assert rows_back
+    assert all("source_url" not in r for r in rows_back)
+
+
 async def test_planner_short_circuits_capability_clarify(monkeypatch):
     """End-to-end: a discover turn whose capability needs attribute confirmation
     returns {kind:"clarify"} via the planner's clarify short-circuit."""
@@ -536,3 +677,118 @@ async def test_planner_short_circuits_capability_clarify(monkeypatch):
     assert result["kind"] == "clarify"
     assert any(o.startswith("Use these:") for o in result["options"])
     reset_capabilities()
+
+
+async def test_execute_records_provider_log_on_success(monkeypatch):
+    """A completed discovery run records which web provider was used and how many
+    records it returned — surfaced in the run-detail view alongside platforms."""
+    from cograph_client.enrichment.job_store import InMemoryJobStore
+
+    register_web_source(FakeProvider())
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+
+    async def fake_ingest(self, content, tenant_id, content_type="text", source="", instance_graph=None):
+        rows = json.loads(content)
+        return IngestResult(entities_extracted=len(rows), entities_resolved=len(rows))
+
+    monkeypatch.setattr(SchemaResolver, "ingest", fake_ingest)
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    store = InMemoryJobStore()
+    cap = WebIngestCapability()
+    step = (
+        await cap.plan(_ctx_with_store(store), "list of OpenRouter models", parsed=CONFIRMED_SPEC)
+    )[0]
+    ack = await cap.execute(_ctx_with_store(store), step)
+    await spawned["task"]
+
+    done = await store.get(ack["job_id"])
+    assert len(done.provider_logs) == 1
+    plog = done.provider_logs[0]
+    assert plog.provider == "fake"
+    assert plog.status == "ok"
+    assert plog.matches == len(FULL_ROWS)
+    assert done.error_summary == []
+
+
+async def test_execute_records_provider_error_when_discover_fails(monkeypatch):
+    """When the web provider itself fails during the full pull, the job is failed
+    AND the provider log + error summary attribute the failure to that provider."""
+    from cograph_client.enrichment.job_store import InMemoryJobStore
+    from cograph_client.enrichment.models import JobStatus
+
+    class FullFailProvider(FakeProvider):
+        async def discover(self, query, *, sample, max_rows, hint_columns, context, urls=None):
+            if not sample:  # plan-time sample works; the full pull explodes
+                raise RuntimeError("provider 503 unavailable")
+            return await super().discover(
+                query, sample=sample, max_rows=max_rows,
+                hint_columns=hint_columns, context=context, urls=urls,
+            )
+
+    register_web_source(FullFailProvider())
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    store = InMemoryJobStore()
+    cap = WebIngestCapability()
+    step = (
+        await cap.plan(_ctx_with_store(store), "list of OpenRouter models", parsed=CONFIRMED_SPEC)
+    )[0]
+    ack = await cap.execute(_ctx_with_store(store), step)
+    await spawned["task"]
+
+    failed = await store.get(ack["job_id"])
+    assert failed.status == JobStatus.failed
+    assert len(failed.provider_logs) == 1
+    assert failed.provider_logs[0].provider == "fake"
+    assert failed.provider_logs[0].status == "error"
+    assert failed.error_summary and failed.error_summary[0].provider == "fake"
+    assert "503" in (failed.provider_logs[0].last_error or "")
+
+
+async def test_execute_does_not_blame_provider_when_ingest_fails(monkeypatch):
+    """A failure AFTER the provider returned (ingest/refresh) is a job-level
+    error: the provider log stays 'ok' (not mis-blamed) and the error-summary
+    entry is kind='job' with no provider attribution."""
+    from cograph_client.enrichment.job_store import InMemoryJobStore
+    from cograph_client.enrichment.models import JobStatus
+
+    register_web_source(FakeProvider())  # discover() succeeds
+    _patch_preview(monkeypatch, entities=_single_type_entities())
+
+    async def boom(self, *a, **k):  # ingest explodes after a clean discover
+        raise RuntimeError("ingest exploded")
+
+    monkeypatch.setattr(SchemaResolver, "ingest", boom)
+    spawned: dict = {}
+    monkeypatch.setattr(
+        web_ingest_cap, "_spawn",
+        lambda coro: spawned.__setitem__("task", asyncio.ensure_future(coro)),
+    )
+
+    store = InMemoryJobStore()
+    cap = WebIngestCapability()
+    step = (
+        await cap.plan(_ctx_with_store(store), "list of OpenRouter models", parsed=CONFIRMED_SPEC)
+    )[0]
+    ack = await cap.execute(_ctx_with_store(store), step)
+    await spawned["task"]
+
+    failed = await store.get(ack["job_id"])
+    assert failed.status == JobStatus.failed
+    # Provider ran fine — its log is NOT flipped to error.
+    assert failed.provider_logs[0].provider == "fake"
+    assert failed.provider_logs[0].status == "ok"
+    # The failure is attributed at job level, not to the provider.
+    assert failed.error_summary and failed.error_summary[0].kind == "job"
+    assert failed.error_summary[0].provider is None
+    assert "ingest exploded" in (failed.error or "")

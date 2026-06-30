@@ -24,7 +24,9 @@ from cograph_client.enrichment.models import (
     ConflictReview,
     EnrichJob,
     EnrichScope,
+    JobErrorItem,
     JobStatus,
+    ProviderLog,
     RowResult,
     Verdict,
 )
@@ -102,6 +104,100 @@ ENRICH_ATTR_DATATYPE = "string"
 # still failing fast relative to "forever". Overridable via the
 # COGRAPH_ADAPTER_LOOKUP_TIMEOUT_S env var.
 ADAPTER_LOOKUP_TIMEOUT_S = float(os.environ.get("COGRAPH_ADAPTER_LOOKUP_TIMEOUT_S", "30"))
+
+# Cap stored per-provider error/summary messages so a chatty adapter exception
+# can't bloat the job payload (it is serialized whole into the job store).
+_MAX_ERROR_MSG = 300
+
+
+class _ProviderTally:
+    """Accumulates per-provider outcomes across a single enrichment run so the
+    job can carry a ``provider_logs`` (what each provider we used did) and an
+    ``error_summary`` (the potential errors, aggregated) for the run-detail view.
+
+    Concurrency: the executor's worker pool runs cooperatively under one event
+    loop and every ``record*`` mutation is synchronous (no ``await`` between read
+    and write), so the plain counters here are race-free — the same property the
+    existing ``job.progress`` increments rely on. No lock needed.
+    """
+
+    def __init__(self) -> None:
+        self._by_provider: dict[str, ProviderLog] = {}
+        # (provider, kind) -> [count, first_sample_message]
+        self._errors: dict[tuple[str, str], list] = {}
+
+    def _log(self, provider: str) -> ProviderLog:
+        pl = self._by_provider.get(provider)
+        if pl is None:
+            pl = ProviderLog(provider=provider)
+            self._by_provider[provider] = pl
+        return pl
+
+    def _bump_error(self, provider: str, kind: str, message: str) -> None:
+        key = (provider, kind)
+        rec = self._errors.get(key)
+        if rec is None:
+            self._errors[key] = [1, (message or "")[:_MAX_ERROR_MSG]]
+        else:
+            rec[0] += 1  # keep the first representative message
+
+    def record_missing(self, provider: str) -> None:
+        """A chain named a provider that isn't registered here (call once per
+        provider per job — the caller already gates on a 'missing' set)."""
+        self._log(provider).status = "skipped"
+        self._bump_error(
+            provider,
+            "missing",
+            f"provider '{provider}' is not registered on this deployment",
+        )
+
+    def record_attempt(
+        self,
+        provider: str,
+        *,
+        cache_hit: bool,
+        outcome: str,  # "match" | "no_match" | "timeout" | "error"
+        error_msg: Optional[str] = None,
+    ) -> None:
+        pl = self._log(provider)
+        if cache_hit:
+            pl.cache_hits += 1
+        else:
+            pl.attempts += 1
+        if outcome == "match":
+            pl.matches += 1
+        elif outcome == "no_match":
+            pl.no_match += 1
+        elif outcome == "timeout":
+            pl.timeouts += 1
+            pl.last_error = (error_msg or "lookup timed out")[:_MAX_ERROR_MSG]
+            self._bump_error(provider, "timeout", error_msg or "lookup timed out")
+        elif outcome == "error":
+            pl.errors += 1
+            if error_msg:
+                pl.last_error = error_msg[:_MAX_ERROR_MSG]
+            self._bump_error(provider, "error", error_msg or "lookup failed")
+
+    def to_logs(self) -> list[ProviderLog]:
+        out: list[ProviderLog] = []
+        for pl in self._by_provider.values():
+            if pl.status != "skipped":
+                if pl.matches > 0:
+                    pl.status = "ok"
+                elif pl.errors > 0 or pl.timeouts > 0:
+                    pl.status = "error"
+                else:
+                    pl.status = "no_match"
+            out.append(pl)
+        return out
+
+    def to_error_summary(self) -> list[JobErrorItem]:
+        items = [
+            JobErrorItem(provider=prov, kind=kind, message=msg, count=count)  # type: ignore[arg-type]
+            for (prov, kind), (count, msg) in self._errors.items()
+        ]
+        items.sort(key=lambda e: e.count, reverse=True)
+        return items
 
 
 def _type_uri(type_name: str) -> str:
@@ -859,6 +955,11 @@ class EnrichmentExecutor:
         return n
 
     async def run(self, job: EnrichJob, tenant_id: str) -> None:
+        # Per-provider activity + error accumulator for this run; stamped onto the
+        # job at every terminal path so the run-detail view shows which providers
+        # we used and a summary of the errors hit. Defined before the try so the
+        # failure path can still surface whatever was recorded before the crash.
+        tally = _ProviderTally()
         try:
             job.status = JobStatus.running
             job.started_at = _now()
@@ -975,6 +1076,7 @@ class EnrichmentExecutor:
                             missing_adapter_names,
                             effective_confidence,
                             strategy_version,
+                            tally=tally,
                         )
                         best = self._pick_best(verdicts, effective_confidence)
 
@@ -1022,6 +1124,12 @@ class EnrichmentExecutor:
             for t in tasks:
                 rows = await t
                 all_rows.extend(rows)
+
+            # Stamp the per-provider activity log + aggregated error summary onto
+            # the job now, so every terminal path below (cancelled, review,
+            # applied) persists "which providers we used + the errors we hit".
+            job.provider_logs = tally.to_logs()
+            job.error_summary = tally.to_error_summary()
 
             # Re-check cancellation after work loop.
             latest = await self._jobs.get(job.id)
@@ -1132,6 +1240,12 @@ class EnrichmentExecutor:
             job.status = JobStatus.failed
             job.error = str(exc)
             job.completed_at = _now()
+            # Surface whatever providers ran (and any per-provider errors) before
+            # the fatal crash, plus the crash itself as a job-level error entry.
+            job.provider_logs = tally.to_logs()
+            job.error_summary = tally.to_error_summary() + [
+                JobErrorItem(kind="job", message=str(exc)[:_MAX_ERROR_MSG])
+            ]
             try:
                 await self._jobs.update(job)
             except Exception:  # noqa: BLE001
@@ -1176,6 +1290,7 @@ class EnrichmentExecutor:
         missing: set[str],
         confidence_min: float,
         strategy_version: str = "v1",
+        tally: Optional["_ProviderTally"] = None,
     ) -> list[Verdict]:
         """Walk an adapter chain, returning verdicts from the first adapter
         that yields one with confidence >= confidence_min.
@@ -1200,7 +1315,14 @@ class EnrichmentExecutor:
                         job_id=job.id,
                         tier=job.tier.value if hasattr(job.tier, "value") else str(job.tier),
                     )
+                    if tally is not None:
+                        tally.record_missing(name)
                 continue
+            # Per-attempt outcome for the provider log: "match" | "no_match" |
+            # "timeout" | "error", with the cache flag tracked separately.
+            from_cache = False
+            err_outcome: Optional[str] = None
+            err_msg: Optional[str] = None
             cached = await self._cache.get(
                 entity_label, attribute, adapter.name, job.type_name, strategy_version
             )
@@ -1209,6 +1331,7 @@ class EnrichmentExecutor:
                     job.progress.cache_hits += 1
                     cache_hit_counted = True
                 verdicts = cached
+                from_cache = True
             else:
                 # Optional custom instructions ride in the adapter lookup
                 # context dict. Adapters that don't use it (wikidata) ignore it
@@ -1239,6 +1362,8 @@ class EnrichmentExecutor:
                         attribute=attribute,
                     )
                     verdicts = []
+                    err_outcome = "timeout"
+                    err_msg = f"timed out after {ADAPTER_LOOKUP_TIMEOUT_S:.0f}s"
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "enrichment_adapter_error",
@@ -1247,6 +1372,8 @@ class EnrichmentExecutor:
                         error=str(exc),
                     )
                     verdicts = []
+                    err_outcome = "error"
+                    err_msg = str(exc)
                 await self._cache.put(
                     entity_label,
                     attribute,
@@ -1255,8 +1382,21 @@ class EnrichmentExecutor:
                     job.type_name,
                     strategy_version,
                 )
+            sufficient = any(v.confidence >= confidence_min for v in verdicts)
+            if tally is not None:
+                outcome = (
+                    err_outcome
+                    if err_outcome is not None
+                    else ("match" if sufficient else "no_match")
+                )
+                tally.record_attempt(
+                    adapter.name,
+                    cache_hit=from_cache,
+                    outcome=outcome,
+                    error_msg=err_msg,
+                )
             # Stop at first sufficient-confidence verdict.
-            if any(v.confidence >= confidence_min for v in verdicts):
+            if sufficient:
                 return verdicts
         # No adapter yielded a sufficiently-confident verdict; return last (may
         # be empty). For simplicity return [] so caller treats as no_match.

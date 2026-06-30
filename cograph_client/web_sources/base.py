@@ -36,12 +36,18 @@ class DiscoverResult:
 
     ``rows`` are uniform string-keyed dicts (one record each), ready to feed the
     SAME schema-inference / ``apply_mapping`` path CSV ingest uses. ``provenance``
-    maps a row's natural key (or its index as a string) to the source URL the row
-    was drawn from, so every committed entity can carry a ``*_source_url``
-    companion. ``sources`` is the distinct set of sources consulted (for the plan
-    preview). ``is_partial`` is True when the provider truncated at ``max_rows``;
-    ``estimated_total`` is the provider's best guess at the full result size
-    (used only to label the plan-time cost estimate, never to drive writes).
+    maps each row to the source URL it was drawn from, so every committed entity
+    can carry a per-record ``source_url`` citation (the discovery counterpart to
+    enrichment's ``<attr>_source_url``). The map is keyed by the row's natural
+    name, falling back to its index as a string — i.e. ``{r.get("name", str(i)):
+    url}``, the convention all bundled adapters + the stub follow. The web-ingest
+    capability resolves a row's URL by that same key (name, then positional
+    index — see ``web_ingest_cap._row_source_url``), so an index-keyed provider
+    resolves too; populate it however your source allows. ``sources`` is the
+    distinct set of sources consulted (for the plan preview). ``is_partial`` is
+    True when the provider truncated at ``max_rows``; ``estimated_total`` is the
+    provider's best guess at the full result size (used only to label the
+    plan-time cost estimate, never to drive writes).
     """
 
     rows: list[dict[str, str]] = field(default_factory=list)
