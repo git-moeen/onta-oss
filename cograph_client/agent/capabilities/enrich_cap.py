@@ -480,6 +480,8 @@ class EnrichCapability:
             limit=int(limit)
             if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit
             else None,
+            # Chat provenance: link the job to the conversation that spawned it.
+            thread_id=getattr(ctx, "session_id", None),
         )
         await job_store.create(job)
         _spawn(executor.run(job, ctx.tenant_id))

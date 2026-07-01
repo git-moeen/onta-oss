@@ -1173,6 +1173,10 @@ export interface EnrichRequest {
   conflict_policy?: ConflictPolicy;
   confidence_min?: number;
   limit?: number;
+  /** Chat provenance: the conversation/thread id this job is kicked off from, so
+   *  the created job is traceable back to its conversation. Omit for non-chat
+   *  (direct API / CLI / scheduled) callers. */
+  thread_id?: string;
 }
 
 export interface EnrichJobCreate {
@@ -1257,6 +1261,9 @@ export interface JobSummary {
   platforms?: string[] | null;
   /** Derived 0-100 completion percentage from progress.processed/total. */
   progress_pct?: number;
+  /** Chat provenance: the conversation/thread id this job was created from, when
+   *  it was kicked off from the Ask-AI chat (null/absent for non-chat jobs). */
+  thread_id?: string | null;
 }
 
 export interface EnrichJob extends JobSummary {
