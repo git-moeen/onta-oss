@@ -138,7 +138,7 @@ class TestBuildFromOntology:
         }
 
         mock_client = _mock_httpx_post(_make_embedding_response(["chunk1", "chunk2"]))
-        with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+        with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
             count = await svc.build_from_ontology(GRAPH_URI, mock_neptune)
 
         assert count == 2
@@ -195,7 +195,7 @@ class TestRetrieve:
         question_emb = _make_fake_embedding(seed=1)  # same as PropertyListing
         mock_client = _mock_httpx_post({"data": [{"embedding": question_emb}]})
 
-        with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+        with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
             result = await svc.retrieve(GRAPH_URI, "How many properties?", top_k=2)
 
         assert result is not None
@@ -218,7 +218,7 @@ class TestRetrieve:
         question_emb = _make_fake_embedding(seed=1)
         mock_client = _mock_httpx_post({"data": [{"embedding": question_emb}]})
 
-        with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+        with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
             result = await svc.retrieve(GRAPH_URI, "properties", top_k=1)
 
         assert result is not None
@@ -251,7 +251,7 @@ class TestRetrieve:
         mock_client = _mock_httpx_post({"data": [{"embedding": question_emb}]})
 
         with patch.object(svc, "_s3_get", return_value=s3_data):
-            with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+            with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
                 result = await svc.retrieve(GRAPH_URI, "property", top_k=5)
 
         assert result is not None
@@ -284,7 +284,7 @@ class TestEmbedTypesIncremental:
         }
 
         mock_client = _mock_httpx_post(_make_embedding_response(["TypeC"], seed_offset=10))
-        with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+        with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
             await svc.embed_types(GRAPH_URI, ["TypeC"], mock_neptune)
 
         assert "TypeA" in svc._stores[GRAPH_URI].chunks
@@ -335,7 +335,7 @@ class TestSafetyValve:
         mock_client.__aexit__ = AsyncMock(return_value=False)
         mock_client.post = AsyncMock(side_effect=make_response)
 
-        with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+        with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
             result = await svc.retrieve(GRAPH_URI, "test query", top_k=5)
 
         assert result is not None
@@ -358,7 +358,7 @@ class TestErrorHandling:
         mock_client.__aexit__ = AsyncMock(return_value=False)
         mock_client.post = AsyncMock(return_value=mock_response)
 
-        with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+        with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
             with pytest.raises(EmbeddingError, match="500"):
                 await svc._embed_texts(["test"])
 
@@ -375,7 +375,7 @@ class TestErrorHandling:
         }
         mock_client = _mock_httpx_post(_make_embedding_response(["TypeA"]))
 
-        with patch("cograph_client.nlp.ontology_embeddings.httpx.AsyncClient", return_value=mock_client):
+        with patch("cograph_client.nlp.embed_client.httpx.AsyncClient", return_value=mock_client):
             with patch.object(svc, "_s3_put", side_effect=Exception("S3 down")):
                 count = await svc.build_from_ontology(GRAPH_URI, mock_neptune)
 

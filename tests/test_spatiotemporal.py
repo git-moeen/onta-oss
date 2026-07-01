@@ -399,6 +399,13 @@ def pg(monkeypatch):
     import asyncpg
 
     monkeypatch.setattr(asyncpg, "create_pool", fake_create_pool)
+    # Pool creation is delegated to the process-wide shared pool (ONTA-174);
+    # clear its per-DSN cache so each test gets THIS test's fake, not a
+    # previous test's (and the lazily-bound asyncio.Lock is re-created on the
+    # current event loop).
+    from cograph_client.db.pool import reset_pg_pools
+
+    reset_pg_pools()
     store = PostGISSpatioTemporalIndex(dsn="postgres://user@host/db")
     return store, recorder, conn
 

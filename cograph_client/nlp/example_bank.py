@@ -14,15 +14,20 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
 import numpy as np
 
-logger = logging.getLogger(__name__)
+# Shared embed client (ONTA-174) — model/batching/errors live in ONE place.
+# Constants are re-exported for backward compatibility with existing importers.
+from cograph_client.nlp.embed_client import (  # noqa: F401 — re-exports
+    EMBEDDING_BATCH_SIZE,
+    EMBEDDING_DIM,
+    EMBEDDING_MODEL,
+    OPENROUTER_EMBEDDINGS_URL,
+    embed_texts,
+)
+from cograph_client.nlp.embed_client import cosine_similarity as _cosine_similarity  # noqa: F401
 
-OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
-EMBEDDING_MODEL = "openai/text-embedding-3-small"
-EMBEDDING_DIM = 1536
-EMBEDDING_BATCH_SIZE = 100
+logger = logging.getLogger(__name__)
 
 # Bank limits
 MAX_BANK_SIZE = 500
@@ -202,16 +207,6 @@ def detect_pattern_tags(sparql: str) -> list[str]:
         tags.append("multi_hop")
 
     return sorted(set(tags))
-
-
-def _cosine_similarity(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Cosine similarity between a query vector and a matrix of vectors."""
-    query_norm = np.linalg.norm(query)
-    if query_norm == 0:
-        return np.zeros(matrix.shape[0])
-    matrix_norms = np.linalg.norm(matrix, axis=1)
-    matrix_norms = np.where(matrix_norms == 0, 1, matrix_norms)
-    return np.dot(matrix, query) / (matrix_norms * query_norm)
 
 
 class ExampleBank:
@@ -613,27 +608,13 @@ class ExampleBank:
         return results[0]
 
     async def _embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Call OpenRouter embeddings API in batches. Same pattern as ontology_embeddings.py."""
-        all_embeddings: list[list[float]] = []
+        """Delegate to the shared embed client (kept as a method: test seam).
 
-        for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-            batch = texts[i : i + EMBEDDING_BATCH_SIZE]
-            async with httpx.AsyncClient(timeout=30) as client:
-                res = await client.post(
-                    OPENROUTER_EMBEDDINGS_URL,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"model": EMBEDDING_MODEL, "input": batch},
-                )
-                if res.status_code != 200:
-                    raise RuntimeError(f"Embedding API returned {res.status_code}: {res.text}")
-                data = res.json()
-                batch_embeddings = [item["embedding"] for item in data["data"]]
-                all_embeddings.extend(batch_embeddings)
-
-        return all_embeddings
+        Raises :class:`~cograph_client.nlp.embed_client.EmbeddingError` — a
+        ``RuntimeError`` subclass, so historical ``except RuntimeError``
+        callers are unaffected.
+        """
+        return await embed_texts(texts, api_key=self._api_key)
 
 
 # ── Prompt formatting ────────────────────────────────────────────────────

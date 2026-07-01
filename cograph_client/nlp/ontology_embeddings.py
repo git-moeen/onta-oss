@@ -11,26 +11,30 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-import httpx
 import numpy as np
 
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.ontology_queries import get_full_ontology_query, type_uri, attr_uri
 from cograph_client.graph.parser import parse_sparql_results
 
+# Shared embed client (ONTA-174) — model/batching/errors live in ONE place.
+# EmbeddingError and the embedding constants are re-exported here so existing
+# importers (tests, callers) keep working unchanged.
+from cograph_client.nlp.embed_client import (  # noqa: F401 — re-exports
+    EMBEDDING_BATCH_SIZE,
+    EMBEDDING_DIM,
+    EMBEDDING_MODEL,
+    OPENROUTER_EMBEDDINGS_URL,
+    EmbeddingError,
+    embed_texts,
+)
+from cograph_client.nlp.embed_client import cosine_similarity as _cosine_similarity  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
-OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
-EMBEDDING_MODEL = "openai/text-embedding-3-small"
-EMBEDDING_DIM = 1536
-EMBEDDING_BATCH_SIZE = 100
 TYPE_URI_PREFIX = "https://cograph.tech/types/"
 LARGE_TYPE_ATTR_THRESHOLD = 200
 LARGE_TYPE_ATTR_KEEP = 50
-
-
-class EmbeddingError(Exception):
-    """Raised when the embedding API call fails."""
 
 
 @dataclass
@@ -200,27 +204,8 @@ class OntologyEmbeddingService:
     # ── Embedding API ─────────────────────────────────────────────────
 
     async def _embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Call OpenRouter embeddings API in batches."""
-        all_embeddings: list[list[float]] = []
-
-        for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-            batch = texts[i : i + EMBEDDING_BATCH_SIZE]
-            async with httpx.AsyncClient(timeout=30) as client:
-                res = await client.post(
-                    OPENROUTER_EMBEDDINGS_URL,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"model": EMBEDDING_MODEL, "input": batch},
-                )
-                if res.status_code != 200:
-                    raise EmbeddingError(f"Embedding API returned {res.status_code}: {res.text}")
-                data = res.json()
-                batch_embeddings = [item["embedding"] for item in data["data"]]
-                all_embeddings.extend(batch_embeddings)
-
-        return all_embeddings
+        """Delegate to the shared embed client (kept as a method: test seam)."""
+        return await embed_texts(texts, api_key=self._api_key)
 
     async def _filter_attributes(self, attributes: list[str], question_vec: np.ndarray) -> list[str]:
         """For types with 200+ attributes, keep only the top-50 most relevant."""
@@ -369,16 +354,6 @@ def _format_output_text(type_name: str, attributes: list[str], relationship_targ
     if relationship_targets:
         lines.append(f"  Relationships: (see related types)")
     return "\n".join(lines)
-
-
-def _cosine_similarity(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Compute cosine similarity between a query vector and a matrix of vectors."""
-    query_norm = np.linalg.norm(query)
-    if query_norm == 0:
-        return np.zeros(matrix.shape[0])
-    matrix_norms = np.linalg.norm(matrix, axis=1)
-    matrix_norms = np.where(matrix_norms == 0, 1, matrix_norms)
-    return np.dot(matrix, query) / (matrix_norms * query_norm)
 
 
 def _extract_tenant_id(graph_uri: str) -> str:
