@@ -26,6 +26,20 @@ from typing import Optional
 # formatting, never a hard validation gate (a research answer is best-effort).
 FIELD_TYPES = ("string", "number", "boolean", "date", "url")
 
+# Characters that make a spreadsheet treat a cell as a formula. Research rows come
+# from untrusted web pages / LLM extraction, so a value like ``=cmd|'…'!A1`` would
+# execute when the exported CSV is opened in Excel/Sheets. Prefix such cells.
+_CSV_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: object) -> str:
+    """Neutralize CSV formula injection: prefix a leading formula-trigger char
+    with an apostrophe so a spreadsheet treats the cell as text, not a formula."""
+    s = "" if value is None else str(value)
+    if s and s[0] in _CSV_FORMULA_LEADERS:
+        return "'" + s
+    return s
+
 
 @dataclass
 class SchemaField:
@@ -263,10 +277,11 @@ class ResearchResult:
             return ""
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow([*cols, "sources"])
+        writer.writerow([_csv_safe(c) for c in cols] + ["sources"])
         for r in self.rows:
             writer.writerow(
-                [r.values.get(c, "") for c in cols] + ["; ".join(r.citations)]
+                [_csv_safe(r.values.get(c, "")) for c in cols]
+                + [_csv_safe("; ".join(r.citations))]
             )
         return buf.getvalue()
 

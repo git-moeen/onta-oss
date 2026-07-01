@@ -162,7 +162,12 @@ class WebResearchCapability:
         schema = TargetSchema.from_dict(params.get("schema") or {})
         urls = list(params.get("urls") or [])
         max_rows = int(params.get("max_rows", _DEFAULT_MAX_ROWS))
-        budget = Budget(**{**_DEFAULT_BUDGET, **(params.get("budget") or {})})
+        # Filter to Budget's known fields so an unexpected/typo'd key in a stored
+        # plan can't raise TypeError and lose the turn.
+        merged_budget = {**_DEFAULT_BUDGET, **(params.get("budget") or {})}
+        budget = Budget(
+            **{k: v for k, v in merged_budget.items() if k in _DEFAULT_BUDGET}
+        )
 
         harness = WebResearchHarness(openrouter_key=ctx.openrouter_key)
         result = await harness.run(

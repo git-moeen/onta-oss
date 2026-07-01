@@ -192,9 +192,11 @@ class WebResearchHarness:
             iterations += 1
 
             # 2. Discover (premium provider) → candidate rows + source URLs.
-            if plan.needs_web and queries:
+            #    Discovery is a paid/metered source consultation, so it is gated
+            #    and charged against the fetch budget just like a page fetch.
+            if plan.needs_web and queries and budget.can_fetch():
                 disc_rows, disc_urls = await self._discover(
-                    queries, cols, max_rows, context
+                    queries, cols, max_rows, context, budget
                 )
                 all_rows.extend(disc_rows)
                 for u in disc_urls:
@@ -274,13 +276,23 @@ class WebResearchHarness:
         return out
 
     async def _discover(
-        self, queries: list[str], cols: list[str], max_rows: int, context: dict
+        self,
+        queries: list[str],
+        cols: list[str],
+        max_rows: int,
+        context: dict,
+        budget: Budget,
     ) -> tuple[list[ResearchRow], list[str]]:
         if self._discover_fn is None:
             return [], []
         rows_out: list[ResearchRow] = []
         urls_out: list[str] = []
         for q in queries[:2]:
+            # Meter each provider call: discovery is a paid source consultation,
+            # so stop once the budget can no longer afford one.
+            if not budget.can_fetch():
+                break
+            budget.note_fetch(1)
             try:
                 result: DiscoverResult = await self._discover_fn(
                     q,
@@ -324,10 +336,21 @@ class WebResearchHarness:
                     "research_fetch_raised", url=url, fetcher=fetcher.name, error=str(exc)
                 )
                 continue
-            if page is not None and (best is None or page.has_content()):
-                best = page
-            if page is not None and page.has_content() and not _looks_incomplete(page):
-                return page  # good enough; don't pay for a higher rung
+            if page is None:
+                continue
+            if page.has_content():
+                # Keep the page with the MOST usable text — a later rung that
+                # returns a sliver must not clobber an earlier, richer read.
+                if (
+                    best is None
+                    or not best.has_content()
+                    or len(page.text) > len(best.text)
+                ):
+                    best = page
+                if not _looks_incomplete(page):
+                    return page  # good enough; don't pay for a higher rung
+            elif best is None:
+                best = page  # keep an error page only if nothing better seen
         return best
 
     @staticmethod
@@ -339,6 +362,9 @@ class WebResearchHarness:
         for r in rows:
             if not any(str(v).strip() for v in r.values.values()):
                 continue
+            # Clamp confidence to [0,1] — a discovery provider (or bug) can hand
+            # us an out-of-range score that would otherwise ride onto the artifact.
+            r.confidence = min(1.0, max(0.0, r.confidence))
             key = _row_key(r.values, cols)
             if key in by_key:
                 existing = by_key[key]

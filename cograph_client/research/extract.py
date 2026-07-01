@@ -124,10 +124,13 @@ def _coerce_values(raw: object, field_names: list[str]) -> dict[str, str]:
 
 
 def _dedupe_key(row: ResearchRow, schema: TargetSchema) -> str:
-    """A case-insensitive identity for a row over its required (else all) fields."""
-    names = schema.required_names() or schema.field_names()
-    if not names:
-        names = sorted(row.values.keys())
+    """A case-insensitive identity for a row over ALL its schema fields.
+
+    Keying on the FULL value tuple (not just the required fields) — matching
+    ``harness._merge_rows`` — so two genuinely distinct records that happen to
+    share a required value (e.g. two models both named "GPT" with different
+    scores) are NOT collapsed into one, silently dropping the second."""
+    names = schema.field_names() or sorted(row.values.keys())
     return "\x1f".join(
         str(row.values.get(n, "")).strip().lower() for n in names
     )
@@ -153,7 +156,7 @@ async def extract_rows(
     source page.
 
     Rows are concatenated across pages, lightly de-duplicated (case-insensitive
-    over required-or-all fields, merging citations), and capped at ``max_rows``.
+    over all schema fields, merging citations), and capped at ``max_rows``.
 
     NEVER raises. A page that errors is skipped (logged); no ``openrouter_key``
     or no pages returns ``[]``. The pass is budget-bounded: it stops before a

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
 from html.parser import HTMLParser
 from typing import Optional, Protocol, runtime_checkable
 from urllib.parse import urlparse
@@ -37,6 +38,10 @@ logger = structlog.stdlib.get_logger("cograph.research.fetch")
 _MAX_BYTES = 2_000_000
 _MAX_CHARS = 40_000
 _DEFAULT_TIMEOUT = 20.0
+# Redirects are followed MANUALLY (see StaticHttpFetcher.fetch) so each hop is
+# re-validated against the SSRF guard — httpx's own follow_redirects would chase
+# a 302 → http://127.0.0.1 past the guard. Bounded to stop redirect loops.
+_MAX_REDIRECTS = 5
 _UA = "Mozilla/5.0 (compatible; OntaResearchBot/1.0; +https://onta.sh/bot)"
 
 
@@ -131,15 +136,46 @@ _BLOCKED_HOST_RE = re.compile(
 )
 
 
+def _host_to_ip(host: str) -> Optional[ipaddress._BaseAddress]:
+    """Parse a host into an IP across ENCODINGS, or None for a real hostname.
+
+    An SSRF guard that only recognizes the canonical ``127.0.0.1`` literal is
+    trivially bypassed: ``2130706433`` (decimal), ``0x7f000001`` (hex),
+    ``0177.0.0.1`` (octal) and ``127.1`` (short) all resolve to loopback at
+    connect time. We normalize every numeric IPv4 encoding here so the block
+    decision sees the real address. Pure parsing, NO DNS — a genuine hostname
+    returns None (its resolution is the egress proxy's job), which keeps this
+    deterministic offline (tests/CI never hit the network)."""
+    h = (host or "").rstrip(".")
+    if not h:
+        return None
+    # 1. A plain literal (IPv4 or IPv6, incl. the [::1] form urlparse strips).
+    try:
+        return ipaddress.ip_address(h)
+    except ValueError:
+        pass
+    # 2. A bare 32-bit decimal integer host, e.g. "2130706433".
+    if h.isdigit():
+        try:
+            return ipaddress.ip_address(int(h))
+        except ValueError:
+            return None
+    # 3. Hex / octal / short dotted IPv4 forms — let the C numeric parser
+    #    (inet_aton, NO DNS) canonicalize them; a hostname raises OSError here.
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(h))
+    except (OSError, ValueError):
+        return None
+
+
 def _is_blocked_host(host: str) -> bool:
     if not host:
         return True
-    if _BLOCKED_HOST_RE.match(host):
+    if _BLOCKED_HOST_RE.match(host.rstrip(".")):
         return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False  # a hostname; DNS resolution is the egress proxy's job
+    ip = _host_to_ip(host)
+    if ip is None:
+        return False  # a real hostname; DNS resolution is the egress proxy's job
     return (
         ip.is_loopback
         or ip.is_link_local
@@ -221,9 +257,10 @@ class StaticHttpFetcher:
     """OSS default fetcher (tier 0): a plain ``httpx`` GET + stdlib HTML→text.
 
     Cheapest rung of the ladder. Reads at most ``_MAX_BYTES`` off the wire,
-    follows redirects, refuses internal hosts, and reduces HTML to plain text
-    (JSON/plain bodies pass through). Never raises — a failure returns
-    ``FetchedPage(ok=False, error=...)`` so the harness can escalate or move on.
+    follows redirects MANUALLY (re-validating each hop against the SSRF guard),
+    refuses internal hosts, and reduces HTML to plain text (JSON/plain bodies
+    pass through). Never raises — a failure returns ``FetchedPage(ok=False,
+    error=...)`` so the harness can escalate or move on.
     """
 
     name = "static"
@@ -239,32 +276,58 @@ class StaticHttpFetcher:
             return FetchedPage(
                 url=url, tier=self.name, ok=False, error="blocked or non-http(s) URL"
             )
+        content_type = ""
+        body = ""
+        truncated = False
+        current = url
         try:
             async with httpx.AsyncClient(
                 timeout=self._timeout,
-                follow_redirects=True,
+                follow_redirects=False,  # followed manually below, re-validated per hop
                 headers={"User-Agent": _UA, "Accept": "text/html,application/json,*/*"},
             ) as client:
-                async with client.stream("GET", url) as resp:
-                    if resp.status_code >= 400:
-                        return FetchedPage(
-                            url=url,
-                            tier=self.name,
-                            ok=False,
-                            error=f"HTTP {resp.status_code}",
-                        )
-                    content_type = resp.headers.get("content-type", "").lower()
-                    chunks: list[bytes] = []
-                    total = 0
-                    truncated = False
-                    async for chunk in resp.aiter_bytes():
-                        chunks.append(chunk)
-                        total += len(chunk)
-                        if total >= _MAX_BYTES:
-                            truncated = True
-                            break
-            raw = b"".join(chunks)
-            body = raw.decode("utf-8", errors="replace")
+                for _hop in range(_MAX_REDIRECTS + 1):
+                    async with client.stream("GET", current) as resp:
+                        # Manual redirect handling: re-run the SSRF guard on the
+                        # target so a public URL can't 302 us onto an internal one.
+                        if resp.is_redirect:
+                            location = resp.headers.get("location", "")
+                            nxt = (
+                                str(httpx.URL(current).join(location))
+                                if location
+                                else ""
+                            )
+                            if not nxt or not is_fetchable_url(nxt):
+                                return FetchedPage(
+                                    url=url,
+                                    tier=self.name,
+                                    ok=False,
+                                    error="redirect to blocked or missing location",
+                                )
+                            current = nxt
+                            continue
+                        if resp.status_code >= 400:
+                            return FetchedPage(
+                                url=url,
+                                tier=self.name,
+                                ok=False,
+                                error=f"HTTP {resp.status_code}",
+                            )
+                        content_type = resp.headers.get("content-type", "").lower()
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in resp.aiter_bytes():
+                            chunks.append(chunk)
+                            total += len(chunk)
+                            if total >= _MAX_BYTES:
+                                truncated = True
+                                break
+                        body = b"".join(chunks).decode("utf-8", errors="replace")
+                        break
+                else:
+                    return FetchedPage(
+                        url=url, tier=self.name, ok=False, error="too many redirects"
+                    )
         except Exception as exc:  # network error, timeout, bad TLS, …
             return FetchedPage(url=url, tier=self.name, ok=False, error=str(exc)[:200])
 
