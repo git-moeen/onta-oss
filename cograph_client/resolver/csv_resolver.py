@@ -214,6 +214,13 @@ KEYS (row conservation is mandatory)
 EDGES
 - An edge predicate names the RELATIONSHIP (a role/verb) between two entities, never the source column name.
 
+NAMES / LABELS (a name is optional, not mandatory)
+- Not every entity has a name. Map a column to a "name"/label attribute ONLY when it is a genuine
+  human-identifying proper name of that entity. A reified/measurement or dependent entity (a score,
+  rating, price, ranking, or an issued identifier) has NO proper name — do NOT designate a descriptive
+  or composite column as its "name", and prefer a composite/synthetic key over keying it on such a
+  label. It is identified by its value + the entities it links to.
+
 TYPE REUSE
 - The user message lists the tenant's EXISTING ontology types. Reuse one ONLY when your entity is genuinely
   the SAME real-world concept. If none genuinely matches, propose a NEW accurate PascalCase type name —
@@ -315,6 +322,9 @@ HARD RULES:
   Attach the constant ONLY to the slot whose ROLE matches the party's role in producing this
   dataset (a catalog's publisher is the issuer/offerer of its identifiers — it is NOT the maker
   of the products listed).
+- A promoted/dependent or measurement type has NO name of its own: never add a "name"/label core
+  slot for it. Its identity is its constitutive slots (the parties it depends on + the identifier or
+  value it carries), not a human-readable label.
 
 Output strict JSON:
 {"types":[{"type","promoted_from_attribute": null|"<attr>","core_slots":[{"name","kind":"relationship|attribute",
