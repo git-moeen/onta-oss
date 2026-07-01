@@ -73,7 +73,7 @@ ontology, extract structured entities, their attributes, and relationships.
 
 Rules:
 - Each entity must have a type_name (PascalCase, singular noun, e.g. "Property" not "properties")
-- Each entity must have an id (use the most natural identifier: name, address, etc.)
+- Each entity must have an id — a stable handle, NOT a display label. Use a genuine human identifier (name, title, address) when the entity has one; when it has no natural name (a reified measurement, event, or other dependent entity) derive a compact STRUCTURAL id from its defining fields. Never invent a descriptive phrase just to serve as an id (see "Names are optional" below).
 - Attributes have a name (snake_case), value (string), and datatype (string, integer, float, boolean, datetime, uri, geo)
 - Use datatype "geo" only for a SINGLE coordinate value (a WKT "POINT(lon lat)" or a "lat,lon" pair); keep separate latitude/longitude columns as float
 - Relationships connect two entities by their id with a predicate (snake_case)
@@ -121,6 +121,18 @@ housekeeping). Reify INSTEAD of a bare scalar attribute on the parent: a bare \
 number loses its history and its provenance the moment a newer reading arrives. \
 Reify only genuine observations; do NOT reify a fixed intrinsic property (a \
 person's birth_year, a product's sku).
+
+Names are optional:
+Not every entity has a name. Emit a "name" (or other name-like label) attribute \
+ONLY when the entity has a real, human-identifying proper name (a person, place, \
+organization, product, titled work). Do NOT fabricate one for an entity that is \
+identified structurally or by its links — a reified measurement/observation \
+(score, rating, price, ranking), an untitled event or transaction, or a \
+dependent/association entity has \
+NO proper name. Identify those by their "value", timestamp, and relationships; a \
+descriptive label stitched together from those fields (the measured thing + the \
+number) is redundant — omit it. Forcing a name onto a nameless entity is a \
+modeling error, not a default.
 
 Lift providers / organizations:
 When records carry a recurring CATEGORICAL naming a provider, vendor, publisher, \
