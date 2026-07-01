@@ -64,7 +64,8 @@ def _build_prompt(
         '"needs_web": <bool>, "fast_path": <bool>, '
         '"queries": ["<concrete discovery query>", ...], '
         '"needs_clarification": <bool>, '
-        '"clarifying_questions": ["<question to ask the user>", ...], '
+        '"clarifying_questions": [{"question": "<question to ask the user>", '
+        '"options": ["<suggested answer>", ...]}, ...], '
         '"rationale": "<one line>"}\n\n'
         "Rules:\n"
         "- `entity` names one row (e.g. \"TTS model\", \"company\").\n"
@@ -85,6 +86,11 @@ def _build_prompt(
         "- `clarifying_questions` holds 1–3 short, specific questions ONLY when "
         "`needs_clarification` is true; otherwise an empty list. When you ask, "
         "you may still fill `entity`/`fields`/`queries` with your best guess.\n"
+        "- Each clarifying question SHOULD carry 2–4 short `options` when the "
+        "plausible answers are enumerable (e.g. modality: LLMs / image / speech; "
+        "metric: benchmark score / price / popularity) — they render as one-tap "
+        "choices. Use an empty `options` list when a free-form answer is better "
+        "(e.g. \"which company?\"). Options are suggestions, never a closed set.\n"
         "- `rationale` is one short line.\n",
     ]
     if hints:

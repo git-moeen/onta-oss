@@ -99,13 +99,26 @@ async def test_plan_available_via_registered_provider_without_urls():
 async def test_plan_asks_for_clarification_when_ambiguous(monkeypatch):
     # A genuinely ambiguous question surfaces a no-write 'answer' step carrying the
     # clarifying questions — the confirm-before-spend research step is never made.
-    from cograph_client.research.types import ResearchPlan, SchemaField, TargetSchema
+    # Questions ride the payload STRUCTURED (question + options) for reply chips,
+    # with the options also inlined in the plain-text answer.
+    from cograph_client.research.types import (
+        ClarifyingQuestion,
+        ResearchPlan,
+        SchemaField,
+        TargetSchema,
+    )
 
     async def _ambiguous_plan(instruction, **kw):
         return ResearchPlan(
             question=instruction,
             needs_clarification=True,
-            clarifying_questions=["Best by what metric?", "Which modality?"],
+            clarifying_questions=[
+                ClarifyingQuestion(
+                    question="Best by what metric?",
+                    options=["benchmark score", "price"],
+                ),
+                ClarifyingQuestion(question="Which modality?"),
+            ],
             schema=TargetSchema(entity="model", fields=[SchemaField(name="name")]),
         )
 
@@ -120,10 +133,11 @@ async def test_plan_asks_for_clarification_when_ambiguous(monkeypatch):
     assert steps[0].action == "answer"  # not "research" — nothing will be spent
     payload = steps[0].params["answer_payload"]
     assert payload["clarifying_questions"] == [
-        "Best by what metric?",
-        "Which modality?",
+        {"question": "Best by what metric?", "options": ["benchmark score", "price"]},
+        {"question": "Which modality?", "options": []},
     ]
     assert "clarification" in payload["answer"].lower()
+    assert "(benchmark score / price)" in payload["answer"]
 
 
 async def test_paid_fetcher_shows_up_in_cost_estimate():

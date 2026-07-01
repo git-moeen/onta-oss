@@ -37,11 +37,13 @@ from cograph_client.research.fetch import (
 from cograph_client.research.types import (
     Budget,
     Citation,
+    ClarifyingQuestion,
     ResearchPlan,
     ResearchResult,
     ResearchRow,
     SchemaField,
     TargetSchema,
+    normalize_clarifying_questions,
 )
 from cograph_client.research.verify import (
     CiteOrAbstainVerifier,
@@ -56,6 +58,7 @@ __all__ = [
     "Budget",
     "Citation",
     "CiteOrAbstainVerifier",
+    "ClarifyingQuestion",
     "FetchedPage",
     "PageFetcher",
     "ResearchPlan",
@@ -69,6 +72,7 @@ __all__ = [
     "fetcher_cost",
     "get_page_fetchers",
     "get_research_verifier",
+    "normalize_clarifying_questions",
     "register_page_fetcher",
     "register_research_verifier",
     "reset_page_fetchers",

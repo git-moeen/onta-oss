@@ -15,6 +15,7 @@ from cograph_client.research.types import (
     ResearchResult,
     ResearchRow,
     TargetSchema,
+    normalize_clarifying_questions,
 )
 from cograph_client.research.verify import VerifyOutcome
 
@@ -85,18 +86,26 @@ def _prose_answer(
     return lead + tail
 
 
-def clarification_result(question: str, questions: list[str]) -> ResearchResult:
+def clarification_result(question: str, questions: list) -> ResearchResult:
     """A no-spend result that asks the user to disambiguate rather than guessing.
 
     Returned by the harness when the planner flags the question as genuinely
     ambiguous (ADR 0006 §Plan — ask only on true ambiguity). Carries no rows and
     is NOT an abstain: ``abstained`` means "searched, found nothing supportable",
-    while this means "I haven't searched yet — pick a reading first"."""
-    qs = [str(q).strip() for q in (questions or []) if str(q).strip()][:3]
-    body = "\n".join(f"- {q}" for q in qs)
+    while this means "I haven't searched yet — pick a reading first".
+
+    ``questions`` entries may be bare strings or ``{"question", "options"}``
+    shapes (see :func:`normalize_clarifying_questions`); options are rendered
+    inline as suggested answers and ride the result structurally for clients
+    that show reply chips."""
+    qs = normalize_clarifying_questions(questions)
+    lines = [
+        f"- {q.question}" + (f" ({' / '.join(q.options)})" if q.options else "")
+        for q in qs
+    ]
     answer = (
         "Before I search the web for this, I need one clarification — the question "
-        "has more than one reasonable reading:\n" + body
+        "has more than one reasonable reading:\n" + "\n".join(lines)
         if qs
         else "Could you clarify what exactly you're looking for?"
     )

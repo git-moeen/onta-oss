@@ -115,6 +115,60 @@ class TargetSchema:
 
 
 @dataclass
+class ClarifyingQuestion:
+    """One question to ask the user before researching, optionally with a short
+    list of suggested answers a client can render as reply chips.
+
+    ``options`` empty means free-form — the question stands on its own. Options
+    are SUGGESTIONS, never a closed set: the user can always answer in their own
+    words.
+    """
+
+    question: str
+    options: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"question": self.question, "options": list(self.options)}
+
+    @classmethod
+    def from_any(cls, item: object) -> "Optional[ClarifyingQuestion]":
+        """Parse a planner-emitted entry defensively: a bare string, a
+        ``{"question", "options"}`` dict, or an existing instance. Returns None
+        for anything unusable (empty/blank question)."""
+        if isinstance(item, ClarifyingQuestion):
+            q, opts = item.question, item.options
+        elif isinstance(item, str):
+            q, opts = item, []
+        elif isinstance(item, dict):
+            q = str(item.get("question", "") or "")
+            opts = item.get("options") or []
+        else:
+            return None
+        q = q.strip()
+        if not q:
+            return None
+        seen: set[str] = set()
+        norm: list[str] = []
+        for o in opts if isinstance(opts, (list, tuple)) else []:
+            s = str(o).strip()
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                norm.append(s)
+        return cls(question=q, options=norm[:5])
+
+
+def normalize_clarifying_questions(items: object) -> list[ClarifyingQuestion]:
+    """Normalize a planner/caller-supplied list into at most 3 well-formed
+    :class:`ClarifyingQuestion`\\ s — ask, don't interrogate. Never raises."""
+    out: list[ClarifyingQuestion] = []
+    for item in items if isinstance(items, (list, tuple)) else []:
+        cq = ClarifyingQuestion.from_any(item)
+        if cq is not None:
+            out.append(cq)
+    return out[:3]
+
+
+@dataclass
 class Citation:
     """A source consulted, surfaced to the user as a clickable citation."""
 
@@ -192,9 +246,10 @@ class ResearchPlan:
 
     ``needs_clarification`` is True ONLY when the question is genuinely ambiguous —
     it has more than one materially different reading that would change the schema
-    or the answer — in which case ``clarifying_questions`` holds 1–3 crisp things
-    to ask the user BEFORE spending on the web. The default is to proceed with the
-    best interpretation; asking is the exception, not the rule.
+    or the answer — in which case ``clarifying_questions`` holds 1–3 crisp
+    :class:`ClarifyingQuestion`\\ s to ask the user BEFORE spending on the web,
+    each optionally carrying suggested answer options. The default is to proceed
+    with the best interpretation; asking is the exception, not the rule.
     """
 
     question: str
@@ -205,7 +260,7 @@ class ResearchPlan:
     seed_urls: list[str] = field(default_factory=list)
     rationale: str = ""
     needs_clarification: bool = False
-    clarifying_questions: list[str] = field(default_factory=list)
+    clarifying_questions: list[ClarifyingQuestion] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -217,7 +272,12 @@ class ResearchPlan:
             "seed_urls": list(self.seed_urls),
             "rationale": self.rationale,
             "needs_clarification": self.needs_clarification,
-            "clarifying_questions": list(self.clarifying_questions),
+            # normalize on the way out so a plan hand-built with bare strings
+            # (tests, callers) still serializes to the canonical shape.
+            "clarifying_questions": [
+                q.to_dict()
+                for q in normalize_clarifying_questions(self.clarifying_questions)
+            ],
         }
 
     @classmethod
@@ -231,9 +291,9 @@ class ResearchPlan:
             seed_urls=[str(u) for u in (d.get("seed_urls") or []) if str(u).strip()],
             rationale=str(d.get("rationale", "") or ""),
             needs_clarification=bool(d.get("needs_clarification", False)),
-            clarifying_questions=[
-                str(q) for q in (d.get("clarifying_questions") or []) if str(q).strip()
-            ],
+            clarifying_questions=normalize_clarifying_questions(
+                d.get("clarifying_questions")
+            ),
         )
 
 
@@ -262,8 +322,9 @@ class ResearchResult:
     # Set when the harness asked the user to disambiguate instead of running the
     # loop — no rows, no web spend, an honest question back (distinct from
     # ``abstained``, which means "I searched and found nothing supportable").
+    # Each entry may carry suggested answer options (reply chips).
     needs_clarification: bool = False
-    clarifying_questions: list[str] = field(default_factory=list)
+    clarifying_questions: list[ClarifyingQuestion] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -279,7 +340,10 @@ class ResearchResult:
             "sources_consulted": list(self.sources_consulted),
             "notes": self.notes,
             "needs_clarification": self.needs_clarification,
-            "clarifying_questions": list(self.clarifying_questions),
+            "clarifying_questions": [
+                q.to_dict()
+                for q in normalize_clarifying_questions(self.clarifying_questions)
+            ],
         }
 
     def to_csv(self) -> str:
@@ -371,6 +435,7 @@ class Budget:
 __all__ = [
     "Budget",
     "Citation",
+    "ClarifyingQuestion",
     "FIELD_TYPES",
     "FetchedPage",
     "ResearchPlan",
@@ -378,4 +443,5 @@ __all__ = [
     "ResearchRow",
     "SchemaField",
     "TargetSchema",
+    "normalize_clarifying_questions",
 ]

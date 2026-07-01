@@ -29,7 +29,11 @@ import structlog
 from cograph_client.agent.registry import AgentContext, PlanStep
 from cograph_client.research.fetch import fetcher_cost, get_page_fetchers
 from cograph_client.research.harness import WebResearchHarness
-from cograph_client.research.types import Budget, TargetSchema
+from cograph_client.research.types import (
+    Budget,
+    TargetSchema,
+    normalize_clarifying_questions,
+)
 from cograph_client.web_sources.base import get_web_source, provider_cost
 from cograph_client.web_sources.url_extract import extract_urls
 
@@ -57,15 +61,20 @@ def _answer_step(text: str) -> PlanStep:
     )
 
 
-def _clarify_step(questions: list[str]) -> PlanStep:
+def _clarify_step(questions: list) -> PlanStep:
     """A no-spend 'answer' step that asks the user to disambiguate a genuinely
     ambiguous question BEFORE running (and paying for) the research loop. The
-    questions ride the payload so a client can render them as reply chips."""
-    qs = [str(q).strip() for q in questions if str(q).strip()][:3]
+    questions ride the payload STRUCTURED (``{"question", "options"}``) so a
+    client can render each one's suggested answers as one-tap reply chips;
+    options are also inlined in the text for plain-text clients."""
+    qs = normalize_clarifying_questions(questions)
+    lines = [
+        f"- {q.question}" + (f" ({' / '.join(q.options)})" if q.options else "")
+        for q in qs
+    ]
     text = (
         "This question has more than one reasonable reading — a quick "
-        "clarification will get you a sharper answer:\n"
-        + "\n".join(f"- {q}" for q in qs)
+        "clarification will get you a sharper answer:\n" + "\n".join(lines)
     )
     return PlanStep(
         capability=WebResearchCapability.name,
@@ -74,7 +83,7 @@ def _clarify_step(questions: list[str]) -> PlanStep:
             "answer_payload": {
                 "answer": text,
                 "narrative": text,
-                "clarifying_questions": qs,
+                "clarifying_questions": [q.to_dict() for q in qs],
             }
         },
         rationale="Question is ambiguous — asking before spending on web tools.",

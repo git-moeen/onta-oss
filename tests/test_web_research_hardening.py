@@ -286,20 +286,82 @@ def test_looks_incomplete_flags_nav_only_shell():
 
 
 # --- ONTA-166 local: clarify-on-true-ambiguity -------------------------------- #
-async def test_plan_emits_clarifying_questions_when_ambiguous(monkeypatch):
+async def test_plan_emits_clarifying_questions_with_options(monkeypatch):
     async def _chat(key, system, user, **kw):
         return (
             '{"entity":"model","fields":[{"name":"name","required":true}],'
             '"needs_web":true,"fast_path":false,"queries":["best models"],'
             '"needs_clarification":true,'
-            '"clarifying_questions":["Best by what metric?","Which modality?"],'
+            '"clarifying_questions":['
+            '{"question":"Best by what metric?",'
+            '"options":["benchmark score","price","popularity"]},'
+            '{"question":"Which modality?","options":["LLMs","image","speech"]}],'
             '"rationale":"ambiguous"}'
         )
 
     monkeypatch.setattr("cograph_client.research.plan.openrouter_chat", _chat)
     plan = await plan_research("list the best models", openrouter_key="k")
     assert plan.needs_clarification is True
-    assert plan.clarifying_questions == ["Best by what metric?", "Which modality?"]
+    assert [q.question for q in plan.clarifying_questions] == [
+        "Best by what metric?",
+        "Which modality?",
+    ]
+    assert plan.clarifying_questions[0].options == [
+        "benchmark score",
+        "price",
+        "popularity",
+    ]
+
+
+async def test_plan_accepts_bare_string_clarifying_questions(monkeypatch):
+    # Defensive parsing: a model that returns plain strings (the pre-options
+    # shape) still works — options just come back empty (free-form).
+    async def _chat(key, system, user, **kw):
+        return (
+            '{"entity":"item","fields":[{"name":"answer"}],"needs_web":true,'
+            '"needs_clarification":true,'
+            '"clarifying_questions":["Which region?", {"question":"What year?"}]}'
+        )
+
+    monkeypatch.setattr("cograph_client.research.plan.openrouter_chat", _chat)
+    plan = await plan_research("q", openrouter_key="k")
+    assert plan.needs_clarification is True
+    assert [(q.question, q.options) for q in plan.clarifying_questions] == [
+        ("Which region?", []),
+        ("What year?", []),
+    ]
+
+
+def test_normalize_clarifying_questions_caps_and_dedupes():
+    from cograph_client.research.types import normalize_clarifying_questions
+
+    qs = normalize_clarifying_questions(
+        [
+            {"question": "Q1", "options": ["a", "A", " b ", "", "c", "d", "e", "f"]},
+            "Q2",
+            {"question": "  "},  # blank → dropped
+            42,  # junk → dropped
+            "Q3",
+            "Q4",  # over the 3-question cap → dropped
+        ]
+    )
+    assert [q.question for q in qs] == ["Q1", "Q2", "Q3"]
+    assert qs[0].options == ["a", "b", "c", "d", "e"]  # deduped (case), capped at 5
+
+
+def test_clarification_result_renders_options_inline():
+    from cograph_client.research.synthesize import clarification_result
+
+    res = clarification_result(
+        "best models?",
+        [{"question": "Which modality?", "options": ["LLMs", "image", "speech"]}],
+    )
+    assert res.needs_clarification is True
+    assert "Which modality? (LLMs / image / speech)" in res.answer
+    d = res.to_dict()
+    assert d["clarifying_questions"] == [
+        {"question": "Which modality?", "options": ["LLMs", "image", "speech"]}
+    ]
 
 
 async def test_plan_clarification_ignored_when_no_questions(monkeypatch):
@@ -344,7 +406,9 @@ async def test_harness_asks_for_clarification_without_web_spend():
     )
     res = await harness.run("list the best models", urls=["https://ex.example/x"])
     assert res.needs_clarification is True
-    assert res.clarifying_questions == ["By what metric — speed, cost, or quality?"]
+    assert [q.question for q in res.clarifying_questions] == [
+        "By what metric — speed, cost, or quality?"
+    ]
     assert res.abstained is False  # asking is not abstaining
     assert res.rows == []
     assert fetcher.calls == 0  # short-circuited BEFORE any fetch → no web spend
