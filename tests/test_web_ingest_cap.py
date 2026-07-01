@@ -358,7 +358,7 @@ def test_empty_message_url_mode_error_surfaces_reason():
     msg = web_ingest_cap._empty_sample_message(
         "models",
         [url],
-        DiscoverResult(rows=[], sources=[url], error="HTTP 502 from firecrawl"),
+        DiscoverResult(rows=[], sources=[url], error="HTTP 502 upstream"),
     )
     assert url in msg
     assert "couldn't read" in msg
