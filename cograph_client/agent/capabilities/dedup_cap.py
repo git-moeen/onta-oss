@@ -220,6 +220,8 @@ class DedupCapability:
             conflict_policy=ConflictPolicy.stage,
             category=JobCategory.dedupe,
             trigger=JobTrigger.manual,
+            # Chat provenance: link the job to the conversation that spawned it.
+            thread_id=getattr(ctx, "session_id", None),
         )
         await job_store.create(job)
         _spawn(_run_dedup(ctx.neptune, job_store, job.id, ctx.tenant_id, kg_name))

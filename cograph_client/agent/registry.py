@@ -53,6 +53,11 @@ class AgentContext:
     # Capabilities read this defensively (``getattr(ctx, "urls", None)``) so they
     # keep working even if a context predates this field.
     urls: list[str] = field(default_factory=list)
+    # The conversation/thread id for this turn (the ``session_id`` on the agent
+    # request). Capabilities stamp it onto any job they create so a chat-spawned
+    # job is traceable back to its conversation. Read defensively
+    # (``getattr(ctx, "session_id", None)``) so older contexts keep working.
+    session_id: Optional[str] = None
     # Free-form extras (e.g. the enrichment executor/job-store stashed on
     # app.state) so a capability can reuse app-scoped singletons without the
     # context model needing to know about every engine.

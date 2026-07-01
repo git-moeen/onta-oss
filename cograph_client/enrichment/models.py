@@ -179,6 +179,11 @@ class EnrichRequest(BaseModel):
     # a URL-aware premium adapter (e.g. Firecrawl) reads the supplied pages.
     # Free adapters (wikidata) ignore it harmlessly.
     target_urls: Optional[list[str]] = None
+    # Chat provenance: the conversation/thread id this job was created from, when
+    # it was kicked off from the Ask-AI chat. Default None → not chat-originated
+    # (e.g. a direct API / CLI / scheduled call). The route copies it onto
+    # ``EnrichJob.thread_id`` so a job is traceable back to its conversation.
+    thread_id: Optional[str] = None
 
     _check_entity_uris = field_validator("entity_uris")(_validate_entity_uris_field)
 
@@ -353,6 +358,11 @@ class EnrichJob(BaseModel):
     # job-detail route serializes them verbatim for the UI.
     provider_logs: list[ProviderLog] = Field(default_factory=list)
     error_summary: list[JobErrorItem] = Field(default_factory=list)
+    # Chat provenance: the conversation/thread id this job was created from (when
+    # kicked off from the Ask-AI chat). Optional / default None so every other
+    # writer (direct API, CLI, scheduled runs) is unchanged. Echoed in the job
+    # summary + detail so a job can be traced back to its conversation.
+    thread_id: Optional[str] = None
 
 
 class JobSummary(BaseModel):
@@ -383,6 +393,9 @@ class JobSummary(BaseModel):
     platforms: Optional[list[str]] = None
     # Derived 0-100 completion percentage from progress.processed/total.
     progress_pct: int = 0
+    # Chat provenance (see EnrichJob.thread_id). Optional so a non-chat job's
+    # summary is unchanged.
+    thread_id: Optional[str] = None
 
 
 ReviewDecision = Literal["accept", "reject", "skip"]
@@ -433,4 +446,5 @@ def job_to_summary(job: EnrichJob) -> JobSummary:
         result_count=job.result_count,
         platforms=job.platforms,
         progress_pct=_progress_pct(job.progress),
+        thread_id=job.thread_id,
     )

@@ -83,6 +83,10 @@ def _build_ctx(
         type_name=body.context.type_name,
         selection=body.context.selection,
         urls=body.context.urls,
+        # Thread the conversation id through so a capability can stamp it onto any
+        # job it creates (chat → job provenance). Covers both the classify/handle
+        # and the confirm/execute-plan paths since ctx is built once from body.
+        session_id=body.session_id,
         openrouter_key=settings.openrouter_api_key
         or os.environ.get("OPENROUTER_API_KEY", ""),
         anthropic_key=settings.anthropic_api_key,

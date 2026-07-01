@@ -315,6 +315,8 @@ class WebIngestCapability:
                 category=JobCategory.discovery,
                 cost=cost_usd,
                 cost_note=cost_note,
+                # Chat provenance: link the job to the conversation that spawned it.
+                thread_id=getattr(ctx, "session_id", None),
             )
             await job_store.create(job)
 

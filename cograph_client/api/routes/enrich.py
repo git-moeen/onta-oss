@@ -205,6 +205,9 @@ async def create_job(
         # enrichment rail). Defaults to [] so a normal enrich is unchanged; a
         # URL-aware adapter reads them via the executor's lookup context.
         source_urls=body.target_urls or [],
+        # Chat provenance: link the job to the conversation it was kicked off
+        # from (None for direct-API / CLI callers).
+        thread_id=body.thread_id,
     )
     await job_store.create(job)
 

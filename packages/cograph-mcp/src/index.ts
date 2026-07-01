@@ -129,6 +129,55 @@ server.registerTool(
 );
 
 server.registerTool(
+  "create_knowledge_graph",
+  {
+    description:
+      "Create a new, empty knowledge graph in the current tenant. Use this " +
+      "before ingesting data into a fresh graph (ingest_csv also auto-creates a " +
+      "graph, so this is for setting one up explicitly / with a description).",
+    inputSchema: {
+      name: z
+        .string()
+        .describe('Name for the new knowledge graph (e.g. "sales-2026").'),
+      description: z
+        .string()
+        .optional()
+        .describe("Optional human-readable description of the graph."),
+    },
+  },
+  async ({ name, description }) => {
+    try {
+      const kg = await client().createKg(name, description);
+      return textResult(
+        `Created knowledge graph "${String(kg.name ?? name)}".`,
+      );
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "delete_knowledge_graph",
+  {
+    description:
+      "Delete a knowledge graph and ALL of its data. This is irreversible — " +
+      "confirm with the user before calling it.",
+    inputSchema: {
+      name: z.string().describe("Name of the knowledge graph to delete."),
+    },
+  },
+  async ({ name }) => {
+    try {
+      await client().deleteKg(name);
+      return textResult(`Deleted knowledge graph "${name}".`);
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
   "view_ontology",
   {
     description:
@@ -408,6 +457,78 @@ server.registerTool(
         confirmPlanId: confirm_plan_id,
       });
       return textResult(describeAgentResult(result));
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "list_jobs",
+  {
+    description:
+      "List background jobs (enrichment, dedupe/merge, reconciliation) for the " +
+      "tenant, newest first. Use this to check on async work the `agent` tool " +
+      "kicked off (e.g. after confirming an enrich or find-duplicates plan): a " +
+      "plan's steps run as background jobs, and this is how you see their status.",
+    inputSchema: {
+      category: z
+        .enum(["enrichment", "dedupe", "reconciliation"])
+        .optional()
+        .describe("Optional filter to a single job category."),
+    },
+  },
+  async ({ category }) => {
+    try {
+      const jobs = await client().jobs(category ? { category } : {});
+      if (!jobs.length) return textResult("No jobs found.");
+      const lines = jobs.map((j) => {
+        const rec = j as unknown as Record<string, unknown>;
+        const id = String(rec.id ?? "?");
+        const cat = String(rec.category ?? "?");
+        const status = String(rec.status ?? "?");
+        const label = rec.label ?? rec.type_name ?? "";
+        return `- ${id} [${cat}] ${status}${label ? ` — ${String(label)}` : ""}`;
+      });
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "get_job",
+  {
+    description:
+      "Get the full record + progress of a single enrichment job by id (as " +
+      "listed by list_jobs). Returns status, tier, per-entity progress and, when " +
+      "finished, the applied/staged counts.",
+    inputSchema: {
+      job_id: z.string().describe("The job id (from list_jobs)."),
+    },
+  },
+  async ({ job_id }) => {
+    try {
+      const job = (await client().enrichJob(job_id)) as unknown as Record<
+        string,
+        unknown
+      >;
+      const status = String(job.status ?? "?");
+      const lines = [`Job ${String(job.id ?? job_id)} — ${status}`];
+      for (const k of [
+        "type_name",
+        "resolved_tier",
+        "processed",
+        "total_entities",
+        "applied",
+        "staged",
+      ]) {
+        if (job[k] !== undefined && job[k] !== null)
+          lines.push(`  ${k}: ${String(job[k])}`);
+      }
+      lines.push("", "Raw job:", JSON.stringify(job, null, 2));
+      return textResult(lines.join("\n"));
     } catch (err) {
       return errorResult(err);
     }

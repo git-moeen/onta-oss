@@ -1,6 +1,6 @@
 {
   "name": "cograph",
-  "version": "0.1.34",
+  "version": "0.1.36",
   "description": "Cograph SDK and CLI — knowledge graph platform for structured data",
   "type": "module",
   "main": "./dist/index.js",
