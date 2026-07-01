@@ -55,10 +55,21 @@ from cograph_client.web_sources.base import DiscoverResult, get_web_source
 
 logger = structlog.stdlib.get_logger("cograph.research.harness")
 
-# A fetched page shorter than this (or flagged as JS-gated) is treated as
-# "incomplete" and the harness escalates to the next, pricier ladder rung.
+# A fetched page is treated as "incomplete" — a signal to escalate to the next,
+# pricier ladder rung — when it is empty, truly tiny, JS-gated, or a nav-only
+# shell (see _looks_incomplete).
 _INCOMPLETE_CHARS = 200
 _JS_GATE_MARKERS = ("enable javascript", "requires javascript", "please enable js")
+# A line at least this long reads as prose/data (a sentence, a table row); shorter
+# lines are nav labels ("Docs", "Pricing"). A client-side-rendered page whose JS
+# never ran returns only its shell — a stack of short nav labels — so it scores
+# ~0 on the substantive-char measure below even when it clears _INCOMPLETE_CHARS.
+_PROSE_LINE_CHARS = 40
+# Minimum characters living in prose/data-length lines for a page over
+# _INCOMPLETE_CHARS to count as real content. Calibrated to sit between an
+# unrendered SPA shell (~0) and genuine content (models.dev static ≈730, census
+# ≈4900), and at the tiny-page bar so a single long content line still counts.
+_MIN_SUBSTANTIVE_CHARS = 200
 
 # Confidence at/above which the reflect loop considers the answer done.
 _DONE_CONFIDENCE = 0.6
@@ -68,14 +79,31 @@ PlannerFn = Callable[..., Awaitable[ResearchPlan]]
 ExtractorFn = Callable[..., Awaitable[list[ResearchRow]]]
 
 
+def _substantive_chars(text: str) -> int:
+    """Characters that live in prose/data-length lines — the signal that a page
+    carries real content and not just navigation chrome. A client-side-rendered
+    page that hasn't executed its JS returns only its shell (a list of short nav
+    labels), which scores ~0 here even when it clears :data:`_INCOMPLETE_CHARS`."""
+    return sum(
+        len(stripped)
+        for line in text.splitlines()
+        if len(stripped := line.strip()) >= _PROSE_LINE_CHARS
+    )
+
+
 def _looks_incomplete(page: FetchedPage) -> bool:
     if not page.has_content():
         return True
-    text = page.text.lower()
-    if len(page.text) < _INCOMPLETE_CHARS:
+    text = page.text
+    if len(text) < _INCOMPLETE_CHARS:
         return True
-    head = text[:4000]
-    return any(marker in head for marker in _JS_GATE_MARKERS)
+    if any(marker in text.lower()[:4000] for marker in _JS_GATE_MARKERS):
+        return True
+    # Over the size bar but almost all short nav labels → an unrendered SPA shell
+    # (e.g. a 407-char menu with zero model data). Escalate to a JS-rendering rung,
+    # which the OSS static tier is not. This is what distinguishes "407 chars of
+    # navigation" from "407 chars of answer".
+    return _substantive_chars(text) < _MIN_SUBSTANTIVE_CHARS
 
 
 def _row_key(values: dict, cols: list[str]) -> str:

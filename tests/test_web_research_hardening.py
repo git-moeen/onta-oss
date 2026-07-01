@@ -256,6 +256,68 @@ def test_looks_incomplete_boundary():
     assert _looks_incomplete(FetchedPage(url="u", ok=False, error="boom"))
 
 
+# --- ONTA-166 local test: nav-only SPA shell must escalate --------------------- #
+# A client-side-rendered page whose JS never ran (openrouter.ai/models static ≈407
+# chars of pure nav) used to PASS the completeness gate — it clears
+# _INCOMPLETE_CHARS but carries zero prose/data — so the ladder never escalated to
+# the render rung and URL-only research abstained. Guard the substantive-char fix.
+_NAV_SHELL = "\n".join(
+    [
+        "Chat", "Rankings", "Apps", "Models", "Providers", "Pricing",
+        "Enterprise", "Docs", "API Reference", "SDK", "Status", "Discord",
+        "GitHub", "Careers", "Privacy", "Terms of Service", "Support",
+    ]
+    * 4
+)
+
+
+def test_looks_incomplete_flags_nav_only_shell():
+    assert len(_NAV_SHELL) > 200  # clears the size bar…
+    assert _looks_incomplete(FetchedPage(url="u", text=_NAV_SHELL, ok=True))
+    # …but a real paragraph of the same/greater size is complete (prose-length line).
+    prose = (
+        "Net international migration drove the highest US population growth in "
+        "years. California remained the most populous state, followed by Texas "
+        "and Florida, according to the Census Bureau's vintage 2024 estimates."
+    )
+    assert len(prose) > 200
+    assert not _looks_incomplete(FetchedPage(url="u", text=prose, ok=True))
+
+
+async def test_ladder_escalates_past_nav_only_shell():
+    url = "https://spa.example/models"
+    cheap = FakeFetcher(
+        default=FetchedPage(url=url, text=_NAV_SHELL, tier="static", ok=True),
+        name="static",
+        tier=0,
+    )
+    pricey = FakeFetcher(
+        default=FetchedPage(
+            url=url,
+            text="GPT-5 offers a 400000 token context window on OpenRouter. " * 20,
+            tier="render",
+            ok=True,
+        ),
+        name="render",
+        tier=2,
+        is_paid=True,
+        cost_per_call=0.02,
+    )
+    seen_tiers: list[str] = []
+
+    async def _record(pages, schema, **kw):
+        seen_tiers.extend(p.tier for p in pages)
+        return [ResearchRow(values={"name": "GPT-5"}, citations=[url], confidence=0.9)]
+
+    harness = WebResearchHarness(fetchers=[cheap, pricey], extractor=_record)
+    res = await harness.run(
+        "list models", schema=_schema(), urls=[url], budget=Budget(max_fetches=4)
+    )
+    assert pricey.calls == 1  # escalated past the >200-char nav-only shell
+    assert "render" in seen_tiers  # extraction ran on the rendered page
+    assert not res.abstained
+
+
 # --- review F8: plan_research keyless + budget-exhausted fallback --------------- #
 async def test_plan_research_keyless_fallback():
     plan = await plan_research("find models", hint_columns=["name", "score"], openrouter_key="")
