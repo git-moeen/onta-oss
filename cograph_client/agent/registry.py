@@ -53,6 +53,11 @@ class AgentContext:
     # Capabilities read this defensively (``getattr(ctx, "urls", None)``) so they
     # keep working even if a context predates this field.
     urls: list[str] = field(default_factory=list)
+    # Which interface issued this request — "explorer" / "cli" / "mcp" / "sdk" /
+    # "" when the client didn't say. Threaded from the canonical /agent request
+    # body (context.medium) so cost/latency telemetry can be broken down per
+    # medium without any per-interface endpoint divergence.
+    medium: str = ""
     # Free-form extras (e.g. the enrichment executor/job-store stashed on
     # app.state) so a capability can reuse app-scoped singletons without the
     # context model needing to know about every engine.

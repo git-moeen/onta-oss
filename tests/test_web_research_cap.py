@@ -35,13 +35,14 @@ def _clean_registries():
     reset_web_sources()
 
 
-def _ctx(urls=None) -> AgentContext:
+def _ctx(urls=None, medium="") -> AgentContext:
     return AgentContext(
         tenant_id="t1",
         kg_name="kg",
         neptune=MagicMock(),
         openrouter_key="",  # keyless → planner uses its deterministic fallback
         urls=list(urls or []),
+        medium=medium,
     )
 
 
@@ -185,7 +186,9 @@ async def test_execute_runs_harness_and_returns_cited_artifact(monkeypatch):
             "budget": {"max_iterations": 1, "max_fetches": 2, "max_llm_calls": 4},
         },
     )
-    out = await cap.execute(_ctx(urls=["https://example.com/board"]), step)
+    out = await cap.execute(
+        _ctx(urls=["https://example.com/board"], medium="mcp"), step
+    )
 
     assert out["kind"] == "research_result"
     assert out["abstained"] is False
@@ -194,6 +197,12 @@ async def test_execute_runs_harness_and_returns_cited_artifact(monkeypatch):
     assert out["sources"] == ["https://example.com/board"]
     assert "Alpha,94," in out["artifact_csv"]
     assert out["confidence"] > 0.5
+    # Per-stage cost/latency trace rides the response, tagged with the medium
+    # the canonical /agent request declared.
+    assert out["trace"]["medium"] == "mcp"
+    stages = {e["stage"] for e in out["trace"]["events"]}
+    assert {"fetch", "extract", "verify"}.issubset(stages)
+    assert out["trace"]["totals"]["elapsed_ms"] >= 0
 
 
 async def test_execute_abstains_without_readable_sources(monkeypatch):

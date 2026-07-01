@@ -115,6 +115,102 @@ class TargetSchema:
 
 
 @dataclass
+class StageEvent:
+    """One metered action inside a research run — a planner call, one discovery
+    query, one fetch-ladder rung, an extract/verify pass.
+
+    ``cost_usd`` is the DECLARED marginal cost of the tool used (a paid fetch
+    rung's ``cost_per_call``, a paid discovery provider's per-call price) — 0.0
+    for free tools and for LLM stages, whose token cost isn't visible at this
+    layer (``meta.llm_calls`` + ``meta.model`` are recorded so billing can be
+    joined downstream). ``elapsed_ms`` is wall-clock for the action.
+    """
+
+    stage: str  # plan | discover | fetch | extract | verify
+    detail: str = ""  # url / query / model — whatever identifies the action
+    elapsed_ms: float = 0.0
+    cost_usd: float = 0.0
+    ok: bool = True
+    meta: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "stage": self.stage,
+            "detail": self.detail,
+            "elapsed_ms": round(self.elapsed_ms, 1),
+            "cost_usd": round(self.cost_usd, 6),
+            "ok": self.ok,
+            "meta": dict(self.meta),
+        }
+
+
+@dataclass
+class ResearchTrace:
+    """Cost / latency observability for one research run.
+
+    ``medium`` names the interface that asked (``cli`` / ``explorer`` / ``mcp`` /
+    ``sdk`` / "" when unknown) — threaded from the canonical ``/agent`` request so
+    every client reports through the same field. ``events`` is the ordered list
+    of metered actions; ``totals()`` aggregates them per stage for dashboards.
+    """
+
+    medium: str = ""
+    events: list[StageEvent] = field(default_factory=list)
+
+    def add(
+        self,
+        stage: str,
+        *,
+        detail: str = "",
+        elapsed_ms: float = 0.0,
+        cost_usd: float = 0.0,
+        ok: bool = True,
+        **meta: object,
+    ) -> StageEvent:
+        ev = StageEvent(
+            stage=stage,
+            detail=detail,
+            elapsed_ms=elapsed_ms,
+            cost_usd=cost_usd,
+            ok=ok,
+            meta=dict(meta),
+        )
+        self.events.append(ev)
+        return ev
+
+    def total_cost_usd(self) -> float:
+        return sum(e.cost_usd for e in self.events)
+
+    def total_elapsed_ms(self) -> float:
+        return sum(e.elapsed_ms for e in self.events)
+
+    def totals(self) -> dict:
+        by_stage: dict[str, dict] = {}
+        for e in self.events:
+            agg = by_stage.setdefault(
+                e.stage, {"calls": 0, "elapsed_ms": 0.0, "cost_usd": 0.0}
+            )
+            agg["calls"] += 1
+            agg["elapsed_ms"] += e.elapsed_ms
+            agg["cost_usd"] += e.cost_usd
+        for agg in by_stage.values():
+            agg["elapsed_ms"] = round(agg["elapsed_ms"], 1)
+            agg["cost_usd"] = round(agg["cost_usd"], 6)
+        return {
+            "cost_usd": round(self.total_cost_usd(), 6),
+            "elapsed_ms": round(self.total_elapsed_ms(), 1),
+            "by_stage": by_stage,
+        }
+
+    def to_dict(self) -> dict:
+        return {
+            "medium": self.medium,
+            "events": [e.to_dict() for e in self.events],
+            "totals": self.totals(),
+        }
+
+
+@dataclass
 class ClarifyingQuestion:
     """One question to ask the user before researching, optionally with a short
     list of suggested answers a client can render as reply chips.
@@ -325,6 +421,9 @@ class ResearchResult:
     # Each entry may carry suggested answer options (reply chips).
     needs_clarification: bool = False
     clarifying_questions: list[ClarifyingQuestion] = field(default_factory=list)
+    # Per-stage cost/latency observability for this run (None when the caller
+    # didn't run the instrumented harness path).
+    trace: Optional[ResearchTrace] = None
 
     def to_dict(self) -> dict:
         return {
@@ -344,6 +443,7 @@ class ResearchResult:
                 q.to_dict()
                 for q in normalize_clarifying_questions(self.clarifying_questions)
             ],
+            "trace": self.trace.to_dict() if self.trace is not None else None,
         }
 
     def to_csv(self) -> str:
@@ -441,7 +541,9 @@ __all__ = [
     "ResearchPlan",
     "ResearchResult",
     "ResearchRow",
+    "ResearchTrace",
     "SchemaField",
+    "StageEvent",
     "TargetSchema",
     "normalize_clarifying_questions",
 ]

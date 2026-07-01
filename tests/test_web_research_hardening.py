@@ -415,6 +415,89 @@ async def test_harness_asks_for_clarification_without_web_spend():
     assert extracted == []  # …and before any extraction
 
 
+async def test_discovery_never_starves_user_url_fetches():
+    # Caught live by the stage trace: with max_fetches=3, two discovery calls
+    # charged 2 credits BEFORE the user's URL was read, leaving budget for the
+    # static rung only — the render escalation never fired and the run abstained
+    # on a page the user explicitly attached. Discovery must spend only when no
+    # known candidate URL is still unread.
+    url = "https://spa.example/models"
+    discover_calls: list[str] = []
+
+    async def _discover(query, **kw):
+        discover_calls.append(query)
+        return DiscoverResult()
+
+    cheap = FakeFetcher(
+        default=FetchedPage(url=url, text=_NAV_SHELL, tier="static", ok=True),
+        name="static",
+        tier=0,
+    )
+    pricey = FakeFetcher(
+        default=FetchedPage(url=url, text="Model X context 128k. " * 30, tier="render", ok=True),
+        name="render",
+        tier=2,
+        is_paid=True,
+        cost_per_call=0.02,
+    )
+
+    async def _extract(pages, schema, **kw):
+        return [
+            ResearchRow(values={"name": "X", "score": "1"}, citations=[url], confidence=0.9)
+        ]
+
+    async def _planner(question, **kw):
+        # A plan WITH discovery queries — the starvation scenario needs both.
+        return ResearchPlan(question=question, schema=_schema(), queries=["q1", "q2"])
+
+    harness = WebResearchHarness(
+        openrouter_key="k",
+        fetchers=[cheap, pricey],
+        discover=_discover,
+        planner=_planner,
+        extractor=_extract,
+    )
+    res = await harness.run(
+        "list models on this page",
+        urls=[url],
+        budget=Budget(max_iterations=1, max_fetches=3, max_llm_calls=3),
+    )
+    # The user's page was read FIRST — static + escalated render both fit in
+    # budget — and discovery never spent a credit this iteration.
+    assert pricey.calls == 1
+    assert discover_calls == []
+    assert not res.abstained and len(res.rows) == 1
+
+
+async def test_planner_sees_user_urls():
+    # `urls=` (user-attached pages) must reach the planner as seed URLs — a
+    # planner blind to them asks "which page?" about a page it was handed.
+    seen: list[list[str]] = []
+
+    async def _spy_planner(question, *, seed_urls=None, **kw):
+        seen.append(list(seed_urls or []))
+        return ResearchPlan(question=question, schema=_schema(), queries=[])
+
+    fetcher = FakeFetcher(default=FetchedPage(url="u", text="rich " * 100, ok=True))
+
+    async def _extract(pages, schema, **kw):
+        return [ResearchRow(values={"name": "X"}, citations=["u"], confidence=0.9)]
+
+    harness = WebResearchHarness(
+        openrouter_key="k", fetchers=[fetcher], planner=_spy_planner, extractor=_extract
+    )
+    await harness.run(
+        "list models on this page",
+        urls=["https://ex.example/models"],
+        seed_urls=["https://ex.example/docs"],
+        budget=Budget(max_iterations=1, max_fetches=2, max_llm_calls=2),
+    )
+    assert seen and set(seen[0]) == {
+        "https://ex.example/docs",
+        "https://ex.example/models",
+    }
+
+
 async def test_harness_pinned_schema_skips_clarification():
     called: list[int] = []
 
@@ -451,6 +534,91 @@ async def test_harness_pinned_schema_skips_clarification():
     assert res.needs_clarification is False
     assert not res.abstained
     assert len(res.rows) == 1
+
+
+# --- ONTA-166 local: per-stage cost/latency trace + medium tagging ------------- #
+def test_trace_totals_aggregate_per_stage():
+    from cograph_client.research.types import ResearchTrace
+
+    tr = ResearchTrace(medium="cli")
+    tr.add("fetch", detail="u1", elapsed_ms=100.0, cost_usd=0.02, tier=2)
+    tr.add("fetch", detail="u2", elapsed_ms=50.0, cost_usd=0.0, tier=0)
+    tr.add("extract", elapsed_ms=200.0, llm_calls=1)
+    t = tr.totals()
+    assert t["cost_usd"] == 0.02
+    assert t["elapsed_ms"] == 350.0
+    assert t["by_stage"]["fetch"] == {
+        "calls": 2,
+        "elapsed_ms": 150.0,
+        "cost_usd": 0.02,
+    }
+    d = tr.to_dict()
+    assert d["medium"] == "cli"
+    assert len(d["events"]) == 3
+    assert d["events"][0]["meta"]["tier"] == 2
+
+
+async def test_harness_traces_stages_costs_and_medium():
+    url = "https://ex.example/js"
+    cheap = FakeFetcher(
+        default=FetchedPage(url=url, text="short", tier="static", ok=True),
+        name="static",
+        tier=0,
+    )
+    pricey = FakeFetcher(
+        default=FetchedPage(url=url, text="rendered content " * 40, tier="render", ok=True),
+        name="render",
+        tier=2,
+        is_paid=True,
+        cost_per_call=0.02,
+    )
+
+    async def _extract(pages, schema, **kw):
+        return [
+            ResearchRow(values={"name": "R", "score": "1"}, citations=[url], confidence=0.9)
+        ]
+
+    harness = WebResearchHarness(fetchers=[cheap, pricey], extractor=_extract)
+    res = await harness.run(
+        "q",
+        schema=_schema(),
+        urls=[url],
+        budget=Budget(max_iterations=1, max_fetches=4, max_llm_calls=4),
+        context={"medium": "mcp"},
+    )
+    tr = res.trace
+    assert tr is not None
+    assert tr.medium == "mcp"
+    stages = [e.stage for e in tr.events]
+    # pinned schema → no plan event; both ladder rungs + extract + verify traced.
+    assert stages.count("fetch") == 2
+    assert "extract" in stages and "verify" in stages
+    fetch_events = [e for e in tr.events if e.stage == "fetch"]
+    assert {e.meta["fetcher"] for e in fetch_events} == {"static", "render"}
+    # the paid rung's declared cost is metered; the free rung is 0.
+    assert tr.totals()["cost_usd"] == 0.02
+    verify = next(e for e in tr.events if e.stage == "verify")
+    assert verify.meta["kept"] == 1 and verify.meta["abstained"] is False
+    # …and the trace serializes onto the result payload.
+    assert res.to_dict()["trace"]["totals"]["cost_usd"] == 0.02
+
+
+async def test_clarification_result_carries_trace_with_plan_stage():
+    async def _ambiguous_planner(question, **kw):
+        return ResearchPlan(
+            question=question,
+            needs_clarification=True,
+            clarifying_questions=["Which metric?"],
+        )
+
+    harness = WebResearchHarness(
+        openrouter_key="k", fetchers=[], planner=_ambiguous_planner
+    )
+    res = await harness.run("best?", context={"medium": "explorer"})
+    assert res.needs_clarification is True
+    assert res.trace is not None and res.trace.medium == "explorer"
+    assert [e.stage for e in res.trace.events] == ["plan"]
+    assert res.trace.events[0].meta["needs_clarification"] is True
 
 
 async def test_ladder_escalates_past_nav_only_shell():

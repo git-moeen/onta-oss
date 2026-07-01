@@ -215,7 +215,14 @@ class WebResearchCapability:
             urls=urls,
             max_rows=max_rows,
             budget=budget,
-            context={"tenant_id": ctx.tenant_id, "kg_name": ctx.kg_name},
+            context={
+                "tenant_id": ctx.tenant_id,
+                "kg_name": ctx.kg_name,
+                # The requesting interface (explorer/cli/mcp/sdk), threaded from
+                # the canonical /agent request — tags every per-stage telemetry
+                # event and the returned trace.
+                "medium": getattr(ctx, "medium", "") or "",
+            },
         )
 
         return {
@@ -234,6 +241,8 @@ class WebResearchCapability:
             "is_complete": result.is_complete,
             "iterations": result.iterations,
             "budget": budget.to_dict(),
+            # Per-stage cost/latency observability (medium-tagged) for the run.
+            "trace": result.trace.to_dict() if result.trace is not None else None,
         }
 
 

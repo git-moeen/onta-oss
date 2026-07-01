@@ -27,6 +27,7 @@ Boundary: OSS. Imports only stdlib / ``cograph_client.*``.
 
 from __future__ import annotations
 
+import time
 from typing import Awaitable, Callable, Optional
 
 import structlog
@@ -35,6 +36,7 @@ from cograph_client.research.fetch import (
     FetchedPage,
     PageFetcher,
     default_ladder,
+    fetcher_cost,
     is_fetchable_url,
 )
 from cograph_client.research.synthesize import (
@@ -46,6 +48,7 @@ from cograph_client.research.types import (
     ResearchPlan,
     ResearchResult,
     ResearchRow,
+    ResearchTrace,
     SchemaField,
     TargetSchema,
 )
@@ -54,7 +57,11 @@ from cograph_client.research.verify import (
     VerifyOutcome,
     get_research_verifier,
 )
-from cograph_client.web_sources.base import DiscoverResult, get_web_source
+from cograph_client.web_sources.base import (
+    DiscoverResult,
+    get_web_source,
+    provider_cost,
+)
 
 logger = structlog.stdlib.get_logger("cograph.research.harness")
 
@@ -114,6 +121,35 @@ def _row_key(values: dict, cols: list[str]) -> str:
     return "|".join(str(values.get(c, "")).strip().lower() for c in keys)
 
 
+def _note_stage(
+    trace: ResearchTrace,
+    stage: str,
+    *,
+    detail: str = "",
+    elapsed_ms: float = 0.0,
+    cost_usd: float = 0.0,
+    ok: bool = True,
+    **meta: object,
+) -> None:
+    """Record one metered action on the run's trace AND emit it as a structured
+    log line, so per-stage cost/latency is observable both in the response
+    (``ResearchResult.trace``) and in ops logs — tagged with the requesting
+    ``medium`` (cli / explorer / mcp / …) in both places."""
+    trace.add(
+        stage, detail=detail, elapsed_ms=elapsed_ms, cost_usd=cost_usd, ok=ok, **meta
+    )
+    logger.info(
+        "research_stage",
+        stage=stage,
+        medium=trace.medium,
+        detail=detail,
+        elapsed_ms=round(elapsed_ms, 1),
+        cost_usd=round(cost_usd, 6),
+        ok=ok,
+        **meta,
+    )
+
+
 class WebResearchHarness:
     def __init__(
         self,
@@ -135,6 +171,14 @@ class WebResearchHarness:
         self._discover_fn = discover if discover is not None else _default_discover()
         self._planner = planner
         self._extractor = extractor
+        # Marginal cost of ONE discovery call, read from the registered provider's
+        # declared pricing — known only for the default binding (an injected
+        # ``discover`` carries no cost signal, so it meters as free).
+        self._discover_cost = 0.0
+        if discover is None:
+            provider = get_web_source()
+            if provider is not None:
+                _, self._discover_cost = provider_cost(provider)
 
     # -- stage callables (imported lazily so a bare import of this module doesn't
     #    require the LLM-stage siblings; also lets tests inject fakes) ---------- #
@@ -185,16 +229,36 @@ class WebResearchHarness:
         context = context or {}
         seed_urls = list(seed_urls or [])
         user_urls = list(urls or [])
+        # Per-run cost/latency trace, tagged with the requesting interface
+        # (cli / explorer / mcp / …) as threaded through the canonical /agent
+        # request context.
+        trace = ResearchTrace(medium=str(context.get("medium", "") or ""))
         # A caller-pinned schema IS the disambiguation — never ask in that case.
         pinned_schema = schema is not None
 
-        # 1. Plan (schema-first) unless the caller pinned a schema.
+        # 1. Plan (schema-first) unless the caller pinned a schema. The planner
+        # sees EVERY caller-supplied URL (seed_urls + urls) — a planner blind to
+        # the user's URLs would ask "which page?" about a page it was handed.
         if schema is None:
+            plan_urls = self._dedupe_urls(seed_urls + user_urls)
+            llm0 = budget.llm_calls_used
+            t0 = time.monotonic()
+            plan_ok = True
             try:
-                plan = await self._plan(question, hint_columns, seed_urls, budget)
+                plan = await self._plan(question, hint_columns, plan_urls, budget)
             except Exception as exc:  # planner must never sink the run
                 logger.warning("research_plan_failed", error=str(exc))
                 plan = ResearchPlan(question=question, queries=[question])
+                plan_ok = False
+            _note_stage(
+                trace,
+                "plan",
+                detail=self.plan_model or "primary",
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                ok=plan_ok,
+                llm_calls=budget.llm_calls_used - llm0,
+                needs_clarification=plan.needs_clarification,
+            )
             schema = plan.schema
         else:
             plan = ResearchPlan(
@@ -209,7 +273,9 @@ class WebResearchHarness:
             and plan.needs_clarification
             and plan.clarifying_questions
         ):
-            return clarification_result(question, plan.clarifying_questions)
+            result = clarification_result(question, plan.clarifying_questions)
+            result.trace = trace
+            return result
 
         if schema.is_empty():
             schema = TargetSchema(
@@ -237,10 +303,16 @@ class WebResearchHarness:
 
             # 2. Discover (premium provider) → candidate rows + source URLs.
             #    Discovery is a paid/metered source consultation, so it is gated
-            #    and charged against the fetch budget just like a page fetch.
-            if plan.needs_web and queries and budget.can_fetch():
+            #    and charged against the fetch budget just like a page fetch —
+            #    and it spends ONLY when no already-known candidate URL is still
+            #    waiting to be read. The pages the user (or planner) handed us
+            #    come first; a small fetch budget must never be starved by
+            #    discovery before the explicit URLs are fetched. A reflect
+            #    iteration re-enters here after those pages proved thin.
+            pending_urls = any(u not in seen_urls for u in candidate_urls)
+            if plan.needs_web and queries and not pending_urls and budget.can_fetch():
                 disc_rows, disc_urls = await self._discover(
-                    queries, cols, max_rows, context, budget
+                    queries, cols, max_rows, context, budget, trace
                 )
                 all_rows.extend(disc_rows)
                 for u in disc_urls:
@@ -256,7 +328,7 @@ class WebResearchHarness:
                     break
                 seen_urls.add(url)
                 sources_consulted.append(url)
-                page = await self._fetch_laddered(url, question, budget)
+                page = await self._fetch_laddered(url, question, budget, trace)
                 if page is not None:
                     pages.append(page)
 
@@ -265,19 +337,47 @@ class WebResearchHarness:
                 p for p in pages if p.has_content() and p.url not in extracted_from
             ]
             if new_pages and budget.can_call_llm():
+                llm0 = budget.llm_calls_used
+                t0 = time.monotonic()
+                ext_ok = True
+                n_rows = 0
                 try:
                     ext = await self._extract(
                         new_pages, schema, question, max_rows, budget
                     )
                     all_rows.extend(ext)
+                    n_rows = len(ext)
                 except Exception as exc:
                     logger.warning("research_extract_failed", error=str(exc))
+                    ext_ok = False
                 extracted_from.update(p.url for p in new_pages)
+                _note_stage(
+                    trace,
+                    "extract",
+                    detail=self.extract_model or "extract-default",
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    ok=ext_ok,
+                    llm_calls=budget.llm_calls_used - llm0,
+                    pages=len(new_pages),
+                    rows=n_rows,
+                )
 
             merged = self._merge_rows(all_rows, cols, max_rows)
 
             # 5. Verify (cite-or-abstain).
+            t0 = time.monotonic()
             outcome = await self._safe_verify(question, merged, pages, schema)
+            _note_stage(
+                trace,
+                "verify",
+                detail=getattr(self._verifier, "name", ""),
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                rows_in=len(merged),
+                kept=len(outcome.rows),
+                dropped=outcome.dropped,
+                abstained=outcome.abstained,
+                confidence=outcome.confidence,
+            )
 
             # 6. Reflect: done, or out of budget → stop; else broaden + loop.
             done = (
@@ -297,7 +397,7 @@ class WebResearchHarness:
             and bool(outcome.rows)
             and outcome.confidence >= _DONE_CONFIDENCE
         )
-        return synthesize_result(
+        result = synthesize_result(
             question,
             schema,
             outcome,
@@ -306,6 +406,21 @@ class WebResearchHarness:
             sources_consulted=sources_consulted,
             complete=complete,
         )
+        result.trace = trace
+        totals = trace.totals()
+        logger.info(
+            "research_run",
+            medium=trace.medium,
+            iterations=iterations,
+            abstained=result.abstained,
+            confidence=result.confidence,
+            rows=len(result.rows),
+            cost_usd=totals["cost_usd"],
+            elapsed_ms=totals["elapsed_ms"],
+            fetches_used=budget.fetches_used,
+            llm_calls_used=budget.llm_calls_used,
+        )
+        return result
 
     # -- helpers --------------------------------------------------------------- #
     @staticmethod
@@ -326,6 +441,7 @@ class WebResearchHarness:
         max_rows: int,
         context: dict,
         budget: Budget,
+        trace: ResearchTrace,
     ) -> tuple[list[ResearchRow], list[str]]:
         if self._discover_fn is None:
             return [], []
@@ -337,6 +453,7 @@ class WebResearchHarness:
             if not budget.can_fetch():
                 break
             budget.note_fetch(1)
+            t0 = time.monotonic()
             try:
                 result: DiscoverResult = await self._discover_fn(
                     q,
@@ -348,7 +465,25 @@ class WebResearchHarness:
                 )
             except Exception as exc:
                 logger.warning("research_discover_failed", query=q, error=str(exc))
+                _note_stage(
+                    trace,
+                    "discover",
+                    detail=q,
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    cost_usd=self._discover_cost,
+                    ok=False,
+                    error=str(exc)[:160],
+                )
                 continue
+            _note_stage(
+                trace,
+                "discover",
+                detail=q,
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                cost_usd=self._discover_cost,
+                rows=len(result.rows or []),
+                sources=len(result.sources or []),
+            )
             for i, row in enumerate(result.rows or []):
                 key = str(row.get("name", i))
                 url = (result.provenance or {}).get(key, "")
@@ -364,7 +499,7 @@ class WebResearchHarness:
         return rows_out, urls_out
 
     async def _fetch_laddered(
-        self, url: str, want: str, budget: Budget
+        self, url: str, want: str, budget: Budget, trace: ResearchTrace
     ) -> Optional[FetchedPage]:
         """Walk the ladder cheapest-first; escalate only when a rung's page looks
         incomplete and budget remains. Returns the best page seen."""
@@ -373,13 +508,37 @@ class WebResearchHarness:
             if not budget.can_fetch():
                 break
             budget.note_fetch(1)
+            _, rung_cost = fetcher_cost(fetcher)
+            t0 = time.monotonic()
             try:
                 page = await fetcher.fetch(url, want=want)
             except Exception as exc:  # fetchers shouldn't raise, but never trust
                 logger.warning(
                     "research_fetch_raised", url=url, fetcher=fetcher.name, error=str(exc)
                 )
+                _note_stage(
+                    trace,
+                    "fetch",
+                    detail=url,
+                    elapsed_ms=(time.monotonic() - t0) * 1000,
+                    cost_usd=rung_cost,
+                    ok=False,
+                    fetcher=fetcher.name,
+                    tier=int(getattr(fetcher, "tier", 0)),
+                    error=str(exc)[:160],
+                )
                 continue
+            _note_stage(
+                trace,
+                "fetch",
+                detail=url,
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                cost_usd=rung_cost,
+                ok=page.ok if page is not None else False,
+                fetcher=fetcher.name,
+                tier=int(getattr(fetcher, "tier", 0)),
+                chars=len(page.text) if page is not None else 0,
+            )
             if page is None:
                 continue
             if page.has_content():

@@ -56,6 +56,11 @@ class AgentRequestContext(BaseModel):
     # planner routes a URL-bearing turn and capabilities extract records from
     # these pages via the premium URL-targeted seam.
     urls: list[str] = []
+    # Which interface is calling — "explorer" / "cli" / "mcp" / "sdk". Optional +
+    # defaulted so existing clients are unaffected. ONE canonical field on the ONE
+    # canonical route (never a per-interface endpoint or header convention) —
+    # capabilities tag per-stage cost/latency telemetry with it.
+    medium: str = ""
 
 
 class Confirm(BaseModel):
@@ -83,6 +88,7 @@ def _build_ctx(
         type_name=body.context.type_name,
         selection=body.context.selection,
         urls=body.context.urls,
+        medium=body.context.medium,
         openrouter_key=settings.openrouter_api_key
         or os.environ.get("OPENROUTER_API_KEY", ""),
         anthropic_key=settings.anthropic_api_key,
