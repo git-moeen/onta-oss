@@ -488,9 +488,11 @@ async def _read_type_stats(
         entity_count = int(ec_rows[0].get("ec", "0"))
     except ValueError:
         entity_count = 0
+    # "1"^^xsd:boolean is an equally valid true — accept both lexical forms so
+    # a future writer/backfill touching the stats graph can't silently read False.
     flags = {
-        "spatially_indexed": ec_rows[0].get("sp", "") == "true",
-        "temporally_indexed": ec_rows[0].get("tp", "") == "true",
+        "spatially_indexed": ec_rows[0].get("sp", "") in ("true", "1"),
+        "temporally_indexed": ec_rows[0].get("tp", "") in ("true", "1"),
     }
     _, pred_rows = parse_sparql_results(pred_raw)
     records: list[dict] = []

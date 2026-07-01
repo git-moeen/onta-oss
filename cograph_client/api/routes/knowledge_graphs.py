@@ -527,9 +527,10 @@ async def _read_type_index_flags(
             continue
         leaf = t[len(TYPE_URI_PREFIX):]
         spatial, temporal = flags.get(leaf, (False, False))
-        if row.get("sp", "") == "true":
+        # Accept both boolean lexical forms ("true" and "1") — see _read_type_stats.
+        if row.get("sp", "") in ("true", "1"):
             spatial = True
-        if row.get("tp", "") == "true":
+        if row.get("tp", "") in ("true", "1"):
             temporal = True
         flags[leaf] = (spatial, temporal)
     return flags

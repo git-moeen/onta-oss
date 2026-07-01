@@ -280,6 +280,33 @@ def test_summary_reads_flags_from_stats(client, mock_neptune, auth_headers):
     assert data["temporally_indexed"] is False
 
 
+def test_summary_accepts_numeric_boolean_lexical_form(client, mock_neptune, auth_headers):
+    """"1"^^xsd:boolean is an equally valid true — a backfill writer using the
+    numeric lexical form must not silently read as False."""
+    from cograph_client.api.routes import explore as _explore_mod
+    _explore_mod._summary_cache.clear()
+
+    def route(sparql, *a, **k):
+        if "?label" in sparql and "subClassOf" in sparql:
+            return _rows({"label": "Store"})
+        if "attrLabel" in sparql:
+            return _empty()
+        if "entityCount" in sparql:
+            return _rows({"ec": "7", "sp": "1", "tp": "1"})
+        if "forType" in sparql:
+            return _rows({"pred": ONTO + "location", "cnt": "7", "rel": "0"})
+        return _empty()
+
+    mock_neptune.query.side_effect = route
+
+    resp = client.get(
+        f"/graphs/{TENANT}/explore/kgs/{KG}/types/Store/summary", headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["spatially_indexed"] is True
+    assert resp.json()["temporally_indexed"] is True
+
+
 def test_summary_computes_flags_on_live_scan_fallback(client, mock_neptune, auth_headers):
     from cograph_client.api.routes import explore as _explore_mod
     _explore_mod._summary_cache.clear()
