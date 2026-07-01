@@ -330,6 +330,42 @@ async def test_empty_sample_returns_message():
     assert "couldn't find anything" in steps[0].params["answer_payload"]["answer"]
 
 
+def test_empty_message_query_mode_says_rephrase():
+    """No URL → open-web search genuinely found nothing → rephrase advice."""
+    msg = web_ingest_cap._empty_sample_message(
+        "obscure query", [], DiscoverResult(rows=[])
+    )
+    assert "couldn't find anything on the web" in msg
+    assert "rephrasing" in msg
+
+
+def test_empty_message_url_mode_no_error_does_not_say_rephrase():
+    """URL mode, page read but no records → explain the page, NEVER tell a user
+    who pasted a specific link to 'rephrase their search' (the original bug)."""
+    url = "https://humannessindex.vapi.ai/"
+    msg = web_ingest_cap._empty_sample_message(
+        "models and their scores", [url], DiscoverResult(rows=[], sources=[url])
+    )
+    assert url in msg
+    assert "couldn't find a list or table" in msg
+    assert "rephras" not in msg.lower()
+    assert "narrow" not in msg.lower()
+
+
+def test_empty_message_url_mode_error_surfaces_reason():
+    """URL mode + provider error → surface the reason + retry, not rephrase."""
+    url = "https://humannessindex.vapi.ai/"
+    msg = web_ingest_cap._empty_sample_message(
+        "models",
+        [url],
+        DiscoverResult(rows=[], sources=[url], error="HTTP 502 upstream"),
+    )
+    assert url in msg
+    assert "couldn't read" in msg
+    assert "502" in msg
+    assert "rephras" not in msg.lower()
+
+
 async def test_execute_runs_full_discover_and_ingests(monkeypatch):
     provider = FakeProvider()
     register_web_source(provider)

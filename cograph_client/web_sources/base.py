@@ -48,6 +48,13 @@ class DiscoverResult:
     True when the provider truncated at ``max_rows``; ``estimated_total`` is the
     provider's best guess at the full result size (used only to label the
     plan-time cost estimate, never to drive writes).
+
+    ``error`` is set when the provider FAILED to reach or read a source (timeout,
+    non-200, blocked page) as opposed to reaching it and finding no records. Zero
+    rows with ``error=None`` means "read the page(s), nothing to extract"; zero
+    rows with ``error`` set means "couldn't read the page(s)". The capability
+    uses this to give an honest, source-appropriate message instead of a generic
+    "found nothing on the web" — the two cases warrant different user advice.
     """
 
     rows: list[dict[str, str]] = field(default_factory=list)
@@ -55,6 +62,7 @@ class DiscoverResult:
     sources: list[str] = field(default_factory=list)
     is_partial: bool = False
     estimated_total: Optional[int] = None
+    error: Optional[str] = None
 
 
 @runtime_checkable

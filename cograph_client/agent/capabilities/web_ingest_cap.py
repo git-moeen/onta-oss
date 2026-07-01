@@ -191,12 +191,7 @@ class WebIngestCapability:
                 )
             ]
         if not sample.rows:
-            return [
-                _answer_step(
-                    f"I couldn't find anything on the web for “{query}”. "
-                    "Try rephrasing or narrowing it."
-                )
-            ]
+            return [_answer_step(_empty_sample_message(query, urls, sample))]
 
         # Thread the per-record source URL onto the sampled rows so the PREVIEW
         # matches the COMMIT (the same invariant the URL persistence keeps): the
@@ -700,6 +695,40 @@ _LEAD_FILLER = re.compile(
     r"(?:a\s+|an\s+|the\s+|me\s+)?",
     re.IGNORECASE,
 )
+
+
+def _empty_sample_message(query: str, urls: list[str], sample) -> str:
+    """The user-facing message when a discovery SAMPLE came back with no rows.
+
+    URL mode and query mode fail for DIFFERENT reasons and warrant DIFFERENT
+    advice, so we never tell a user who pasted a specific page to "rephrase their
+    search" (the old bug — a search-flavoured dead-end shown after a URL scrape):
+
+    * URL mode + provider ERROR (``DiscoverResult.error`` set) → we couldn't READ
+      the page(s): surface the reason and suggest retry, not rephrasing.
+    * URL mode + no error → we read the page(s) but found no extractable records:
+      the page may render its data in a way we can't parse, or hold no list.
+    * query mode → an open-web search genuinely found nothing: rephrase/narrow.
+    """
+    err = getattr(sample, "error", None)
+    if urls:
+        target = urls[0] if len(urls) == 1 else f"the {len(urls)} pages you shared"
+        if err:
+            return (
+                f"I couldn't read {target}: {err}. The page may be blocking "
+                "automated reading or be temporarily unavailable — try again in a "
+                "moment, or share a different link."
+            )
+        return (
+            f"I reached {target} but couldn't find a list or table of records to "
+            "pull from it. The data may be rendered in a way I can't parse, or the "
+            "page may not hold a structured list — try a page whose main content "
+            "is the records you want."
+        )
+    return (
+        f"I couldn't find anything on the web for “{query}”. "
+        "Try rephrasing or narrowing it."
+    )
 
 
 def _clean_query(instruction: str) -> str:
