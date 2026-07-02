@@ -84,6 +84,96 @@ def delete_triples(graph_uri: str, triples: list[tuple[str, str, str]]) -> str:
     return f"DELETE DATA {{\n  GRAPH <{graph_uri}> {{\n{body}\n  }}\n}}"
 
 
+def batched_delete_triples(
+    graph_uri: str, triples: list[tuple[str, str, str]], batch_size: int = 500,
+) -> list[str]:
+    """Split concrete-triple deletes into batched ``DELETE DATA`` statements.
+
+    Mirror of :func:`batched_insert_triples` on the removal side, so a large
+    concrete-triple delete is chunked rather than emitted as one oversized
+    statement. Used by ``kg_writer.delete_facts`` for its ``triples=`` mode.
+    """
+    if not triples:
+        return []
+    return [
+        delete_triples(graph_uri, triples[i : i + batch_size])
+        for i in range(0, len(triples), batch_size)
+    ]
+
+
+def delete_subjects_query(graph_uri: str, subjects: list[str]) -> str:
+    """One batched ``DELETE`` of every triple whose subject is in ``subjects``.
+
+    Bounded by ``len(subjects)`` (a ``VALUES ?s`` list), not by triple count, so a
+    subject with thousands of triples is still a single statement. Used by
+    ``kg_writer.delete_facts`` for its ``subjects=`` mode; the caller chunks the
+    subject list so the statement stays bounded.
+    """
+    values = " ".join(f"<{s}>" for s in subjects)
+    return (
+        f"DELETE {{ GRAPH <{graph_uri}> {{ ?s ?p ?o }} }}\n"
+        f"WHERE {{ GRAPH <{graph_uri}> {{ VALUES ?s {{ {values} }} ?s ?p ?o }} }}"
+    )
+
+
+def delete_subject_predicates_query(
+    graph_uri: str, sp_pairs: list[tuple[str, str]]
+) -> str:
+    """One batched predicate-scoped ``DELETE`` of every ``(subject, predicate)`` object.
+
+    Removes every object of each ``(?s, ?p)`` pair (the "clear this attribute
+    before writing the new value" case — e.g. a lambda re-invoke) via a
+    ``VALUES (?s ?p)`` list, so the old value is dropped regardless of its literal
+    serialization (no fragile object round-trip). Used by
+    ``kg_writer.delete_facts`` for ``triples=`` entries whose object is ``None``.
+    """
+    tuples = " ".join(f"(<{s}> <{p}>)" for s, p in sp_pairs)
+    return (
+        f"DELETE {{ GRAPH <{graph_uri}> {{ ?s ?p ?o }} }}\n"
+        f"WHERE {{ GRAPH <{graph_uri}> {{ VALUES (?s ?p) {{ {tuples} }} ?s ?p ?o }} }}"
+    )
+
+
+def count_subjects_query(graph_uri: str, subjects: list[str]) -> str:
+    """COUNT of triples that ``delete_subjects_query`` would remove (removed-count)."""
+    values = " ".join(f"<{s}>" for s in subjects)
+    return (
+        f"SELECT (COUNT(*) AS ?n) FROM <{graph_uri}>\n"
+        f"WHERE {{ VALUES ?s {{ {values} }} ?s ?p ?o }}"
+    )
+
+
+def count_subject_predicates_query(
+    graph_uri: str, sp_pairs: list[tuple[str, str]]
+) -> str:
+    """COUNT of triples that ``delete_subject_predicates_query`` would remove."""
+    tuples = " ".join(f"(<{s}> <{p}>)" for s, p in sp_pairs)
+    return (
+        f"SELECT (COUNT(*) AS ?n) FROM <{graph_uri}>\n"
+        f"WHERE {{ VALUES (?s ?p) {{ {tuples} }} ?s ?p ?o }}"
+    )
+
+
+def rewrite_subject_update(graph_uri: str, old_uri: str, new_uri: str) -> str:
+    """SPARQL update that renames ``old_uri`` to ``new_uri`` in one graph.
+
+    Moves every triple that references ``old_uri`` as SUBJECT and every triple
+    that references it as OBJECT onto ``new_uri``, as two ``;``-separated
+    operations in one request. Idempotent under RDF set semantics (re-running on
+    already-rewritten data is a no-op). This is the single-place SPARQL for
+    ``kg_writer.rewrite_subject`` (which adds the provenance ``rewrite`` event and
+    the derived-index re-key); ER merge composes it via that primitive.
+    """
+    return (
+        f"WITH <{graph_uri}>\n"
+        f"DELETE {{ <{old_uri}> ?p ?o }} INSERT {{ <{new_uri}> ?p ?o }} "
+        f"WHERE {{ <{old_uri}> ?p ?o }} ;\n"
+        f"WITH <{graph_uri}>\n"
+        f"DELETE {{ ?s ?p <{old_uri}> }} INSERT {{ ?s ?p <{new_uri}> }} "
+        f"WHERE {{ ?s ?p <{old_uri}> }}"
+    )
+
+
 def select_triples(
     graph_uri: str,
     subject: str | None = None,

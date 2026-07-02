@@ -18,7 +18,6 @@ from cograph_client.resolver.er.engine import ERPipeline, extract_signals
 from cograph_client.resolver.er.rebuild import (
     choose_canonical,
     compute_clusters,
-    merge_operations,
     rebuild_kg,
     rebuild_type,
 )
@@ -56,7 +55,6 @@ __all__ = [
     "config_for",
     "config_for_with_hierarchy",
     "extract_signals",
-    "merge_operations",
     "primary_config_type",
     "primary_type",
     "rebuild_kg",

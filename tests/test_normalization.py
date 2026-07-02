@@ -136,11 +136,29 @@ class FakeNeptune:
             self._g(graph).discard(t)
 
     def _apply_delete_where(self, op: str) -> None:
-        # Two forms:
-        #  (a) legacy single-subject: DELETE { GRAPH <g> { <subj> ?p ?o } } WHERE …
-        #  (b) the orphan sweep: DELETE { GRAPH <g> { ?c ?dp ?do } } WHERE { …
-        #      ?c rdf:type <t> ; (composite-named) ; no inbound onto/attr edge … }
+        # Forms emitted by the write path:
+        #  (a) ADR 0007 delete_facts subject form (rule-store clear + orphan sweep):
+        #      DELETE { GRAPH <g> { ?s ?p ?o } }
+        #      WHERE  { GRAPH <g> { VALUES ?s { <s1> <s2> … } ?s ?p ?o } }
+        #  (b) ADR 0007 delete_facts predicate-scoped form:
+        #      WHERE { GRAPH <g> { VALUES (?s ?p) { (<s> <p>) … } ?s ?p ?o } }
+        #  (c) legacy single-subject: DELETE { GRAPH <g> { <subj> ?p ?o } } WHERE …
+        #  (d) legacy orphan sweep: DELETE { GRAPH <g> { ?c ?dp ?do } } WHERE { … }
         graph = self._graph_in(op)
+        vals_m = re.search(r"VALUES \?s \{([^}]*)\}", op)
+        if vals_m and "?s ?p ?o" in op:
+            subjects = set(re.findall(r"<([^>]+)>", vals_m.group(1)))
+            for t in list(self._g(graph)):
+                if t[0] in subjects:
+                    self._g(graph).discard(t)
+            return
+        valsp_m = re.search(r"VALUES \(\?s \?p\) \{(.*?)\}\s*\?s \?p \?o", op, re.S)
+        if valsp_m:
+            pairs = set(re.findall(r"\(<([^>]+)> <([^>]+)>\)", valsp_m.group(1)))
+            for t in list(self._g(graph)):
+                if (t[0], t[1]) in pairs:
+                    self._g(graph).discard(t)
+            return
         subj_m = re.search(r"DELETE \{ GRAPH <[^>]+> \{ <([^>]+)> \?p \?o", op)
         if subj_m:
             subj = subj_m.group(1)
@@ -193,6 +211,23 @@ class FakeNeptune:
         if "COUNT(DISTINCT ?c)" in sparql:
             n = len(self._orphan_composites(sparql, quads))
             return [{"n": str(n)}]
+
+        # Orphan-sweep SELECT (ADR 0007): SELECT DISTINCT ?c … orphan WHERE.
+        if "SELECT DISTINCT ?c" in sparql:
+            return [{"c": c} for c in sorted(self._orphan_composites(sparql, quads))]
+
+        # delete_facts removed-count: SELECT (COUNT(*) AS ?n) … VALUES ?s|(?s ?p).
+        if "COUNT(*)" in sparql:
+            vals_m = re.search(r"VALUES \?s \{([^}]*)\}", sparql)
+            if vals_m:
+                subjects = set(re.findall(r"<([^>]+)>", vals_m.group(1)))
+                n = sum(1 for (s, p, o) in quads if s in subjects)
+                return [{"n": str(n)}]
+            valsp_m = re.search(r"VALUES \(\?s \?p\) \{(.*?)\}\s*\?s \?p \?o", sparql, re.S)
+            if valsp_m:
+                pairs = set(re.findall(r"\(<([^>]+)> <([^>]+)>\)", valsp_m.group(1)))
+                n = sum(1 for (s, p, o) in quads if (s, p) in pairs)
+                return [{"n": str(n)}]
 
         # Composite target-type discovery (re-run path): SELECT DISTINCT ?t … of
         # composite-named, orphaned entities. Returns the distinct types.

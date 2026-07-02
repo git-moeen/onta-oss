@@ -30,10 +30,10 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 from cograph_client.graph.client import NeptuneClient
+from cograph_client.graph.kg_writer import delete_facts, insert_facts
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import (
     _escape_literal,
-    insert_triples,
     tenant_graph_uri,
 )
 
@@ -140,11 +140,16 @@ class NormalizationRuleStore:
 
     async def save(self, tenant_id: str, rule: NormalizationRule) -> None:
         graph = tenant_graph_uri(tenant_id)
-        # Clear-then-write so an updated rule replaces its old field triples
-        # instead of accumulating duplicates (delete-by-subject pattern).
-        await self._neptune.update(self._delete_by_subject(graph, rule.uri))
-        triples = self._rule_to_triples(rule)
-        await self._neptune.update(insert_triples(graph, triples))
+        # Clear-then-write through the shared write path (ADR 0007): the rule is a
+        # metadata subject in the tenant ontology graph, so delete_facts drops its
+        # prior field triples (subject-scoped) and insert_facts writes the current
+        # set. No refresh_after_write — a rule row is config metadata (never
+        # instance data / geometry / schema), so there is no derived-index,
+        # ontology-cache, or type-stats fan-out to run for it.
+        await delete_facts(
+            self._neptune, graph, subjects=[rule.uri], reason="normalization-rule upsert"
+        )
+        await insert_facts(self._neptune, graph, self._rule_to_triples(rule))
 
     async def get(self, tenant_id: str, rule_id: str) -> Optional[NormalizationRule]:
         graph = tenant_graph_uri(tenant_id)
@@ -282,12 +287,4 @@ class NormalizationRuleStore:
             status=fields.get(P_STATUS, "suggested"),  # type: ignore[arg-type]
             created_at=fields.get(P_CREATED_AT, ""),
             applied_at=fields.get(P_APPLIED_AT) or None,
-        )
-
-    @staticmethod
-    def _delete_by_subject(graph: str, subject_uri: str) -> str:
-        """DELETE every triple whose subject is this rule (clear before re-write)."""
-        return (
-            f"DELETE {{ GRAPH <{graph}> {{ <{subject_uri}> ?p ?o }} }}\n"
-            f"WHERE {{ GRAPH <{graph}> {{ <{subject_uri}> ?p ?o }} }}"
         )

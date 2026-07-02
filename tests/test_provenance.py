@@ -22,8 +22,18 @@ import pytest
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.ontology_queries import attr_uri
 from cograph_client.graph.provenance import (
+    EVENT_REWRITE,
+    EVENT_TOMBSTONE,
+    PROV_EVENT,
     PROV_NS,
+    PROV_OBJECT,
+    PROV_PREDICATE,
+    PROV_REASON,
+    PROV_REWRITTEN_TO,
+    PROV_SUBJECT,
     build_provenance_triples,
+    build_rewrite_triples,
+    build_tombstone_triples,
     fetch_provenance,
     provenance_graph_uri,
     provenance_query,
@@ -377,3 +387,72 @@ async def test_multi_entity_ingest_flushes_one_batched_provenance_insert(mock_ne
     instance_calls = [c for c in calls if f"GRAPH <{prov_graph}>" not in c]
     assert len(instance_calls) == 1
     assert PROV_NS not in instance_calls[0]
+
+
+# --- Removal / rename events (ADR 0007): tombstone + rewrite builders ----------
+
+_GRAPH = "https://cograph.tech/graphs/t/kg/k"
+_FIXED = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+
+def _by_node(triples):
+    nodes = {}
+    for s, p, o in triples:
+        nodes.setdefault(s, {}).setdefault(p, []).append(o)
+    return nodes
+
+
+def test_build_tombstone_triples_for_subject():
+    subj = "https://cograph.tech/entities/E/1"
+    triples = build_tombstone_triples(
+        subjects=[subj],
+        graph_uri=_GRAPH,
+        reason="orphan sweep",
+        timestamp=_FIXED,
+        touched_types=["https://cograph.tech/types/Language"],
+    )
+    assert triples, "a subject removal must emit a tombstone event"
+    node = triples[0][0]
+    assert node.startswith(f"{PROV_NS}event/")
+    fields = _by_node(triples)[node]
+    assert fields[PROV_EVENT] == [EVENT_TOMBSTONE]
+    assert fields[PROV_SUBJECT] == [subj]
+    assert fields[PROV_REASON] == ["orphan sweep"]
+    assert any("affectedType" in p for p, _ in ((k, v) for k in fields for v in fields[k]))
+
+
+def test_build_tombstone_triples_predicate_scoped_has_no_object():
+    # object=None → predicate-scoped removal: prov:predicate present, prov:object absent.
+    triples = build_tombstone_triples(
+        triples=[("urn:e", "urn:p", None)], graph_uri=_GRAPH, reason="lambda re-invoke",
+        timestamp=_FIXED,
+    )
+    fields = _by_node(triples)[triples[0][0]]
+    assert fields[PROV_EVENT] == [EVENT_TOMBSTONE]
+    assert fields[PROV_PREDICATE] == ["urn:p"]
+    assert PROV_OBJECT not in fields
+
+
+def test_build_tombstone_triples_concrete_triple_records_object():
+    triples = build_tombstone_triples(
+        triples=[("urn:e", "urn:p", "the-old-value")], graph_uri=_GRAPH, timestamp=_FIXED,
+    )
+    fields = _by_node(triples)[triples[0][0]]
+    assert fields[PROV_OBJECT] == ["the-old-value"]
+
+
+def test_build_rewrite_triples_maps_old_to_new():
+    triples = build_rewrite_triples(
+        "urn:loser", "urn:canon", graph_uri=_GRAPH, reason="er-merge", timestamp=_FIXED,
+    )
+    fields = _by_node(triples)[triples[0][0]]
+    assert fields[PROV_EVENT] == [EVENT_REWRITE]
+    assert fields[PROV_SUBJECT] == ["urn:loser"]
+    assert fields[PROV_REWRITTEN_TO] == ["urn:canon"]
+    assert fields[PROV_REASON] == ["er-merge"]
+
+
+def test_tombstone_events_are_deterministic_for_fixed_timestamp():
+    a = build_tombstone_triples(subjects=["urn:e"], graph_uri=_GRAPH, timestamp=_FIXED)
+    b = build_tombstone_triples(subjects=["urn:e"], graph_uri=_GRAPH, timestamp=_FIXED)
+    assert a == b  # same fact + timestamp → same event node (idempotent)

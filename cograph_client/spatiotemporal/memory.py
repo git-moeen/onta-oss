@@ -273,6 +273,37 @@ class InMemorySpatioTemporalIndex:
                 )
             }
 
+    async def rekey(
+        self,
+        old_uri: str,
+        new_uri: str,
+        tenant_id: str,
+        *,
+        kg_name: Optional[str] = None,
+    ) -> None:
+        async with self._lock:
+            kept: dict[tuple, SpatioTemporalFact] = {}
+            moved: dict[tuple, SpatioTemporalFact] = {}
+            for k, v in self._facts.items():
+                is_old = (
+                    v.tenant_id == tenant_id
+                    and v.entity_uri == old_uri
+                    and (kg_name is None or v.kg_name == kg_name)
+                )
+                if not is_old:
+                    kept[k] = v
+                    continue
+                m = v.model_copy(deep=True)
+                m.entity_uri = new_uri
+                moved[self._key(m)] = m
+            # Winner precedence: an existing new_uri fact at the same key is NOT
+            # overwritten by the loser's re-keyed row (mirrors the PostGIS
+            # ON CONFLICT DO NOTHING).
+            for nk, m in moved.items():
+                if nk not in kept:
+                    kept[nk] = m
+            self._facts = kept
+
     async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
         async with self._lock:
             self._facts = {

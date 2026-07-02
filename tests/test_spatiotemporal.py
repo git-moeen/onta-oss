@@ -656,3 +656,59 @@ async def test_postgis_roundtrip_live():
         assert _uris(res) == set()
     finally:
         await store.clear(tenant)
+
+
+# --------------------------------------------------------------------------- #
+# rekey (ADR 0007): an ER merge re-keys the loser's rows onto the winner instead
+# of evicting + recomputing, so radius/bbox queries never return a merged-away
+# ghost URI and no embedding is recomputed.
+# --------------------------------------------------------------------------- #
+
+
+async def test_inmemory_rekey_moves_rows_to_new_uri(idx):
+    await idx.upsert_many([_fact("e:loser", *SF_FERRY), _fact("e:other", *SF_CITY_HALL)])
+    await idx.rekey("e:loser", "e:canon", TENANT)
+    res = await idx.query_radius(TENANT, *SF_FERRY, 5_000)
+    # The loser is gone; its geometry now answers under the canonical URI.
+    assert _uris(res) == {"e:canon", "e:other"}
+
+
+async def test_inmemory_rekey_winner_precedence_on_collision(idx):
+    # Winner already has a fact at the same (kg, valid_time) — its geometry must
+    # survive; the loser's re-keyed row must NOT clobber it.
+    await idx.upsert(_fact("e:canon", *SF_FERRY, attrs={"label": "winner"}))
+    await idx.upsert(_fact("e:loser", *NYC_TIMES_SQ, attrs={"label": "loser"}))
+    await idx.rekey("e:loser", "e:canon", TENANT)
+    near_ferry = await idx.query_radius(TENANT, *SF_FERRY, 5_000)
+    near_nyc = await idx.query_radius(TENANT, *NYC_TIMES_SQ, 5_000)
+    assert _uris(near_ferry) == {"e:canon"}  # winner geometry kept
+    assert _uris(near_nyc) == set()  # loser row dropped, not moved on collision
+
+
+async def test_inmemory_rekey_scoped_to_kg(idx):
+    await idx.upsert(_fact("e:loser", *SF_FERRY, kg=KG))
+    await idx.upsert(_fact("e:loser", *SF_FERRY, kg=OTHER_KG))
+    await idx.rekey("e:loser", "e:canon", TENANT, kg_name=KG)
+    res = await idx.query_radius(TENANT, *SF_FERRY, 1_000)
+    # Only the KG-scoped row moved; the OTHER_KG row keeps the old URI.
+    assert _uris(res) == {"e:canon", "e:loser"}
+
+
+async def test_postgis_rekey_sql(pg):
+    store, recorder, _conn = pg
+    await store.rekey("e:loser", "e:canon", TENANT, kg_name=KG)
+    sqls = _sqls(recorder, "execute")
+    # Re-key = move-then-drop: INSERT…SELECT with ON CONFLICT DO NOTHING (winner
+    # precedence), then DELETE FROM the old key — both in the transaction.
+    assert any(
+        "INSERT INTO entity_spatiotemporal" in s
+        and "SELECT $2, tenant_id, kg_name, geom, valid_time, attrs" in s
+        and "ON CONFLICT (tenant_id, kg_name, entity_uri, valid_time) DO NOTHING" in s
+        for s in sqls
+    )
+    assert any(
+        "DELETE FROM entity_spatiotemporal" in s
+        and "entity_uri = $2" in s
+        and "kg_name = $3" in s
+        for s in sqls
+    )

@@ -47,11 +47,10 @@ import re
 import structlog
 
 from cograph_client.graph.client import NeptuneClient
-from cograph_client.graph.kg_writer import insert_facts, refresh_after_write
+from cograph_client.graph.kg_writer import delete_facts, insert_facts, refresh_after_write
 from cograph_client.graph.ontology_queries import RDF, RDFS, attr_uri, type_uri
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import (
-    delete_triples,
     kg_graph_uri,
     tenant_graph_uri,
 )
@@ -121,24 +120,36 @@ async def apply_rule(neptune: NeptuneClient, tenant_id: str, rule) -> dict:
     kg_graph = kg_graph_uri(tenant_id, rule.kg_name)
     onto_graph = tenant_graph_uri(tenant_id)
 
-    summary = await _dispatch(neptune, kg_graph, onto_graph, rule)
+    summary, deleted_subjects = await _dispatch(neptune, kg_graph, onto_graph, rule)
 
     if _summary_mutated(summary):
         # Shared post-write housekeeping (graph/kg_writer.py) — same path every
         # KG writer uses. affected_types=() because normalization changes instance
         # data + counts but NEVER the type SCHEMA (no new types/attributes), so no
         # re-embed is needed; the shared refresh still invalidates the NL-planning
-        # cache and recomputes type-stats.
+        # cache and recomputes type-stats. deleted_subjects carries any orphan
+        # composites the sweep removed (ADR 0007) so the SAME refresh evicts them
+        # from the derived secondary indexes — no ghost rows left behind.
         await refresh_after_write(
-            neptune, tenant_id=tenant_id, kg_name=rule.kg_name, affected_types=()
+            neptune,
+            tenant_id=tenant_id,
+            kg_name=rule.kg_name,
+            affected_types=(),
+            deleted_subjects=deleted_subjects,
         )
     return summary
 
 
 async def _dispatch(
     neptune: NeptuneClient, kg_graph: str, onto_graph: str, rule
-) -> dict:
-    """Route to the rule-type handler and return its summary."""
+) -> tuple[dict, list[str]]:
+    """Route to the rule-type handler; return ``(summary, deleted_subjects)``.
+
+    ``deleted_subjects`` are the whole-entity URIs the handler removed (the orphan
+    sweep's swept composites) so ``apply_rule``'s single refresh can evict them
+    from derived indexes. Attribute/edge-level deletes (a subject survives, only
+    some triples go) are NOT subjects here.
+    """
     if rule.rule_type == "strip_emoji":
         return await _strip_emoji(neptune, kg_graph, rule)
 
@@ -155,7 +166,7 @@ async def _dispatch(
                 predicate=pred_leaf,
                 note="promotion of attribute literals to atomic entities is a follow-up",
             )
-            return {"edges_rewritten": 0, "atomic_created": 0, "orphans_dropped": 0}
+            return {"edges_rewritten": 0, "atomic_created": 0, "orphans_dropped": 0}, []
         return await _explode_relationship(
             neptune, kg_graph, onto_graph, rule.type_name, pred_leaf, delimiters
         )
@@ -252,8 +263,12 @@ async def _explode_relationship(
     domain_type: str,
     pred_leaf: str,
     delimiters: list[str],
-) -> dict:
-    """Split composite relationship targets into canonical atomic entities."""
+) -> tuple[dict, list[str]]:
+    """Split composite relationship targets into canonical atomic entities.
+
+    Returns ``(summary, orphan_uris)`` — the composite subjects the final sweep
+    removed, so the caller's single refresh can evict them from derived indexes.
+    """
     onto_pred = ONTO_PRED_PREFIX + pred_leaf
     attr_pred_suffix = ATTRS_INFIX + pred_leaf  # any …/attrs/<leaf> form
 
@@ -336,9 +351,15 @@ async def _explode_relationship(
     if edges_to_add:
         await insert_facts(neptune, kg_graph, edges_to_add)
     if edges_to_delete:
-        # delete_triples batches all in one DELETE DATA; chunk to stay safe.
-        for i in range(0, len(edges_to_delete), 500):
-            await neptune.update(delete_triples(kg_graph, edges_to_delete[i : i + 500]))
+        # Concrete-triple removal via the shared primitive (ADR 0007); delete_facts
+        # batches internally (no oversized statement). These are edge drops — the
+        # subject survives — so they are NOT deleted_subjects.
+        await delete_facts(
+            neptune,
+            kg_graph,
+            triples=edges_to_delete,
+            reason="normalization:list_explode composite-edge drop",
+        )
 
     # 3) Final orphan sweep. After ALL edges for this predicate are re-pointed,
     #    delete EVERY composite node of the relationship's target type(s) that has
@@ -353,17 +374,17 @@ async def _explode_relationship(
     target_types = await _composite_target_types(
         neptune, onto_graph, domain_type, pred_leaf, composites_touched
     )
-    orphans_dropped = await _sweep_orphan_composites(
+    orphan_uris = await _sweep_orphan_composites(
         neptune, kg_graph, onto_pred, attr_pred_suffix, target_types, delimiters
     )
 
     summary = {
         "edges_rewritten": len(edges_to_delete),
         "atomic_created": len(atomic_seen),
-        "orphans_dropped": orphans_dropped,
+        "orphans_dropped": len(orphan_uris),
     }
     logger.info("explode_relationship_done", predicate=pred_leaf, **summary)
-    return summary
+    return summary, orphan_uris
 
 
 async def _composite_target_types(
@@ -458,32 +479,35 @@ async def _sweep_orphan_composites(
     attr_pred_suffix: str,
     target_types: set[str],
     delimiters: list[str],
-) -> int:
+) -> list[str]:
     """Final, graph-state-keyed sweep of orphaned composite nodes.
 
     For each target type, delete ALL triples of every entity that is (a) of that
     type, (b) composite-named (local-name or rdfs:label contains a rule
     delimiter), and (c) has ZERO inbound ``onto/<pred>`` (or ``…/attrs/<pred>``)
-    edges. One DELETE/WHERE per type — not a per-node loop — so it catches every
-    orphan in a single pass (complete) and re-deletes leftovers on a later run
-    (idempotent / re-runnable). Atomic nodes (no delimiter) and still-referenced
-    composites are left untouched.
+    edges. One SELECT per type resolves the orphan set (complete — catches every
+    orphan a per-edge drop would miss; re-runnable — a later apply still sweeps
+    leftovers), then the removal routes through the shared ``delete_facts``
+    primitive (ADR 0007) so a swept subject is evicted from the derived secondary
+    indexes too — no ghost rows keyed to a deleted subject. Atomic nodes (no
+    delimiter) and still-referenced composites are left untouched.
 
-    Returns the number of orphan composite nodes deleted (counted before the
-    DELETE so the summary reflects what was removed).
+    Returns the URIs of the orphan composite subjects removed (the summary count
+    is ``len(...)``, and the caller feeds them to ``refresh_after_write`` as
+    ``deleted_subjects``).
     """
     if not target_types:
-        return 0
+        return []
 
     delim_filter = " || ".join(
         f'CONTAINS(?cname, "{_sparql_str(d)}")' for d in delimiters
     )
-    dropped = 0
+    dropped: list[str] = []
     for target_type in sorted(target_types):
         t_uri = type_uri(target_type)
-        # The shared WHERE: an orphaned composite ?c of this type. Both the count
-        # and the delete key on exactly this pattern, so the count matches what
-        # the DELETE removes.
+        # An orphaned composite ?c of this type. SELECT the subjects, then remove
+        # them by URI via delete_facts (subject-scoped) — so the set that is
+        # evicted from derived indexes is exactly the set removed from Neptune.
         orphan_where = (
             f"  ?c <{RDF_TYPE}> <{t_uri}> .\n"
             f'  FILTER(STRSTARTS(STR(?c), "{ENTITY_URI_PREFIX}"))\n'
@@ -494,39 +518,35 @@ async def _sweep_orphan_composites(
             f"  FILTER NOT EXISTS {{ ?s2 ?p2 ?c . "
             f"FILTER(STRENDS(STR(?p2), \"{_sparql_str(attr_pred_suffix)}\")) }}\n"
         )
-        count_q = (
-            f"SELECT (COUNT(DISTINCT ?c) AS ?n) FROM <{kg_graph}> WHERE {{\n"
+        select_q = (
+            f"SELECT DISTINCT ?c FROM <{kg_graph}> WHERE {{\n"
             f"{orphan_where}"
             f"}}"
         )
         try:
-            _, rows = parse_sparql_results(await neptune.query(count_q))
-            n = int(rows[0].get("n", 0)) if rows else 0
+            _, rows = parse_sparql_results(await neptune.query(select_q))
+            orphan_uris = [r["c"] for r in rows if r.get("c")]
         except Exception:
             logger.warning(
-                "orphan_count_failed", target_type=target_type, exc_info=True
+                "orphan_select_failed", target_type=target_type, exc_info=True
             )
-            n = 0
-        if n == 0:
             continue
-        # Delete EVERY triple of EVERY orphan of this type in one DELETE/WHERE.
-        # The orphan set is identified by the same predicate as the count, then
-        # we sweep all of its outbound triples (rdf:type, label, attrs).
-        delete_q = (
-            f"DELETE {{ GRAPH <{kg_graph}> {{ ?c ?dp ?do }} }}\n"
-            f"WHERE {{ GRAPH <{kg_graph}> {{\n"
-            f"{orphan_where}"
-            f"  ?c ?dp ?do .\n"
-            f"}} }}"
-        )
+        if not orphan_uris:
+            continue
         try:
-            await neptune.update(delete_q)
+            await delete_facts(
+                neptune,
+                kg_graph,
+                subjects=orphan_uris,
+                touched_types=[target_type],
+                reason="normalization:list_explode orphan-composite sweep",
+            )
         except Exception:
             logger.warning(
                 "orphan_sweep_failed", target_type=target_type, exc_info=True
             )
             continue
-        dropped += n
+        dropped.extend(orphan_uris)
     return dropped
 
 
@@ -541,8 +561,12 @@ def _target_type_from_type_uri(t_uri: str) -> str | None:
 
 async def _explode_literal(
     neptune: NeptuneClient, kg_graph: str, pred_leaf: str, delimiters: list[str]
-) -> dict:
-    """Split packed attribute literals into N atomic literals."""
+) -> tuple[dict, list[str]]:
+    """Split packed attribute literals into N atomic literals.
+
+    Returns ``(summary, [])`` — literal splits replace an attribute value on a
+    surviving subject, so nothing here is a deleted subject.
+    """
     onto_pred = ONTO_PRED_PREFIX + pred_leaf
     attr_pred_suffix = ATTRS_INFIX + pred_leaf
 
@@ -581,8 +605,12 @@ async def _explode_literal(
     if to_add:
         await insert_facts(neptune, kg_graph, to_add)
     if to_delete:
-        for i in range(0, len(to_delete), 500):
-            await neptune.update(delete_triples(kg_graph, to_delete[i : i + 500]))
+        await delete_facts(
+            neptune,
+            kg_graph,
+            triples=to_delete,
+            reason="normalization:list_explode packed-literal replace",
+        )
 
     summary = {
         "edges_rewritten": rewritten,
@@ -590,7 +618,7 @@ async def _explode_literal(
         "orphans_dropped": 0,
     }
     logger.info("explode_literal_done", predicate=pred_leaf, **summary)
-    return summary
+    return summary, []
 
 
 def _strip_emoji_value(value: str) -> str:
@@ -606,7 +634,7 @@ def _strip_emoji_value(value: str) -> str:
     return _WS_PATTERN.sub(" ", stripped).strip()
 
 
-async def _strip_emoji(neptune: NeptuneClient, kg_graph: str, rule) -> dict:
+async def _strip_emoji(neptune: NeptuneClient, kg_graph: str, rule) -> tuple[dict, list[str]]:
     """Strip emoji/junk from this predicate's literals; rewrite only what changed.
 
     Selects every ``attrs/<leaf>`` (or ``onto/<leaf>``) literal for the
@@ -653,15 +681,19 @@ async def _strip_emoji(neptune: NeptuneClient, kg_graph: str, rule) -> dict:
     if to_add:
         await insert_facts(neptune, kg_graph, to_add)
     if to_delete:
-        for i in range(0, len(to_delete), 500):
-            await neptune.update(delete_triples(kg_graph, to_delete[i : i + 500]))
+        await delete_facts(
+            neptune,
+            kg_graph,
+            triples=to_delete,
+            reason="normalization:strip_emoji literal cleanup",
+        )
 
     summary = {
         "literals_cleaned": literals_cleaned,
         "triples_rewritten": len(to_delete),
     }
     logger.info("strip_emoji_done", predicate=pred_leaf, **summary)
-    return summary
+    return summary, []
 
 
 def _decode_local_name(uri: str) -> str:
