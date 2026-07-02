@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "cograph-client"
 version = "0.1.0"
 description = "Living Knowledge Graph Platform"
+license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",

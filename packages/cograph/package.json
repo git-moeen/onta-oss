@@ -1,6 +1,6 @@
 {
   "name": "cograph",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "description": "Cograph SDK and CLI — knowledge graph platform for structured data",
   "type": "module",
   "main": "./dist/index.js",
@@ -37,7 +37,7 @@
     "llm"
   ],
   "author": "Cograph",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://cograph.cloud",
   "repository": {
     "type": "git",

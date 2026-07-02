@@ -1,6 +1,6 @@
 {
   "name": "cograph-mcp",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Cograph MCP server — expose knowledge graph tools to AI agents",
   "type": "module",
   "main": "./dist/index.js",
@@ -25,7 +25,7 @@
     "agent"
   ],
   "author": "Cograph",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://cograph.cloud",
   "repository": {
     "type": "git",
