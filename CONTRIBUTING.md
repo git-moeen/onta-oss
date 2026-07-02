@@ -49,6 +49,24 @@ CI runs `check_boundary.sh` on every PR (`.github/workflows/boundary.yml`), and
 the publish workflow runs `check_npm_bundle.sh` before any `npm publish`. A PR
 that adds `from cograph.<anything>` under `cograph_client/` or `packages/` fails.
 
+## Contributor License Agreement (CLA)
+
+First-time contributors sign the project [CLA](CLA.md) once, by commenting
+on their pull request:
+
+> I have read the CLA Document and I hereby sign the CLA
+
+The CLA bot (`.github/workflows/cla.yml`) blocks merge until every PR
+author has signed, and records signatures in `.github/signatures/cla.json`
+on the `cla-signatures` branch. Comment `recheck` to re-run a stale check.
+
+Why a CLA on an Apache-2.0 repo: it keeps the project able to add license
+options later (commercial licensing, or a different license for a future
+version) without tracking down every past contributor. The trade in your
+favor is written into the CLA itself: anything you contribute stays
+available under Apache-2.0 as released — relicensing can never be
+retroactive — and you keep the copyright to your contribution.
+
 ## Dev Setup
 
 ```bash
@@ -111,6 +129,7 @@ cograph_client/
 4. Run tests: `pytest tests/ -v`
 5. Commit with a clear message: `git commit -m "fix: description of what and why"`
 6. Open a PR against `main`
+7. First PR? Sign the [CLA](CLA.md) when the bot prompts you (see above)
 
 ## Commit Messages
 

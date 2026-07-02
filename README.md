@@ -234,4 +234,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical deep-dive.
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Contributions require a one-time [CLA](CLA.md) signature — a single comment
+on your first pull request. See [CONTRIBUTING.md](CONTRIBUTING.md).
