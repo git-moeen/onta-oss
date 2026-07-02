@@ -326,8 +326,9 @@ class PostgresSemanticIndex:
             from cograph_client.db.pool import get_pg_pool, register_pool_init
 
             # Install the codec hook BEFORE creating/joining the pool so its
-            # very first connections run it (register_pool_init also expires
-            # any pre-existing pool's connections, so joining late is safe).
+            # very first connections run it (a pre-existing pool for this DSN
+            # is expired — awaited — inside the get_pg_pool call right below,
+            # so joining late is safe).
             register_pool_init(_register_vector_codec)
 
             pool = await get_pg_pool(self._dsn)

@@ -6,7 +6,10 @@ must hold:
 * one pool per DSN, however many stores/callers ask for it (the whole point);
 * distinct DSNs get distinct pools;
 * per-connection init hooks are applied to new connections, and registering a
-  hook AFTER a pool exists expires its connections (so no mixed pool);
+  hook AFTER a pool exists expires its connections on the next ``get_pg_pool``
+  call — properly awaited, because asyncpg's ``expire_connections`` is a
+  coroutine whose body never runs unawaited (the ONTA-176 review finding: the
+  old fire-and-forget call was a silent no-op on real pools);
 * ``reset_pg_pools`` forgets pools + hooks (test isolation contract that
   ``tests/test_spatiotemporal.py``'s ``pg`` fixture relies on).
 """
@@ -30,7 +33,10 @@ class FakePool:
         self.expired = 0
         self.closed = False
 
-    def expire_connections(self):
+    async def expire_connections(self):
+        # Coroutine on purpose — mirrors real asyncpg, so a fire-and-forget
+        # (unawaited) call in pool.py would leave ``expired`` at 0 and fail
+        # the late-hook test below.
         self.expired += 1
 
     async def close(self):
@@ -97,7 +103,15 @@ async def test_late_hook_expires_existing_pools(fresh):
         pass
 
     register_pool_init(hook)
+    # Registration itself is sync and defers the (async) expiry to the next
+    # get_pg_pool call — the only way consumers obtain a pool.
+    assert pool.expired == 0
+    again = await get_pg_pool("postgres://u@h/db")
+    assert again is pool
     assert pool.expired == 1  # existing connections recycled → hook applies
+    # Idempotent: no further hook registrations → no further expiry churn.
+    await get_pg_pool("postgres://u@h/db")
+    assert pool.expired == 1
 
 
 async def test_close_pg_pools_closes_and_forgets(fresh):
