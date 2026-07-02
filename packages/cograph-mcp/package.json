@@ -25,7 +25,7 @@
     "agent"
   ],
   "author": "Cograph",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://cograph.cloud",
   "repository": {
     "type": "git",
