@@ -843,14 +843,17 @@ async def reconcile_kg(
     1. fetch the marker map (uncached, raising — see :func:`_fetch_marker_map`);
     2. apply the default candidacy heuristic to undecided attributes and fold
        any new ``free_text`` verdicts into this run's marker set;
-    3. snapshot the index's doc listing (``list_docs``) **BEFORE the scan
-       starts** — the ordering is load-bearing: a doc the write hook indexes
-       mid-scan would otherwise be in the listing but missed by the
-       already-running scan and get ghost-deleted. Snapshot-first means any
-       doc indexed after the snapshot simply isn't a ghost candidate this run
-       (its Neptune triples land before its index rows, so the NEXT run's scan
-       sees it), and any doc in the snapshot already has its triples committed
-       and IS seen by this scan;
+    3. snapshot the index's doc listing (``list_docs``) — taken **FIRST,
+       before every other Neptune read of the run** (marker fetch, candidacy
+       sampling, the scan). The ordering is load-bearing: a doc the write hook
+       indexes anywhere inside the run's read window (including during the
+       candidacy pass, whose marker writes can extend the scan-predicate set
+       after it was derived) would otherwise be in the listing but absent from
+       the expected set and get ghost-deleted. Snapshot-first means any doc
+       indexed after the snapshot simply isn't a ghost candidate this run (its
+       Neptune triples land before its index rows, so the NEXT run's scan sees
+       it), and any doc in the snapshot already has its triples committed and
+       IS seen by this scan;
     4. scan the instance graph for marked predicates (plus ``rdf:type`` /
        label predicates for display parity with hook-written rows) — keyset
        pagination by entity (whole-entity groups; see :func:`_scan_triples`) —
@@ -895,6 +898,36 @@ async def reconcile_kg(
     idx = index if index is not None else get_semantic_index()
     kg_graph = kg_graph_uri(tenant_id, kg_name)
 
+    # 0. Snapshot the index FIRST — before ANY of this run's Neptune reads
+    # (marker fetch, candidacy sampling, the scan). The ordering is
+    # load-bearing beyond just "before the scan": the candidacy pass below can
+    # issue up to _MAX_CANDIDACY_ATTRS_PER_RUN sample queries and even write
+    # new markers, so a doc the write hook indexes during that window (for an
+    # attr this run's scan-predicate set was derived too early to include)
+    # would land in `current` with no chance of appearing in `expected` — and
+    # be ghost-deleted. Snapshot-first closes the whole window: any doc
+    # indexed after this point simply isn't a ghost candidate this run (its
+    # Neptune triples land before its index rows, so the NEXT run claims it).
+    #
+    # getattr, not a direct call: list_docs is a Protocol method now, but a
+    # third-party backend compiled against the pre-list_docs Protocol must
+    # degrade gracefully, never crash (module docstring). Both first-party
+    # backends implement it, so the default paths always take this branch.
+    lister = getattr(idx, "list_docs", None)
+    doc_listing_supported = callable(lister)
+    current: dict[tuple[str, str], str] = {}
+    # Doc key -> stored denormalized attrs; None when the backend's listing
+    # predates the 4-tuple form (legacy 3-tuples: hash-diff only, no attrs
+    # repair — degrade, don't crash).
+    current_attrs: dict[tuple[str, str], Optional[dict[str, Any]]] = {}
+    if doc_listing_supported:
+        for row in await lister(tenant_id, kg_name=kg_name):
+            key = (row[0], row[1])
+            current[key] = row[2]
+            current_attrs[key] = (
+                dict(row[3]) if len(row) > 3 and row[3] is not None else None
+            )
+
     # 1+2. Markers, then the default heuristic for undecided attributes.
     marker_map = await _fetch_marker_map(neptune, tenant_id)
     literal_preds = await _distinct_literal_predicates(neptune, kg_graph)
@@ -919,30 +952,6 @@ async def reconcile_kg(
     scan_preds.add(_RDF_TYPE)
     scan_preds.add(_RDFS_LABEL)
 
-    # 3. Snapshot the index BEFORE the scan starts (docstring step 3): a doc
-    # the write hook indexes after this point cannot appear in `current`, so
-    # it can never be misread as a ghost by this run — its Neptune triples are
-    # committed before its index rows, so the next run's scan claims it.
-    #
-    # getattr, not a direct call: list_docs is a Protocol method now, but a
-    # third-party backend compiled against the pre-list_docs Protocol must
-    # degrade gracefully, never crash (module docstring). Both first-party
-    # backends implement it, so the default paths always take this branch.
-    lister = getattr(idx, "list_docs", None)
-    doc_listing_supported = callable(lister)
-    current: dict[tuple[str, str], str] = {}
-    # Doc key -> stored denormalized attrs; None when the backend's listing
-    # predates the 4-tuple form (legacy 3-tuples: hash-diff only, no attrs
-    # repair — degrade, don't crash).
-    current_attrs: dict[tuple[str, str], Optional[dict[str, Any]]] = {}
-    if doc_listing_supported:
-        for row in await lister(tenant_id, kg_name=kg_name):
-            key = (row[0], row[1])
-            current[key] = row[2]
-            current_attrs[key] = (
-                dict(row[3]) if len(row) > 3 and row[3] is not None else None
-            )
-
     # 4. Scan (keyset-paginated, whole-entity groups).
     triples: list[Triple] = []
     scan_truncated = False
@@ -950,6 +959,14 @@ async def reconcile_kg(
         triples, scan_truncated = await _scan_triples(
             neptune, kg_graph, sorted(scan_preds)
         )
+
+    # Client-side re-sort for strict parity with the write hook, which sorts
+    # its re-read triples in Python (kg_writer._fetch_touched_entity_triples).
+    # The server's ORDER BY ?e ?p ?o may order heterogeneous literal values
+    # differently than Python's codepoint sort on the rendered strings; the
+    # extractor's first-qualifying-wins choices (labels, cross-attr dedup)
+    # must not depend on which side built the doc.
+    triples.sort()
 
     chunks = extract_semantic_chunks(
         triples, tenant_id=tenant_id, kg_name=kg_name, marked_predicates=marked
