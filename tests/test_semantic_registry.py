@@ -25,6 +25,9 @@ TENANT = "demo-tenant"
 OTHER_TENANT = "spider-bench"
 KG = "kg1"
 OTHER_KG = "kg2"
+#: The "current" embed model for these tests: the vector leg (both backends)
+#: only trusts vectors produced by the index's current model.
+FAKE_MODEL = "fake-embed-model"
 
 
 def _chunk(
@@ -37,6 +40,7 @@ def _chunk(
     kg: str = KG,
     doc_text: str | None = None,
     embedding: list[float] | None = None,
+    embed_model: str | None = None,
     attrs: dict | None = None,
 ) -> SemanticChunk:
     """A chunk row; ``doc_text`` overrides the hashed doc for multi-chunk docs
@@ -50,13 +54,16 @@ def _chunk(
         chunk_text=text,
         content_hash=content_hash(doc_text if doc_text is not None else text),
         embedding=embedding,
+        embed_model=embed_model
+        if embed_model is not None
+        else (FAKE_MODEL if embedding is not None else None),
         attrs=attrs if attrs is not None else {"label": uri},
     )
 
 
 @pytest.fixture
 def idx() -> InMemorySemanticIndex:
-    return InMemorySemanticIndex()
+    return InMemorySemanticIndex(embed_model=FAKE_MODEL)
 
 
 @pytest.fixture(autouse=True)
@@ -382,9 +389,10 @@ async def test_list_docs_empty_index(idx):
 
 
 async def test_list_docs_is_doc_granular_not_chunk_granular(idx):
-    """One row per (entity, attr) DOC: a multi-chunk doc collapses to a single
-    triple (every chunk carries the same doc-level hash by construction) —
-    the granularity the reconciler's ghost diff operates on."""
+    """One row per (entity, attr) DOC: a multi-chunk doc collapses to its
+    chunk-0 row (every chunk carries the same doc-level hash by construction,
+    and attrs are written per doc) — the granularity the reconciler's ghost
+    diff and attrs-repair pass operate on."""
     await idx.upsert_chunks(
         [
             _chunk("e:1", "part one about quasars", ix=0, doc_text="d1"),
@@ -394,9 +402,9 @@ async def test_list_docs_is_doc_granular_not_chunk_granular(idx):
         ]
     )
     assert await idx.list_docs(TENANT) == [
-        ("e:1", "description", content_hash("d1")),
-        ("e:1", "notes", content_hash("the notes text")),
-        ("e:2", "description", content_hash("other entity text")),
+        ("e:1", "description", content_hash("d1"), {"label": "e:1"}),
+        ("e:1", "notes", content_hash("the notes text"), {"label": "e:1"}),
+        ("e:2", "description", content_hash("other entity text"), {"label": "e:2"}),
     ]  # sorted (deterministic), one row per doc despite the two d1 chunks
 
 
@@ -410,9 +418,9 @@ async def test_list_docs_scoping(idx):
             _chunk("e:c", "gamma text", tenant=OTHER_TENANT, kg=KG),
         ]
     )
-    assert [e for e, _a, _h in await idx.list_docs(TENANT)] == ["e:a", "e:b"]
-    assert [e for e, _a, _h in await idx.list_docs(TENANT, kg_name=KG)] == ["e:a"]
-    assert [e for e, _a, _h in await idx.list_docs(OTHER_TENANT)] == ["e:c"]
+    assert [row[0] for row in await idx.list_docs(TENANT)] == ["e:a", "e:b"]
+    assert [row[0] for row in await idx.list_docs(TENANT, kg_name=KG)] == ["e:a"]
+    assert [row[0] for row in await idx.list_docs(OTHER_TENANT)] == ["e:c"]
     assert await idx.list_docs("no-such-tenant") == []
 
 
@@ -420,13 +428,61 @@ async def test_list_docs_tracks_hash_changes_and_deletes(idx):
     """The listing is the reconciler's change-detection currency: a replaced
     doc surfaces its NEW hash (still one row), and a deleted doc vanishes."""
     await idx.upsert_chunks([_chunk("e:1", "version one")])
-    [(_, _, h1)] = await idx.list_docs(TENANT)
+    [(_, _, h1, _attrs)] = await idx.list_docs(TENANT)
     assert h1 == content_hash("version one")
     await idx.upsert_chunks([_chunk("e:1", "version two")])
-    [(_, _, h2)] = await idx.list_docs(TENANT)  # still exactly one row
+    [(_, _, h2, _attrs)] = await idx.list_docs(TENANT)  # still exactly one row
     assert h2 == content_hash("version two") != h1
     await idx.delete("e:1", TENANT, attr="description")
     assert await idx.list_docs(TENANT) == []
+
+
+async def test_unchanged_hash_upsert_repairs_attrs_and_keeps_embedding(idx):
+    """The attrs half of the upsert contract: replaying a doc with the SAME
+    text but different denormalized attrs (chunk born attrs={}, later writes
+    carry the type/label) must refresh attrs WITHOUT resetting the filled
+    embedding — the enrichment-shaped repair the reconciler relies on."""
+    await idx.upsert_chunks([_chunk("e:1", "same text", attrs={})])
+    [pending] = await idx.fetch_pending()
+    assert await idx.fill_embeddings([pending], [[1.0, 0.0]], embed_model=FAKE_MODEL) == 1
+
+    await idx.upsert_chunks(
+        [_chunk("e:1", "same text", attrs={"label": "Fixed", "type": "Report"})]
+    )
+    assert await idx.fetch_pending() == []  # embedding survived, not re-queued
+    [(_, _, h, attrs)] = await idx.list_docs(TENANT)
+    assert h == content_hash("same text")  # text state untouched
+    assert attrs == {"label": "Fixed", "type": "Report"}  # attrs repaired
+    # The repaired attrs are live on hits (and for the type_filter).
+    res = await idx.search(TENANT, "same text", type_filter="Report")
+    assert _uris(res) == {"e:1"}
+    assert res.hits[0].attrs == {"label": "Fixed", "type": "Report"}
+
+
+async def test_delete_docs_batches_and_scopes(idx):
+    """delete_docs removes exactly the (entity, attr) pairs in the given KG —
+    the reconciler's batched ghost-deletion primitive."""
+    await idx.upsert_chunks(
+        [
+            _chunk("e:1", "ghost description"),
+            _chunk("e:1", "living notes", attr="notes"),
+            _chunk("e:2", "ghost too"),
+            _chunk("e:1", "sibling kg twin", kg=OTHER_KG),
+            _chunk("e:3", "other tenant twin", tenant=OTHER_TENANT),
+        ]
+    )
+    await idx.delete_docs(
+        [("e:1", "description"), ("e:2", "description")], TENANT, kg_name=KG
+    )
+    assert [(row[0], row[1]) for row in await idx.list_docs(TENANT, kg_name=KG)] == [
+        ("e:1", "notes")
+    ]
+    # The sibling KG and the other tenant were untouched.
+    assert [row[0] for row in await idx.list_docs(TENANT, kg_name=OTHER_KG)] == ["e:1"]
+    assert [row[0] for row in await idx.list_docs(OTHER_TENANT)] == ["e:3"]
+    # Empty pairs is a no-op.
+    await idx.delete_docs([], TENANT, kg_name=KG)
+    assert len(await idx.list_docs(TENANT, kg_name=KG)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -467,11 +523,43 @@ async def test_fetch_pending_respects_limit_and_scoping(idx):
 async def test_fill_embeddings_stamps_model_and_drains_queue(idx):
     await idx.upsert_chunks([_chunk("e:1", "embed me")])
     pending = await idx.fetch_pending()
-    assert await idx.fill_embeddings(pending, [[0.1, 0.2]], embed_model="text-embedding-3-small") == 1
+    assert await idx.fill_embeddings(pending, [[0.1, 0.2]], embed_model=FAKE_MODEL) == 1
     assert await idx.fetch_pending() == []
-    # The filled vector is live for the vector leg.
+    # The filled vector is live for the vector leg (stamped with the current
+    # model, so it passes the leg's embed_model filter).
     res = await idx.search(TENANT, "zzz nolexicalmatch", query_embedding=[0.1, 0.2])
     assert _uris(res) == {"e:1"}
+
+
+async def test_vector_leg_ignores_stale_model_embeddings(idx):
+    """The vector leg only trusts vectors from the CURRENT embed model — a
+    chunk embedded under an older model must be invisible to a pure-vector
+    probe (the same rule as the pgvector ANN leg's ``embed_model =`` filter),
+    without flipping ``degraded``."""
+    await idx.upsert_chunks(
+        [_chunk("e:old", "no lexical overlap here", embedding=[1.0, 0.0], embed_model="old-model")]
+    )
+    res = await idx.search(TENANT, "zzz nolexicalmatch", query_embedding=[1.0, 0.0])
+    assert res.hits == []
+    assert res.degraded is False  # the leg ran; it just (rightly) found nothing
+
+
+async def test_dim_mismatch_query_embedding_degrades_loudly(idx):
+    """A query embedding whose dimension matches NO current-model chunk must
+    run lexical-only with degraded=True + a warning (mirrors the pgvector
+    backend's dim-mismatch degrade) — never a silent all-zero vector leg."""
+    import structlog
+
+    await idx.upsert_chunks(
+        [_chunk("e:1", "resilient text about pumps", embedding=[1.0, 0.0, 0.0, 0.0])]
+    )
+    with structlog.testing.capture_logs() as logs:
+        res = await idx.search(TENANT, "resilient text", query_embedding=[1.0, 0.0])
+    assert res.degraded is True
+    assert _uris(res) == {"e:1"}  # lexical leg still works
+    assert any(
+        e["event"] == "semantic_query_embedding_dim_mismatch" for e in logs
+    )
 
 
 async def test_fill_embeddings_stale_hash_does_not_apply(idx):

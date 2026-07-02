@@ -7,8 +7,13 @@ without Postgres (and the whole test suite) work with no external service:
   stemming, no idf, no external deps. The pgvector backend (ONTA-176) uses a
   real ``tsvector``/``ts_rank`` pipeline; parity between the two is *loose by
   design* (a later smoke-parity suite only asserts overlap, not ordering).
-* **Vector scoring** is exact cosine via numpy over whatever chunks have a
-  filled embedding.
+* **Vector scoring** is exact cosine via numpy over chunks whose filled
+  embedding was produced by the CURRENT embed model (``embed_model`` filter —
+  the same rule as the pgvector backend's ANN leg: vectors from an older model
+  are not comparable to the query vector). A query embedding whose dimension
+  matches none of those chunks runs lexical-only with ``degraded=True`` and a
+  warning — mirroring the durable backend's dim-mismatch degrade, never a
+  silent all-zero vector leg.
 * **Fusion** is Reciprocal Rank Fusion with the same ``k=60`` the SQL backend
   uses (two top-:data:`_CANDIDATES_PER_LEG` legs → ``1/(k+rank)`` summed), so
   the two backends rank in the same spirit even though the leg scorers differ.
@@ -24,16 +29,20 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import Counter
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
+import structlog
 
+from cograph_client.nlp.embed_client import EMBEDDING_MODEL
 from cograph_client.semantic.protocol import (
     ChunkKey,
     SemanticChunk,
     SemanticHit,
     SemanticSearchResult,
 )
+
+logger = structlog.stdlib.get_logger("cograph.semantic.memory")
 
 #: RRF constant — matches the ONTA-176 SQL (`1/(60+rank)`), the standard value
 #: from the original RRF paper. Not worth configuring.
@@ -99,17 +108,24 @@ def _snippet(text: str, limit: int = _SNIPPET_MAX_CHARS) -> str:
 class InMemorySemanticIndex:
     """Non-durable, per-process :class:`SemanticIndex` — the registered default."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, embed_model: Optional[str] = None) -> None:
         # PK -> chunk; the dict IS the entity_semantic_chunk table.
         self._chunks: dict[ChunkKey, SemanticChunk] = {}
         self._lock = asyncio.Lock()
+        # The "current" embed model: the vector leg only trusts vectors
+        # produced by it (a query vector is not comparable across models).
+        # Defaults to the shared embed client's model so the embed-fill sweep
+        # (ONTA-181) and the query side agree by construction — the same
+        # contract as PostgresSemanticIndex's constructor.
+        self._embed_model = embed_model or EMBEDDING_MODEL
 
     # -- writes ---------------------------------------------------------------
 
     async def upsert_chunks(self, chunks: Sequence[SemanticChunk]) -> None:
         """Replace-per-doc upsert (see the Protocol's complete-document
-        contract): unchanged-hash rows are kept (preserving embeddings),
-        changed rows replaced, and each doc's stale tail deleted."""
+        contract): unchanged-hash rows keep their text/embedding/queue state
+        (attrs are always refreshed), changed rows are replaced, and each
+        doc's stale tail deleted."""
         async with self._lock:
             docs: dict[tuple[str, str, str, str], list[SemanticChunk]] = {}
             for c in chunks:
@@ -121,9 +137,13 @@ class InMemorySemanticIndex:
                         existing is not None
                         and existing.content_hash == c.content_hash
                     ):
-                        # Same content -> keep the stored row as-is. This is
-                        # what makes replaying an unchanged doc free: a filled
-                        # embedding survives instead of being re-queued.
+                        # Same content -> keep the stored row's text/hash/
+                        # embedding/queue state. This is what makes replaying
+                        # an unchanged doc free: a filled embedding survives
+                        # instead of being re-queued. The denormalized attrs
+                        # are refreshed regardless — type/label can change
+                        # while the text does not (protocol contract).
+                        existing.attrs = dict(c.attrs)
                         continue
                     self._chunks[c.key()] = c.model_copy(deep=True)
                 # Stale tail: the doc shrank -> rows past its highest incoming
@@ -161,6 +181,30 @@ class InMemorySemanticIndex:
                 )
             }
 
+    async def delete_docs(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        tenant_id: str,
+        *,
+        kg_name: str,
+    ) -> None:
+        """Batched (entity, attr) doc removal — the reconciler's ghost-deletion
+        primitive (Protocol contract): one pass over the table instead of one
+        :meth:`delete` scan per ghost doc."""
+        doomed = set(pairs)
+        if not doomed:
+            return
+        async with self._lock:
+            self._chunks = {
+                k: v
+                for k, v in self._chunks.items()
+                if not (
+                    v.tenant_id == tenant_id
+                    and v.kg_name == kg_name
+                    and (v.entity_uri, v.attr) in doomed
+                )
+            }
+
     async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
         async with self._lock:
             self._chunks = {
@@ -176,21 +220,30 @@ class InMemorySemanticIndex:
 
     async def list_docs(
         self, tenant_id: str, *, kg_name: Optional[str] = None
-    ) -> list[tuple[str, str, str]]:
-        """One ``(entity_uri, attr, content_hash)`` row per (entity, attr) doc
-        (the Protocol's doc-granularity contract). Chunk rows collapse through
-        a set — every chunk of a doc carries the same doc-level hash by
-        construction — which is deliberately the same semantics as the durable
-        backend's ``SELECT DISTINCT``, so the two listings can never disagree.
-        Sorted for the deterministic ordering the contract requires."""
+    ) -> list[tuple[str, str, str, dict[str, Any]]]:
+        """One ``(entity_uri, attr, content_hash, attrs)`` row per (entity,
+        attr) doc (the Protocol's doc-granularity contract). Chunk rows
+        collapse to their chunk-0 row — every chunk of a doc carries the same
+        doc-level hash by construction, and attrs are written per doc — which
+        is deliberately the same semantics as the durable backend's
+        ``DISTINCT ON (entity_uri, attr) … ORDER BY … chunk_ix``, so the two
+        listings can never disagree. Sorted by (entity, attr) for the
+        deterministic ordering the contract requires."""
         async with self._lock:
-            docs = {
-                (c.entity_uri, c.attr, c.content_hash)
-                for c in self._chunks.values()
-                if c.tenant_id == tenant_id  # tenant isolation: never cross tenants
-                and (kg_name is None or c.kg_name == kg_name)
-            }
-        return sorted(docs)
+            first_chunk: dict[tuple[str, str], SemanticChunk] = {}
+            for c in self._chunks.values():
+                if c.tenant_id != tenant_id:  # tenant isolation: never cross
+                    continue
+                if kg_name is not None and c.kg_name != kg_name:
+                    continue
+                key = (c.entity_uri, c.attr)
+                prev = first_chunk.get(key)
+                if prev is None or c.chunk_ix < prev.chunk_ix:
+                    first_chunk[key] = c
+            return [
+                (entity_uri, attr, c.content_hash, dict(c.attrs))
+                for (entity_uri, attr), c in sorted(first_chunk.items())
+            ]
 
     # -- search ---------------------------------------------------------------
 
@@ -234,18 +287,40 @@ class InMemorySemanticIndex:
             lexical = lexical[:_CANDIDATES_PER_LEG]
 
             # Leg 2 — vector, only when the caller could embed the query.
+            # Only vectors produced by the CURRENT embed model participate —
+            # the same ``embed_model`` filter as the pgvector backend's ANN
+            # leg (vectors from an older model are not comparable).
             degraded = query_embedding is None
             vector: list[tuple[float, SemanticChunk]] = []
             if query_embedding is not None:
                 q = np.asarray(list(query_embedding), dtype=float)
-                vector = [
-                    (score, c)
+                embedded = [
+                    c
                     for c in candidates
                     if c.embedding is not None
-                    and (score := _cosine(q, c.embedding)) > 0.0
+                    and c.embed_model == self._embed_model
                 ]
-                vector.sort(key=lambda sc: (-sc[0], sc[1].key()))
-                vector = vector[:_CANDIDATES_PER_LEG]
+                usable = [c for c in embedded if len(c.embedding) == q.shape[0]]
+                if embedded and not usable:
+                    # The query vector's dimension matches NO current-model
+                    # chunk: the vector leg cannot run. Degrade to
+                    # lexical-only EXPLICITLY (flag + warning) — mirroring the
+                    # pgvector backend's dim-mismatch behavior — rather than
+                    # silently scoring every chunk 0.0.
+                    logger.warning(
+                        "semantic_query_embedding_dim_mismatch",
+                        got=int(q.shape[0]),
+                        expected=sorted({len(c.embedding) for c in embedded}),
+                    )
+                    degraded = True
+                else:
+                    vector = [
+                        (score, c)
+                        for c in usable
+                        if (score := _cosine(q, c.embedding)) > 0.0
+                    ]
+                    vector.sort(key=lambda sc: (-sc[0], sc[1].key()))
+                    vector = vector[:_CANDIDATES_PER_LEG]
 
             # RRF fusion (k=60) over the two ranked legs, then group chunks
             # into entities: an entity scores as its best fused chunk.

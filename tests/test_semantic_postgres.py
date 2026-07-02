@@ -391,11 +391,19 @@ async def test_upsert_sql_shape(pg):
         "ON CONFLICT (tenant_id, kg_name, entity_uri, attr, chunk_ix) DO UPDATE"
         in insert_sql
     )
-    # The unchanged-hash guard: keep the row (and its filled embedding) as-is.
-    assert (
-        "WHERE entity_semantic_chunk.content_hash IS DISTINCT FROM EXCLUDED.content_hash"
-        in insert_sql
-    )
+    # Split SET (protocol contract): attrs ALWAYS refreshed — no WHERE gate on
+    # the whole update — while text/embedding/queue state only move when the
+    # content_hash actually differs (an unchanged-hash replay must never reset
+    # a filled embedding, and an attrs-only change must never re-queue).
+    assert "WHERE" not in insert_sql.split("DO UPDATE SET", 1)[1]
+    assert "attrs         = EXCLUDED.attrs" in insert_sql
+    normalized = " ".join(insert_sql.split())
+    for col in ("chunk_text", "embedding", "embed_model", "attempt_count", "last_error"):
+        assert (
+            f"{col} = CASE WHEN entity_semantic_chunk.content_hash IS DISTINCT "
+            f"FROM EXCLUDED.content_hash THEN EXCLUDED.{col} "
+            f"ELSE entity_semantic_chunk.{col} END" in normalized
+        ), f"{col} must only change when the hash differs"
     # Vector bound as text + cast (works with or without the asyncpg codec).
     assert "$8::text::vector" in insert_sql
     assert insert_rows[0][7] == "[1.0,0.0,0.0,0.0]"
@@ -583,27 +591,68 @@ async def test_delete_and_clear_sql(pg):
     assert deletes[3].endswith("AND kg_name = $2")
 
 
+async def test_delete_docs_sql_is_one_batched_statement(pg):
+    """The reconciler's ghost-deletion primitive: ONE DELETE ... USING unnest
+    for the whole pair set (never a per-doc statement loop), scoped to the
+    tenant + kg."""
+    store, recorder, _conn, _pool = pg
+    await store.delete_docs(
+        [("e:1", "description"), ("e:2", "notes")], TENANT, kg_name=KG
+    )
+    deletes = [
+        (s, a)
+        for (op, s, a) in recorder
+        if op == "execute" and s.strip().startswith("DELETE")
+    ]
+    assert len(deletes) == 1  # batched: one statement for two docs
+    sql, args = deletes[0]
+    assert "USING unnest($3::text[], $4::text[]) AS u(entity_uri, attr)" in sql
+    assert "t.tenant_id = $1 AND t.kg_name = $2" in sql
+    assert "t.entity_uri = u.entity_uri AND t.attr = u.attr" in sql
+    assert args == (TENANT, KG, ["e:1", "e:2"], ["description", "notes"])
+
+
+async def test_delete_docs_empty_pairs_is_noop(pg):
+    store, recorder, _conn, _pool = pg
+    await store.delete_docs([], TENANT, kg_name=KG)
+    assert recorder == []  # not even pool/DDL setup
+
+
 # -- list_docs (reconciler ghost-diff enumeration) -------------------------------
 
 
 async def test_list_docs_sql_shape_and_hydration(pg):
     store, recorder, conn, _pool = pg
     conn.rows = [
-        {"entity_uri": "e:1", "attr": "description", "content_hash": "h1"},
-        {"entity_uri": "e:1", "attr": "notes", "content_hash": "h2"},
+        {
+            "entity_uri": "e:1",
+            "attr": "description",
+            "content_hash": "h1",
+            "attrs": '{"type": "Report"}',
+        },
+        {
+            "entity_uri": "e:1",
+            "attr": "notes",
+            "content_hash": "h2",
+            "attrs": None,
+        },
     ]
     docs = await store.list_docs(TENANT, kg_name=KG)
     sql = _fetch_sql(recorder)
-    # One row per (entity, attr) DOC: DISTINCT collapses a doc's chunk rows
-    # (same doc-level hash on every chunk by construction).
-    assert "SELECT DISTINCT entity_uri, attr, content_hash" in sql
+    # One row per (entity, attr) DOC — the chunk-0 row, so the listing carries
+    # the doc's stored attrs for the reconciler's attrs-repair diff.
+    assert "SELECT DISTINCT ON (entity_uri, attr)" in sql
+    assert "entity_uri, attr, content_hash, attrs" in sql
     # Scoping identical to the other methods: tenant mandatory, kg optional.
     assert "tenant_id = $1" in sql
     assert "($2::text IS NULL OR kg_name = $2::text)" in sql
-    # Deterministic ordering (the Protocol contract).
-    assert "ORDER BY entity_uri, attr, content_hash" in sql
+    # Deterministic ordering + chunk-0 selection (the Protocol contract).
+    assert "ORDER BY entity_uri, attr, chunk_ix" in sql
     assert _fetch_args(recorder) == (TENANT, KG)
-    assert docs == [("e:1", "description", "h1"), ("e:1", "notes", "h2")]
+    assert docs == [
+        ("e:1", "description", "h1", {"type": "Report"}),
+        ("e:1", "notes", "h2", {}),
+    ]
 
 
 # -- embed queue ---------------------------------------------------------------
@@ -638,19 +687,34 @@ async def test_fetch_pending_sql_and_hydration(pg):
     assert c.attrs == {"label": "L"}
 
 
-async def test_fill_embeddings_counts_and_guards(pg):
+async def test_fill_embeddings_is_one_batched_update_with_guards(pg):
+    """One set-based UPDATE ... FROM unnest for the whole batch (never a
+    per-chunk statement loop); the statement's rowcount is the filled count,
+    and every unnest row carries its own content_hash so the per-row
+    optimistic-concurrency guard is preserved."""
     store, recorder, conn, _pool = pg
-    conn.update_statuses = ["UPDATE 1", "UPDATE 0"]
+    conn.update_statuses = ["UPDATE 1"]  # 1 of 2 rows still matched the guard
     chunks = [_chunk("e:1", "a"), _chunk("e:2", "b")]
     n = await store.fill_embeddings(
         chunks, [[1, 0, 0, 0], [0, 1, 0, 0]], embed_model="m1"
     )
-    assert n == 1  # only rows actually updated count
-    updates = [s for s in _sqls(recorder, "execute") if s.strip().startswith("UPDATE")]
-    assert len(updates) == 2
-    # Optimistic-concurrency guard: same hash AND still unembedded.
-    assert "content_hash = $8 AND embedding IS NULL" in updates[0]
-    assert "embed_model = $7, last_error = NULL" in updates[0]
+    assert n == 1  # only rows actually updated count (single-statement rowcount)
+    updates = [
+        (s, a)
+        for (op, s, a) in recorder
+        if op == "execute" and s.strip().startswith("UPDATE")
+    ]
+    assert len(updates) == 1  # batched: one statement for the whole batch
+    sql, args = updates[0]
+    assert "FROM unnest(" in sql
+    # Per-row optimistic-concurrency guard: same hash AND still unembedded.
+    assert "t.content_hash = u.content_hash AND t.embedding IS NULL" in sql
+    assert "embed_model = $8, last_error = NULL" in sql
+    # Parallel arrays: PKs + per-row hashes + text-serialized vectors + model.
+    assert args[2] == ["e:1", "e:2"]
+    assert args[5] == [chunks[0].content_hash, chunks[1].content_hash]
+    assert args[6] == ["[1.0,0.0,0.0,0.0]", "[0.0,1.0,0.0,0.0]"]
+    assert args[7] == "m1"
 
 
 async def test_fill_embeddings_length_mismatch_raises(pg):
@@ -659,14 +723,25 @@ async def test_fill_embeddings_length_mismatch_raises(pg):
         await store.fill_embeddings([_chunk("e:1", "a")], [], embed_model="m")
 
 
-async def test_mark_embed_failed_sql(pg):
+async def test_mark_embed_failed_is_one_batched_update(pg):
     store, recorder, conn, _pool = pg
-    conn.update_statuses = ["UPDATE 1"]
-    n = await store.mark_embed_failed([_chunk("e:1", "a")], error="boom")
-    assert n == 1
-    [sql] = [s for s in _sqls(recorder, "execute") if s.strip().startswith("UPDATE")]
-    assert "attempt_count = attempt_count + 1" in sql
-    assert "content_hash = $7 AND embedding IS NULL" in sql
+    conn.update_statuses = ["UPDATE 2"]
+    n = await store.mark_embed_failed(
+        [_chunk("e:1", "a"), _chunk("e:2", "b")], error="boom"
+    )
+    assert n == 2
+    updates = [
+        (s, a)
+        for (op, s, a) in recorder
+        if op == "execute" and s.strip().startswith("UPDATE")
+    ]
+    assert len(updates) == 1  # batched: one statement for the whole batch
+    sql, args = updates[0]
+    assert "FROM unnest(" in sql
+    assert "attempt_count = t.attempt_count + 1" in sql
+    assert "t.content_hash = u.content_hash AND t.embedding IS NULL" in sql
+    assert args[2] == ["e:1", "e:2"]
+    assert args[6] == "boom"
 
 
 # ---------------------------------------------------------------------------
@@ -895,8 +970,9 @@ async def test_live_delete_and_clear_scoping(live):
 @pytest.mark.integration
 async def test_live_list_docs_doc_granularity_and_scoping(live):
     """The Protocol's list_docs contract on the real store: one row per
-    (entity, attr) DOC (DISTINCT collapses a multi-chunk doc — every chunk
-    carries the doc-level hash), deterministic order, tenant/kg scoping."""
+    (entity, attr) DOC (DISTINCT ON collapses a multi-chunk doc to its chunk-0
+    row — every chunk carries the doc-level hash), attrs riding along,
+    deterministic order, tenant/kg scoping."""
     tenant = _t()
     await live.upsert_chunks(
         [
@@ -908,14 +984,14 @@ async def test_live_list_docs_doc_granularity_and_scoping(live):
     )
     # kg-scoped: the two d1 chunk rows collapse into ONE doc row.
     assert await live.list_docs(tenant, kg_name=KG) == [
-        ("e:1", "description", content_hash("d1")),
-        ("e:1", "notes", content_hash("the notes text")),
+        ("e:1", "description", content_hash("d1"), {"label": "e:1"}),
+        ("e:1", "notes", content_hash("the notes text"), {"label": "e:1"}),
     ]
     # kg_name=None spans every KG in the tenant.
     assert await live.list_docs(tenant) == [
-        ("e:1", "description", content_hash("d1")),
-        ("e:1", "notes", content_hash("the notes text")),
-        ("e:2", "description", content_hash("sibling kg text")),
+        ("e:1", "description", content_hash("d1"), {"label": "e:1"}),
+        ("e:1", "notes", content_hash("the notes text"), {"label": "e:1"}),
+        ("e:2", "description", content_hash("sibling kg text"), {"label": "e:2"}),
     ]
     # Tenant isolation: a different tenant sees nothing.
     assert await live.list_docs(_t()) == []
@@ -927,7 +1003,7 @@ async def test_live_list_docs_tracks_hash_change_and_delete(live):
     """The listing is the reconciler's change-detection currency: a replaced
     doc surfaces its NEW hash — still exactly one row, proving the
     hash-per-doc invariant survives the replace-per-doc upsert transaction
-    (what makes DISTINCT safe) — and a deleted doc vanishes."""
+    (what makes the doc-level collapse safe) — and a deleted doc vanishes."""
     tenant = _t()
     await live.upsert_chunks(
         [
@@ -935,15 +1011,120 @@ async def test_live_list_docs_tracks_hash_change_and_delete(live):
             _chunk("e:1", "version one part b", ix=1, doc_text="v1", tenant=tenant),
         ]
     )
-    assert await live.list_docs(tenant) == [("e:1", "description", content_hash("v1"))]
+    assert await live.list_docs(tenant) == [
+        ("e:1", "description", content_hash("v1"), {"label": "e:1"})
+    ]
     # Replace with a shorter, changed doc: still ONE row, the new hash.
     await live.upsert_chunks(
         [_chunk("e:1", "version two", ix=0, doc_text="v2", tenant=tenant)]
     )
-    assert await live.list_docs(tenant) == [("e:1", "description", content_hash("v2"))]
+    assert await live.list_docs(tenant) == [
+        ("e:1", "description", content_hash("v2"), {"label": "e:1"})
+    ]
     # The ghost-deletion primitive removes the doc from the listing.
     await live.delete("e:1", tenant, kg_name=KG, attr="description")
     assert await live.list_docs(tenant) == []
+
+
+@needs_pg
+@pytest.mark.integration
+async def test_live_unchanged_hash_upsert_repairs_attrs_keeps_embedding(live):
+    """The attrs half of the upsert contract on the real store: same text +
+    new attrs refreshes attrs (chunk born attrs={} — the enrichment shape)
+    WITHOUT resetting the filled embedding or re-queuing embed work."""
+    tenant = _t()
+    await live.upsert_chunks(
+        [_chunk("e:1", "attrs repair probe text", tenant=tenant, attrs={})]
+    )
+    [pending] = await live.fetch_pending(tenant_id=tenant)
+    assert await live.fill_embeddings([pending], [V1], embed_model=FAKE_MODEL) == 1
+
+    await live.upsert_chunks(
+        [
+            _chunk(
+                "e:1",
+                "attrs repair probe text",
+                tenant=tenant,
+                attrs={"label": "Fixed", "type": "Report"},
+            )
+        ]
+    )
+    assert await live.fetch_pending(tenant_id=tenant) == []  # embedding survived
+    assert await live.list_docs(tenant) == [
+        (
+            "e:1",
+            "description",
+            content_hash("attrs repair probe text"),
+            {"label": "Fixed", "type": "Report"},
+        )
+    ]
+    # The repaired type is live for the type_filter, and the preserved
+    # embedding still carries the ANN leg.
+    res = await live.search(
+        tenant, "zzz qqq nothing", query_embedding=V1, type_filter="Report"
+    )
+    assert {h.entity_uri for h in res.hits} == {"e:1"}
+    assert res.hits[0].attrs == {"label": "Fixed", "type": "Report"}
+
+
+@needs_pg
+@pytest.mark.integration
+async def test_live_delete_docs_batch_scoping(live):
+    """delete_docs on the real store: one batched statement removes exactly
+    the given (entity, attr) docs in the given KG — sibling attrs, sibling
+    KGs, and other tenants untouched."""
+    tenant, other_tenant = _t(), _t()
+    await live.upsert_chunks(
+        [
+            _chunk("e:1", "ghost description", tenant=tenant),
+            _chunk("e:1", "living notes", attr="notes", tenant=tenant),
+            _chunk("e:2", "ghost too", tenant=tenant),
+            _chunk("e:1", "sibling kg twin", tenant=tenant, kg=OTHER_KG),
+            _chunk("e:1", "other tenant twin", tenant=other_tenant),
+        ]
+    )
+    await live.delete_docs(
+        [("e:1", "description"), ("e:2", "description")], tenant, kg_name=KG
+    )
+    assert [(r[0], r[1]) for r in await live.list_docs(tenant, kg_name=KG)] == [
+        ("e:1", "notes")
+    ]
+    assert [r[0] for r in await live.list_docs(tenant, kg_name=OTHER_KG)] == ["e:1"]
+    assert [r[0] for r in await live.list_docs(other_tenant)] == ["e:1"]
+    await live.delete_docs([], tenant, kg_name=KG)  # empty set: no-op
+    assert len(await live.list_docs(tenant, kg_name=KG)) == 1
+
+
+@needs_pg
+@pytest.mark.integration
+async def test_live_batched_fill_partial_stale_counts(live):
+    """The set-based fill on the real store: one call fills many rows and the
+    per-row content_hash guard still holds row-by-row — a batch mixing one
+    stale row with fresh ones fills exactly the fresh ones."""
+    tenant = _t()
+    await live.upsert_chunks(
+        [
+            _chunk("e:1", "alpha fill text", tenant=tenant),
+            _chunk("e:2", "beta fill text", tenant=tenant),
+            _chunk("e:3", "gamma fill text", tenant=tenant),
+        ]
+    )
+    pending = await live.fetch_pending(tenant_id=tenant)
+    assert len(pending) == 3
+    # e:2's doc changes between fetch and fill: its row in the batch is stale.
+    await live.upsert_chunks([_chunk("e:2", "beta REVISED text", tenant=tenant)])
+    filled = await live.fill_embeddings(pending, [V1, V1, V2], embed_model=FAKE_MODEL)
+    assert filled == 2  # the stale row was skipped by the per-row hash guard
+    still_pending = await live.fetch_pending(tenant_id=tenant)
+    assert [c.entity_uri for c in still_pending] == ["e:2"]
+    assert still_pending[0].chunk_text == "beta REVISED text"
+    # Batched failure marking honors the same per-row guards: the already
+    # embedded e:1 row is skipped, the current e:2 row is marked — one call.
+    [fresh] = still_pending
+    assert await live.mark_embed_failed([pending[0], fresh], error="boom") == 1
+    [row] = await live.fetch_pending(tenant_id=tenant)
+    assert row.entity_uri == "e:2"
+    assert row.attempt_count == 1 and row.last_error == "boom"
 
 
 @needs_pg

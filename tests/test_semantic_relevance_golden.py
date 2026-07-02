@@ -153,9 +153,11 @@ def _t() -> str:
 @pytest.fixture(params=["memory", "postgres"])
 async def backend(request):
     """Same golden corpus + assertions against both backends; the postgres
-    param skips without a DSN (mirrors test_semantic_parity.py)."""
+    param skips without a DSN (mirrors test_semantic_parity.py). Both use
+    GOLDEN_MODEL as the current embed model, matching what _seed stamps —
+    each backend's vector leg only trusts current-model vectors."""
     if request.param == "memory":
-        yield InMemorySemanticIndex()
+        yield InMemorySemanticIndex(embed_model=GOLDEN_MODEL)
         return
     if not DSN:
         pytest.skip(needs_pg_reason)

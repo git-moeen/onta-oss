@@ -123,18 +123,23 @@ class FakeNeptune:
             ][:limit]
             return self._rows([{"o": v} for v in values], ["o"])
         if "SELECT ?e ?p ?o" in sparql and "VALUES ?p" in sparql:
+            # Keyset pagination (ONTA-173 review fix): the scan must never use
+            # LIMIT/OFFSET (O(pages²) on the store) — pin that here.
+            assert "OFFSET" not in sparql, "scan regressed to OFFSET paging"
             block = re.search(r"VALUES \?p \{ ([^}]*)\}", sparql).group(1)
             preds = set(re.findall(r"<([^>]+)>", block))
             limit = int(re.search(r"LIMIT (\d+)", sparql).group(1))
-            offset = int(re.search(r"OFFSET (\d+)", sparql).group(1))
+            m = re.search(r'FILTER\(STR\(\?e\) > "((?:[^"\\]|\\.)*)"\)', sparql)
+            after = m.group(1) if m else ""
             triples = sorted(
                 (e, p, v)
                 for e, pv in self.entities.items()
+                if e > after
                 for p, vals in pv.items()
                 if p in preds
                 for v in vals
             )
-            page = triples[offset : offset + limit]
+            page = triples[:limit]
             return self._rows(
                 [{"e": e, "p": p, "o": o} for e, p, o in page], ["e", "p", "o"]
             )
@@ -292,6 +297,42 @@ def test_reconcile_deletes_ghosts_of_merged_entities():
     asyncio.run(run())
 
 
+def test_reconcile_ghost_deletion_is_batched_via_delete_docs():
+    """Ghost deletion goes through the protocol's batched delete_docs — ONE
+    call for the whole ghost set, not one per-doc delete round trip."""
+    entities = _doc_entities(3)
+    neptune = _kg(entities, {("Doc", "description"): "free_text"})
+
+    class RecordingIndex(InMemorySemanticIndex):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delete_docs_calls: list[list[tuple[str, str]]] = []
+            self.delete_calls = 0
+
+        async def delete_docs(self, pairs, tenant_id, *, kg_name):  # noqa: ANN001
+            self.delete_docs_calls.append(list(pairs))
+            await super().delete_docs(pairs, tenant_id, kg_name=kg_name)
+
+        async def delete(self, *a, **kw):  # noqa: ANN002, ANN003
+            self.delete_calls += 1
+            await super().delete(*a, **kw)
+
+    index = RecordingIndex()
+
+    async def run():
+        await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        del neptune.entities[_entity(1)]
+        del neptune.entities[_entity(2)]
+        counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        assert counters["ghosts_deleted"] == 2
+        assert index.delete_docs_calls == [
+            [(_entity(1), "description"), (_entity(2), "description")]
+        ]
+        assert index.delete_calls == 0  # no per-doc fallback on a capable backend
+
+    asyncio.run(run())
+
+
 def test_reconcile_decided_no_flip_removes_rows_without_reclassifying():
     """Candidacy flip: a marker rewritten to a decided-no kind removes that
     attr's rows via the ghost diff — and the default heuristic must NOT fight
@@ -363,6 +404,44 @@ def test_reconcile_default_candidacy_heuristic():
         assert counters["chunks_written"] == 4
         rows = await index.fetch_pending(limit=100)
         assert {r.attr for r in rows} == {"summary"}
+
+    asyncio.run(run())
+
+
+def test_candidacy_cap_randomizes_selection_and_logs_the_backlog(monkeypatch):
+    """Fairness past the per-run cap: with a deterministic prefix, attrs
+    sorted after the cap would NEVER be sampled while ≥cap stay perpetually
+    ambiguous. The selection must shuffle before truncating (so every
+    undecided attr eventually gets its turn) and log the total backlog."""
+    monkeypatch.setattr(rec, "_MAX_CANDIDACY_ATTRS_PER_RUN", 1)
+    # A deterministic "shuffle" that reverses: the pick must become the attr a
+    # stable prefix would have starved (proves shuffle happens BEFORE [:cap]).
+    monkeypatch.setattr(rec.random, "shuffle", lambda seq: seq.reverse())
+
+    aaa_pred = attr_uri("Doc", "aaa_first")
+    zzz_pred = attr_uri("Doc", "zzz_last")
+    entities = {
+        _entity(i): {
+            RDF_TYPE: [DOC_TYPE],
+            aaa_pred: [f"{PROSE} First remarks {i}."],
+            zzz_pred: [f"{PROSE} Last remarks {i}."],
+        }
+        for i in range(1, 4)
+    }
+    neptune = _kg(entities)  # both attrs undecided
+    index = InMemorySemanticIndex()
+
+    async def run():
+        with structlog.testing.capture_logs() as logs:
+            counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        # Only the capped, shuffled pick was classified this run…
+        assert counters["attrs_marked_free_text"] == 1
+        assert ("Doc", "zzz_last") in neptune.markers  # the reversed pick
+        assert ("Doc", "aaa_first") not in neptune.markers  # waits for a later run
+        # …and the truncation reported the full backlog, never silently.
+        [capped] = [e for e in logs if e["event"] == "semantic_candidacy_capped"]
+        assert capped["undecided"] == 2
+        assert capped["cap"] == 1
 
     asyncio.run(run())
 
@@ -500,8 +579,9 @@ def test_partial_reconcile_resumes_and_converges(monkeypatch):
 
 
 def test_reconcile_scan_pages_through_large_kgs(monkeypatch):
-    """The scan pages with ORDER BY + LIMIT/OFFSET — a KG larger than one page
-    is still fully indexed."""
+    """The scan pages with keyset pagination (ORDER BY ?e ?p ?o + a
+    strictly-after-entity FILTER, never OFFSET — the FakeNeptune handler
+    asserts that) — a KG larger than one page is still fully indexed."""
     monkeypatch.setenv("COGRAPH_SEMANTIC_SCAN_PAGE_SIZE", "3")
     neptune = _kg(_doc_entities(4), {("Doc", "description"): "free_text"})
     index = InMemorySemanticIndex()
@@ -509,6 +589,137 @@ def test_reconcile_scan_pages_through_large_kgs(monkeypatch):
     async def run():
         counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
         assert counters["chunks_written"] == 4
+
+    asyncio.run(run())
+
+
+def test_scan_keyset_keeps_straddling_entity_group_whole(monkeypatch):
+    """An entity whose triples straddle a page boundary must come out of the
+    scan WHOLE (the trailing partial group is held back and re-fetched from
+    the last complete entity) — extract's intra-entity dedup and its
+    multi-value canonicalization assume whole-entity groups."""
+    from cograph_client.semantic.extract import canonicalize_values, content_hash
+
+    monkeypatch.setenv("COGRAPH_SEMANTIC_SCAN_PAGE_SIZE", "4")
+    v_a = f"{PROSE} Straddle part alpha."
+    v_b = f"{PROSE} Straddle part beta."
+    entities = {
+        # e1: 2 scan rows (rdf:type + description).
+        _entity(1): {RDF_TYPE: [DOC_TYPE], DESC_PRED: [f"{PROSE} One."]},
+        # e2: 3 scan rows — page 1 (size 4) cuts its group after 2 of them.
+        _entity(2): {RDF_TYPE: [DOC_TYPE], DESC_PRED: [v_a, v_b]},
+    }
+    neptune = _kg(entities, {("Doc", "description"): "free_text"})
+    index = InMemorySemanticIndex()
+
+    async def run():
+        counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        assert counters["chunks_written"] == 2
+        # e2's doc holds BOTH values: the straddled group was re-fetched whole
+        # (a torn group would have hashed/canonicalized only the first value).
+        docs = {(e, a): h for e, a, h, _attrs in await index.list_docs(TENANT, kg_name=KG)}
+        assert docs[(_entity(2), "description")] == content_hash(
+            canonicalize_values([v_a, v_b])
+        )
+        # And the scan really paged with keyset: page 2 filters past e1.
+        scans = [q for q in neptune.queries if "VALUES ?p" in q]
+        assert len(scans) == 2
+        assert "FILTER" not in scans[0]
+        assert f'FILTER(STR(?e) > "{_entity(1)}")' in scans[1]
+
+    asyncio.run(run())
+
+
+def test_reconcile_mid_scan_indexed_doc_is_not_ghost_deleted():
+    """The reconcile-vs-ingest race: a doc the write hook indexes AFTER the
+    reconciler's list_docs snapshot but DURING the Neptune scan lands in the
+    index without being in this run's scan output. It must NOT be
+    ghost-deleted — the snapshot is taken before the scan starts, so a
+    mid-scan arrival is simply not a ghost candidate this run."""
+    neptune = _kg(_doc_entities(2), {("Doc", "description"): "free_text"})
+    index = InMemorySemanticIndex()
+
+    fired = {"done": False}
+    orig_query = neptune.query
+
+    async def query_with_mid_scan_hook_write(sparql):
+        if "VALUES ?p" in sparql and not fired["done"]:
+            fired["done"] = True
+            # Simulate kg_writer._index_semantic firing concurrently: the doc
+            # lands in the index while the scan is mid-flight.
+            await index.upsert_chunks([_chunk(7, "landed mid-scan via the hook")])
+        return await orig_query(sparql)
+
+    neptune.query = query_with_mid_scan_hook_write  # type: ignore[assignment]
+
+    async def run():
+        counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        assert fired["done"]  # the race actually happened
+        assert counters["ghosts_deleted"] == 0
+        docs = await index.list_docs(TENANT, kg_name=KG)
+        assert _entity(7) in {e for e, *_rest in docs}  # survived the run
+
+    asyncio.run(run())
+
+
+def test_reconcile_truncated_scan_skips_ghost_deletion(monkeypatch):
+    """A scan cut off at the page cap yields a PARTIAL expected set — driving
+    ghost deletion with it would mass-delete every healthy doc past the
+    cutoff. Truncation must skip ghost deletion entirely (0 deletes, loud
+    warning), while upserts of what WAS scanned still land."""
+    monkeypatch.setenv("COGRAPH_SEMANTIC_SCAN_PAGE_SIZE", "1")
+    monkeypatch.setattr(rec, "_MAX_SCAN_PAGES", 1)
+    neptune = _kg(_doc_entities(3), {("Doc", "description"): "free_text"})
+    index = InMemorySemanticIndex()
+
+    async def run():
+        # A doc that IS a genuine ghost (entity absent from Neptune) — even it
+        # must survive a truncated run: partial knowledge, no deletions.
+        await index.upsert_chunks([_chunk(9, "stale merged-away doc")])
+        with structlog.testing.capture_logs() as logs:
+            counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        assert counters["ghosts_deleted"] == 0
+        docs = await index.list_docs(TENANT, kg_name=KG)
+        assert _entity(9) in {e for e, *_rest in docs}
+        assert any(e["event"] == "semantic_scan_truncated" for e in logs)
+        assert any(
+            e["event"] == "semantic_reconcile_ghosts_skipped_scan_truncated"
+            for e in logs
+        )
+
+    asyncio.run(run())
+
+
+def test_reconcile_repairs_attrs_when_text_unchanged():
+    """The enrichment-shaped attrs drift: a chunk born with attrs={} (a hook
+    write whose triple batch carried no rdf:type/label rows) must get its
+    denormalized attrs repaired by reconcile even though the TEXT is unchanged
+    — and the already-filled embedding must survive the repair."""
+    neptune = _kg(_doc_entities(1), {("Doc", "description"): "free_text"})
+    index = InMemorySemanticIndex()
+    text = f"{PROSE} Session 1."  # exactly what the scan re-extracts
+
+    async def run():
+        await index.upsert_chunks([_chunk(1, text)])  # attrs={} (model default)
+        [pending] = await index.fetch_pending(limit=10)
+        assert await index.fill_embeddings([pending], [[0.1, 0.2]], embed_model="m1") == 1
+
+        counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        assert counters["attrs_repaired"] == 1
+        assert counters["chunks_written"] == 1  # the repair upsert
+        assert counters["skipped_unchanged_hash"] == 0
+        assert counters["ghosts_deleted"] == 0
+        # Repaired attrs are live (type came from the scan's rdf:type rows)...
+        [(_, _, _, attrs)] = await index.list_docs(TENANT, kg_name=KG)
+        assert attrs.get("type") == "Doc"
+        # ...and the filled embedding was preserved, not re-queued.
+        assert await index.fetch_pending(limit=10) == []
+
+        # A second run has nothing left to repair: pure unchanged-skip.
+        counters = await rec.reconcile_kg(neptune, TENANT, KG, index=index)
+        assert counters["attrs_repaired"] == 0
+        assert counters["chunks_written"] == 0
+        assert counters["skipped_unchanged_hash"] == 1
 
     asyncio.run(run())
 
@@ -637,6 +848,36 @@ def test_embed_fill_poison_row_dead_letters(monkeypatch):
     asyncio.run(run())
 
 
+def test_embed_fill_all_success_sweep_keeps_fetch_window_constant(monkeypatch):
+    """A healthy sweep must NOT widen the fetch window as it progresses:
+    successful fills DRAIN from the queue, so only FAILED rows (which stay
+    pending) need sliding past. Growing the window with every processed row
+    made a large healthy sweep quadratic in fetch work."""
+    fetch_limits: list[int] = []
+
+    class RecordingIndex(InMemorySemanticIndex):
+        async def fetch_pending(self, *, limit=100, **kw):  # noqa: ANN001, ANN003
+            fetch_limits.append(limit)
+            return await super().fetch_pending(limit=limit, **kw)
+
+    index = RecordingIndex()
+
+    async def fake_embed(texts, *, api_key, timeout=30):  # noqa: ANN001
+        return [[0.1, 0.2] for _ in texts]
+
+    monkeypatch.setattr(embed_client_mod, "embed_texts", fake_embed)
+
+    async def run():
+        await index.upsert_chunks([_chunk(i, f"pending {i}") for i in range(1, 6)])
+        counters = await rec.run_embed_fill_sweep(index=index, api_key="k", limit=2)
+        assert counters["embeds_filled"] == 5
+        assert counters["embed_failures"] == 0
+        # Every fetch used the caller's limit — the window never grew.
+        assert fetch_limits and all(limit == 2 for limit in fetch_limits)
+
+    asyncio.run(run())
+
+
 def test_embed_fill_without_api_key_leaves_queue_intact(monkeypatch):
     index = InMemorySemanticIndex()
 
@@ -702,6 +943,36 @@ def test_ensure_reconcile_schedule_due_now_pulls_forward():
         # Removal drops the row (the KG-delete path).
         await rec.remove_reconcile_schedule(store, TENANT, KG)
         assert await store.get(rec.reconcile_schedule_id(TENANT, KG)) is None
+
+    asyncio.run(run())
+
+
+def test_hook_ensure_memo_expires_so_crud_deletes_cannot_poison_it(monkeypatch):
+    """The write hook's ensure memo is TTL-based, not process-lifetime: a
+    schedules-CRUD DELETE of the auto-created reconcile row (which never
+    touches this module) is re-ensured within one TTL window by the next hook
+    write — deleting the row is NOT a durable opt-out (the env gate is)."""
+    from cograph_client.scheduling.store import make_schedule_store
+
+    async def run():
+        store = make_schedule_store()  # the same in-memory singleton the hook uses
+        sid = rec.reconcile_schedule_id(TENANT, KG)
+
+        await rec.ensure_reconcile_schedule_from_hook(TENANT, KG)
+        assert await store.get(sid) is not None
+
+        # A schedules-CRUD delete bypasses remove_reconcile_schedule entirely.
+        await store.delete(sid)
+
+        # Within the TTL the memo (correctly) suppresses the round trip…
+        await rec.ensure_reconcile_schedule_from_hook(TENANT, KG)
+        assert await store.get(sid) is None
+
+        # …but once the TTL passes, the next hook write resurrects the row.
+        expired = rec._now_monotonic() + rec._ensure_memo_ttl_s() + 1
+        monkeypatch.setattr(rec, "_now_monotonic", lambda: expired)
+        await rec.ensure_reconcile_schedule_from_hook(TENANT, KG)
+        assert await store.get(sid) is not None
 
     asyncio.run(run())
 

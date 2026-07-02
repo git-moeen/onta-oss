@@ -147,9 +147,11 @@ needs_pg_reason = "OMNIX_DATABASE_URL not set; needs live Postgres with pgvector
 @pytest.fixture(params=["memory", "postgres"])
 async def backend(request):
     """The SAME tests run against both backends; the postgres param skips
-    without a DSN (so the memory half is the no-DSN unit layer)."""
+    without a DSN (so the memory half is the no-DSN unit layer). Both are
+    constructed with the SAME current embed model — the vector leg of each
+    only trusts vectors stamped with it (locked parity behavior)."""
     if request.param == "memory":
-        yield InMemorySemanticIndex()
+        yield InMemorySemanticIndex(embed_model=FAKE_MODEL)
         return
     if not DSN:
         pytest.skip(needs_pg_reason)
@@ -283,6 +285,34 @@ async def test_rrf_determinism_with_fake_embeddings_per_backend(backend):
     assert runs[0][0][1] > runs[0][1][1]  # rank-1 fused score strictly higher
 
 
+async def test_stale_model_vectors_excluded_from_vector_leg_per_backend(backend):
+    """Vectors embedded under an OLDER model must be invisible to the vector
+    leg on BOTH backends (a query vector is not comparable across models) —
+    with degraded staying False (the leg ran; the row rightly didn't enter)."""
+    tenant = _t()
+    stale = _chunk(
+        "e:stale", "no lexical overlap here", tenant=tenant, embedding=V_SOLAR
+    )
+    stale.embed_model = "an-older-model"
+    await backend.upsert_chunks([stale])
+    res = await backend.search(tenant, "zzz qqq nothing", query_embedding=V_SOLAR)
+    assert "e:stale" not in _uris(res)
+    assert res.degraded is False
+
+
+async def test_dim_mismatch_query_degrades_lexical_only_per_backend(backend):
+    """A query embedding of the wrong dimension must degrade EXPLICITLY to
+    lexical-only (degraded=True) on both backends — never crash, never a
+    silent all-zero vector leg."""
+    tenant = _t()
+    await backend.upsert_chunks(_corpus(tenant))
+    res = await backend.search(
+        tenant, "solar panel efficiency", query_embedding=[1.0, 0.0]  # dim 2 != 8
+    )
+    assert res.degraded is True
+    assert "e:solar" in _uris(res)  # the lexical leg still delivers
+
+
 async def test_top_k_and_grouping_per_backend(backend):
     tenant = _t()
     # Two chunks of one doc must collapse into ONE entity hit.
@@ -325,7 +355,7 @@ async def test_smoke_parity_memory_vs_postgres():
     from cograph_client.db.pool import close_pg_pools, reset_pg_pools
 
     reset_pg_pools()
-    mem = InMemorySemanticIndex()
+    mem = InMemorySemanticIndex(embed_model=FAKE_MODEL)
     pg = PostgresSemanticIndex(dsn=DSN, embed_model=FAKE_MODEL, embed_dim=DIM)
     try:
         tenant = _t()

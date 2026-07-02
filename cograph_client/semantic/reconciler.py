@@ -49,25 +49,33 @@ SAME runner. Topology:
 
 No job rows are created for these dispatches — a 5-minute sweep would spam the
 unified Jobs feed; observability is structlog counters (``chunks_written``,
-``skipped_unchanged_hash``, ``embeds_pending``, ``embeds_filled``,
-``embed_failures``, ``ghosts_deleted``), logged every run, never silently zero.
+``skipped_unchanged_hash``, ``attrs_repaired``, ``embeds_pending``,
+``embeds_filled``, ``embed_failures``, ``ghosts_deleted``), logged every run,
+never silently zero.
 
 Ghost enumeration (the ``list_docs`` Protocol method)
 -----------------------------------------------------
 
 Diffing "docs in the index" against "docs in Neptune" uses
 :meth:`~cograph_client.semantic.protocol.SemanticIndex.list_docs` —
-``(entity_uri, attr, content_hash)``, one row per (entity, attr) document.
-Both first-party backends implement it (InMemory sorts a set; the pgvector
-adapter runs one ``SELECT DISTINCT`` per KG), so every default deployment
-ghost-repairs. The method started life as an OPTIONAL duck-typed seam (the
-Protocol was frozen while ONTA-181 was built), and the reconciler still looks
-it up with ``getattr``: a third-party backend registered via
-``register_semantic_index`` that predates the Protocol method must DEGRADE,
-not crash. In that case ghost deletion and the unchanged-hash skip are
-SKIPPED — loudly logged with ``doc_listing_supported=False`` — and everything
-else still converges (upserts are hash-idempotent; shrunk docs still lose
-their stale tail via the upsert contract).
+``(entity_uri, attr, content_hash, attrs)``, one row per (entity, attr)
+document. The snapshot is taken BEFORE the Neptune scan starts (docs the
+write hook indexes mid-scan must never be misread as ghosts), the hash drives
+the unchanged-skip, the attrs drive the attrs-repair pass (type/label drift
+with unchanged text), and ghost deletion is batched through ``delete_docs``
+— and is additionally SKIPPED whenever the scan was truncated at the page
+cap (a partial expected set must never drive deletions). Both first-party
+backends implement the seam (InMemory sorts its dict; the pgvector adapter
+runs one ``DISTINCT ON`` per KG), so every default deployment ghost-repairs.
+The method started life as an OPTIONAL duck-typed seam (the Protocol was
+frozen while ONTA-181 was built), and the reconciler still looks it up with
+``getattr``: a third-party backend registered via ``register_semantic_index``
+that predates the Protocol method must DEGRADE, not crash. In that case ghost
+deletion and the unchanged-hash skip are SKIPPED — loudly logged with
+``doc_listing_supported=False`` — and everything else still converges
+(upserts are hash-idempotent; shrunk docs still lose their stale tail via the
+upsert contract). A legacy 3-tuple listing degrades one notch: hash-diffing
+still works, only the attrs-repair pass is skipped.
 
 Candidacy default heuristic (ONTA-177 hand-off)
 -----------------------------------------------
@@ -96,6 +104,9 @@ and ops can tune without re-import):
 * ``COGRAPH_SEMANTIC_EMBED_MAX_ATTEMPTS`` — dead-letter cutoff for embed
   failures (default 5).
 * ``COGRAPH_SEMANTIC_SCAN_PAGE_SIZE`` — Neptune scan page size (default 10000).
+* ``COGRAPH_SEMANTIC_ENSURE_MEMO_TTL_S`` — TTL of the write hook's
+  ensure-schedule memo (default 600; see
+  :func:`ensure_reconcile_schedule_from_hook`).
 * ``COGRAPH_SEMANTIC_UPSERT_TIMEOUT_S`` — the WRITE HOOK's timeout (read in
   ``graph/kg_writer.py``, listed here for one-stop docs).
 
@@ -108,7 +119,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
@@ -221,8 +234,17 @@ def _scan_page_size() -> int:
     return _int_env("COGRAPH_SEMANTIC_SCAN_PAGE_SIZE", 10000)
 
 
+def _ensure_memo_ttl_s() -> int:
+    return _int_env("COGRAPH_SEMANTIC_ENSURE_MEMO_TTL_S", 600)
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _now_monotonic() -> float:
+    """Seam for the memo clock (monkeypatched in tests — no sleeps)."""
+    return time.monotonic()
 
 
 # --- schedule-row management ---------------------------------------------------
@@ -321,29 +343,48 @@ async def remove_reconcile_schedule(store: Any, tenant_id: str, kg_name: str) ->
     """Drop the per-KG reconcile row (the KG-delete path) + the hook's memo, so
     a same-named KG recreated later in this process re-ensures a fresh row."""
     await store.delete(reconcile_schedule_id(tenant_id, kg_name))
-    _ensured_reconcile.discard((tenant_id, kg_name))
+    _ensured_reconcile.pop((tenant_id, kg_name), None)
 
 
 # The write hook's ensure path. A module-level store (same selection logic as
 # the runner's: Postgres when a DSN is configured — same table, so rows are
-# shared — else the process-wide in-memory singleton) plus a once-per-process
-# memo so the hook pays the ensure round-trip once per (tenant, kg), not once
-# per write.
+# shared — else the process-wide in-memory singleton) plus a TTL memo so the
+# hook pays the ensure round-trip once per (tenant, kg) per TTL window
+# (COGRAPH_SEMANTIC_ENSURE_MEMO_TTL_S, default 600s), not once per write.
+#
+# Why a TTL and not a process-lifetime memo: the schedules CRUD routes can
+# DELETE the auto-created reconcile row without this module ever hearing about
+# it (only the KG-delete path calls remove_reconcile_schedule). A permanent
+# memo would then "poison" this process — it would never re-ensure the row and
+# the KG would silently stop reconciling until a restart. With the TTL, a
+# CRUD-deleted row is re-created within one TTL window by the next write.
 _hook_store: Any = None
-_ensured_reconcile: set[tuple[str, str]] = set()
+#: ``(tenant, kg) -> monotonic deadline``; entries past their deadline are
+#: re-ensured on the next hook write.
+_ensured_reconcile: dict[tuple[str, str], float] = {}
 
 
 async def ensure_reconcile_schedule_from_hook(tenant_id: str, kg_name: str) -> None:
-    """Best-effort, memoized ensure used by ``kg_writer._index_semantic``.
+    """Best-effort, TTL-memoized ensure used by ``kg_writer._index_semantic``.
 
     This is how a KG that receives writes while the feature is enabled gets its
     recurring reconcile row without any operator action (already-ingested,
     write-quiet KGs use the reindex route instead). Exceptions propagate to the
     hook's catch-all (the memo is only set on success, so the next write
     retries).
+
+    **Deleting the auto-created schedule row is NOT a durable opt-out.** As
+    long as the feature gate (``COGRAPH_SEMANTIC_INDEX_ENABLED``) is on and the
+    KG keeps receiving writes, this hook resurrects a deleted
+    ``semantic-reconcile:{tenant}:{kg}`` row within one memo TTL
+    (``COGRAPH_SEMANTIC_ENSURE_MEMO_TTL_S``, default 600s) — by design, so a
+    stray CRUD delete can't silently disable correctness maintenance for a
+    live KG. The durable off-switch is the env gate itself (flip it off and
+    stale rows become logged no-ops — see :func:`dispatch_semantic_schedule`).
     """
     key = (tenant_id, kg_name)
-    if key in _ensured_reconcile:
+    deadline = _ensured_reconcile.get(key)
+    if deadline is not None and _now_monotonic() < deadline:
         return
     global _hook_store
     if _hook_store is None:
@@ -351,7 +392,7 @@ async def ensure_reconcile_schedule_from_hook(tenant_id: str, kg_name: str) -> N
 
         _hook_store = make_schedule_store()
     await ensure_reconcile_schedule(_hook_store, tenant_id, kg_name)
-    _ensured_reconcile.add(key)
+    _ensured_reconcile[key] = _now_monotonic() + _ensure_memo_ttl_s()
 
 
 def reset_for_tests() -> None:
@@ -457,18 +498,22 @@ async def run_embed_fill_sweep(
     key = api_key if api_key is not None else settings.openrouter_api_key
     cutoff = max_attempts if max_attempts is not None else embed_max_attempts()
 
+    # Keys of rows that FAILED this sweep. Only failures stay pending (a
+    # successful fill drains the row from the queue), so only failures need
+    # the fetch window widened to slide past them — adding every processed row
+    # here would make the window (and the backend's scan) grow linearly with
+    # progress, i.e. a quadratic sweep over a large healthy queue.
     seen: set[tuple] = set()
     for _ in range(_MAX_SWEEP_ITERATIONS):
         # fetch_pending drains in deterministic (PK) order, so a row that just
         # FAILED is still at the head of the queue. Widening the window by the
-        # rows already attempted this sweep lets the fetch slide past them —
+        # rows already failed this sweep lets the fetch slide past them —
         # otherwise a poison row at the head would wedge the whole sweep at
         # ``limit=len(failed)`` (exactly the failure mode ONTA-181 forbids).
         batch = await idx.fetch_pending(limit=limit + len(seen), max_attempts=cutoff)
         fresh = [c for c in batch if c.key() not in seen][:limit]
         if not fresh:
             break
-        seen.update(c.key() for c in fresh)
         counters["embeds_pending"] += len(fresh)
         if not key:
             # Lexical-only deployment (no OpenRouter key): rows stay queued —
@@ -484,6 +529,7 @@ async def run_embed_fill_sweep(
                 fresh, vectors, embed_model=EMBEDDING_MODEL
             )
         except Exception as exc:  # noqa: BLE001 — a bad batch must not wedge the sweep
+            seen.update(c.key() for c in fresh)  # failed rows stay pending: slide past
             counters["embed_failures"] += len(fresh)
             await idx.mark_embed_failed(fresh, error=str(exc)[:500])
             logger.warning(
@@ -620,6 +666,13 @@ async def _apply_default_candidacy(
             undecided=len(undecided),
             cap=_MAX_CANDIDACY_ATTRS_PER_RUN,
         )
+        # Fairness guard: a deterministic prefix would starve everything past
+        # the cap FOREVER when more than the cap stay perpetually AMBIGUOUS
+        # (heuristic verdicts are durable, but AMBIGUOUS attrs are re-sampled
+        # every run, so a stable order re-samples the same head each time).
+        # Randomizing before truncation gives every undecided attr a chance of
+        # being sampled on each run, so all of them are eventually classified.
+        random.shuffle(undecided)
         undecided = undecided[:_MAX_CANDIDACY_ATTRS_PER_RUN]
 
     onto_graph = tenant_graph_uri(tenant_id)
@@ -657,41 +710,101 @@ async def _apply_default_candidacy(
     return counters
 
 
-def _scan_query(kg_graph: str, predicates: Sequence[str], limit: int, offset: int) -> str:
+def _sparql_string_literal(value: str) -> str:
+    """Escape a Python string for embedding in a double-quoted SPARQL literal."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _scan_query(
+    kg_graph: str,
+    predicates: Sequence[str],
+    limit: int,
+    after_entity: Optional[str] = None,
+) -> str:
+    """One keyset-paginated scan page: entities strictly after
+    ``after_entity`` (the last COMPLETELY-scanned entity of the previous page),
+    in stable ``?e ?p ?o`` order. Keyset instead of OFFSET so page N costs the
+    same as page 1 — OFFSET makes the store re-walk (and re-sort) every
+    already-scanned row, an O(pages²) total scan."""
     values = " ".join(f"<{p}>" for p in predicates)
+    entity_filter = (
+        f'  FILTER(STR(?e) > "{_sparql_string_literal(after_entity)}")\n'
+        if after_entity
+        else ""
+    )
     return (
         f"SELECT ?e ?p ?o FROM <{kg_graph}> WHERE {{\n"
         f"  VALUES ?p {{ {values} }}\n"
         f"  ?e ?p ?o .\n"
-        f"}} ORDER BY ?e ?p ?o LIMIT {limit} OFFSET {offset}"
+        f"{entity_filter}"
+        f"}} ORDER BY ?e ?p ?o LIMIT {limit}"
     )
 
 
 async def _scan_triples(
     neptune: Any, kg_graph: str, predicates: Sequence[str]
-) -> list[Triple]:
-    """Page through ``?e ?p ?o`` for the given predicates (stable ORDER BY so
-    OFFSET paging is sound), bounded by the page cap (logged if hit)."""
+) -> tuple[list[Triple], bool]:
+    """Scan ``?e ?p ?o`` for the given predicates via keyset pagination by
+    entity, bounded by the page cap.
+
+    Each full page holds back its trailing entity group — the page boundary
+    may have cut that entity's rows mid-group — and the next page re-fetches
+    from ``FILTER(STR(?e) > "<last complete entity>")``, so every entity's
+    rows arrive CONTIGUOUS AND COMPLETE. That grouping is load-bearing for
+    ``extract_semantic_chunks``: its intra-entity doc dedup and per-entity
+    chunk cap assume they see all of an entity's values together.
+
+    Returns ``(triples, truncated)``. ``truncated=True`` means the page cap
+    (:data:`_MAX_SCAN_PAGES`) was exhausted and the scan is PARTIAL — logged
+    here, and the caller must NOT ghost-delete against it (a partial expected
+    set would mass-delete perfectly healthy docs).
+    """
     from cograph_client.graph.parser import parse_sparql_results
 
     page = _scan_page_size()
     triples: list[Triple] = []
-    for page_ix in range(_MAX_SCAN_PAGES):
-        sparql = _scan_query(kg_graph, predicates, page, page_ix * page)
+    after: Optional[str] = None  # last completely-scanned entity
+    for _page_ix in range(_MAX_SCAN_PAGES):
+        sparql = _scan_query(kg_graph, predicates, page, after_entity=after)
         _, rows = parse_sparql_results(await neptune.query(sparql))
+        page_triples: list[Triple] = []
         for row in rows:
             e, p = row.get("e", ""), row.get("p", "")
             if e and p:
-                triples.append((e, p, row.get("o", "")))
+                page_triples.append((e, p, row.get("o", "")))
         if len(rows) < page:
-            return triples
+            # Final page: nothing after it, so every entity here is complete.
+            triples.extend(page_triples)
+            return triples, False
+        if not page_triples:
+            continue  # defensive: a full page of unusable bindings — bounded by the cap
+        last_entity = page_triples[-1][0]
+        complete = [t for t in page_triples if t[0] != last_entity]
+        if complete:
+            # Hold the trailing (possibly partial) entity group back; the next
+            # page re-fetches it from its first row.
+            triples.extend(complete)
+            after = complete[-1][0]
+        else:
+            # The whole page is ONE entity: entity-level keyset cannot page
+            # inside it, so keep what we have (its first `page` rows — far
+            # beyond extract's per-entity chunk cap at any sane page size) and
+            # step past it. Loud, never silent: rows beyond the page are lost.
+            logger.warning(
+                "semantic_scan_entity_exceeds_page",
+                kg_graph=kg_graph,
+                entity_uri=last_entity,
+                page_size=page,
+            )
+            triples.extend(page_triples)
+            after = last_entity
     logger.warning(
         "semantic_scan_truncated",
         kg_graph=kg_graph,
         pages=_MAX_SCAN_PAGES,
         page_size=page,
     )
-    return triples
+    return triples, True
 
 
 async def _upsert_in_doc_batches(idx: SemanticIndex, chunks: list[SemanticChunk]) -> None:
@@ -730,18 +843,33 @@ async def reconcile_kg(
     1. fetch the marker map (uncached, raising — see :func:`_fetch_marker_map`);
     2. apply the default candidacy heuristic to undecided attributes and fold
        any new ``free_text`` verdicts into this run's marker set;
-    3. scan the instance graph for marked predicates (plus ``rdf:type`` /
-       label predicates for display parity with hook-written rows) — matching
-       the extractor's exact-URI-or-local-name semantics so hook-written docs
-       are never mistaken for ghosts;
-    4. re-extract chunks and upsert by ``content_hash`` (docs whose hash is
-       unchanged are skipped entirely when the backend supports doc listing,
-       and preserved by the upsert contract either way — filled embeddings
-       survive);
-    5. DELETE ghosts: index docs absent from the expected set (covers ER-merged
-       entities, normalization deletes, emptied values, AND marker-removed
-       attributes in one diff). Uses the ``list_docs`` Protocol method; skipped
-       loudly for third-party backends that predate it (module docstring).
+    3. snapshot the index's doc listing (``list_docs``) **BEFORE the scan
+       starts** — the ordering is load-bearing: a doc the write hook indexes
+       mid-scan would otherwise be in the listing but missed by the
+       already-running scan and get ghost-deleted. Snapshot-first means any
+       doc indexed after the snapshot simply isn't a ghost candidate this run
+       (its Neptune triples land before its index rows, so the NEXT run's scan
+       sees it), and any doc in the snapshot already has its triples committed
+       and IS seen by this scan;
+    4. scan the instance graph for marked predicates (plus ``rdf:type`` /
+       label predicates for display parity with hook-written rows) — keyset
+       pagination by entity (whole-entity groups; see :func:`_scan_triples`) —
+       matching the extractor's exact-URI-or-local-name semantics so
+       hook-written docs are never mistaken for ghosts;
+    5. re-extract chunks and upsert by ``content_hash``: docs whose hash AND
+       denormalized attrs are unchanged are skipped entirely when the backend
+       supports doc listing (``skipped_unchanged_hash``); docs whose text is
+       unchanged but whose attrs drifted (type/label changed without the
+       marked text changing) ARE re-upserted (``attrs_repaired``) — the
+       backend contract keeps their filled embeddings while refreshing attrs;
+    6. DELETE ghosts: snapshot docs absent from the expected set (covers
+       ER-merged entities, normalization deletes, emptied values, AND
+       marker-removed attributes in one diff), batched through the backend's
+       ``delete_docs`` (per-doc ``delete`` fallback for third-party backends).
+       SKIPPED — loudly — when the backend predates ``list_docs`` (module
+       docstring) **or when the scan was truncated at the page cap**: a
+       partial expected set must never drive deletions (it would mass-delete
+       every doc past the truncation point).
 
     Raises on Neptune failures — the schedule runner logs and retries on the
     next cadence; acting on partial reads would be worse than waiting.
@@ -751,6 +879,7 @@ async def reconcile_kg(
     counters = {
         "chunks_written": 0,
         "skipped_unchanged_hash": 0,
+        "attrs_repaired": 0,
         "ghosts_deleted": 0,
         "attrs_marked_free_text": 0,
         "attrs_marked_not_text": 0,
@@ -790,19 +919,11 @@ async def reconcile_kg(
     scan_preds.add(_RDF_TYPE)
     scan_preds.add(_RDFS_LABEL)
 
-    triples: list[Triple] = []
-    if marked:
-        triples = await _scan_triples(neptune, kg_graph, sorted(scan_preds))
-
-    chunks = extract_semantic_chunks(
-        triples, tenant_id=tenant_id, kg_name=kg_name, marked_predicates=marked
-    )
-
-    # 4. Diff against the backend's current docs (optional seam), upsert changes.
-    expected: dict[tuple[str, str], str] = {}
-    for c in chunks:
-        expected[(c.entity_uri, c.attr)] = c.content_hash
-
+    # 3. Snapshot the index BEFORE the scan starts (docstring step 3): a doc
+    # the write hook indexes after this point cannot appear in `current`, so
+    # it can never be misread as a ghost by this run — its Neptune triples are
+    # committed before its index rows, so the next run's scan claims it.
+    #
     # getattr, not a direct call: list_docs is a Protocol method now, but a
     # third-party backend compiled against the pre-list_docs Protocol must
     # degrade gracefully, never crash (module docstring). Both first-party
@@ -810,17 +931,52 @@ async def reconcile_kg(
     lister = getattr(idx, "list_docs", None)
     doc_listing_supported = callable(lister)
     current: dict[tuple[str, str], str] = {}
+    # Doc key -> stored denormalized attrs; None when the backend's listing
+    # predates the 4-tuple form (legacy 3-tuples: hash-diff only, no attrs
+    # repair — degrade, don't crash).
+    current_attrs: dict[tuple[str, str], Optional[dict[str, Any]]] = {}
     if doc_listing_supported:
-        for entity_uri, attr, content_hash in await lister(
-            tenant_id, kg_name=kg_name
-        ):
-            current[(entity_uri, attr)] = content_hash
-        to_write = [
-            c
-            for c in chunks
-            if current.get((c.entity_uri, c.attr)) != c.content_hash
-        ]
+        for row in await lister(tenant_id, kg_name=kg_name):
+            key = (row[0], row[1])
+            current[key] = row[2]
+            current_attrs[key] = (
+                dict(row[3]) if len(row) > 3 and row[3] is not None else None
+            )
+
+    # 4. Scan (keyset-paginated, whole-entity groups).
+    triples: list[Triple] = []
+    scan_truncated = False
+    if marked:
+        triples, scan_truncated = await _scan_triples(
+            neptune, kg_graph, sorted(scan_preds)
+        )
+
+    chunks = extract_semantic_chunks(
+        triples, tenant_id=tenant_id, kg_name=kg_name, marked_predicates=marked
+    )
+
+    # 5. Diff against the snapshot, upsert changes: a doc is written when its
+    # hash changed OR (hash unchanged but) its denormalized attrs drifted —
+    # the attrs-repair pass; the backend contract preserves the filled
+    # embedding on unchanged-hash rewrites while refreshing attrs.
+    expected: dict[tuple[str, str], str] = {}
+    for c in chunks:
+        expected[(c.entity_uri, c.attr)] = c.content_hash
+
+    if doc_listing_supported:
+        to_write = []
+        repaired: set[tuple[str, str]] = set()
+        for c in chunks:
+            key = (c.entity_uri, c.attr)
+            if current.get(key) != c.content_hash:
+                to_write.append(c)
+                continue
+            stored_attrs = current_attrs.get(key)
+            if stored_attrs is not None and stored_attrs != c.attrs:
+                to_write.append(c)
+                repaired.add(key)
         counters["skipped_unchanged_hash"] = len(chunks) - len(to_write)
+        counters["attrs_repaired"] = len(repaired)
     else:
         # No listing: upsert everything — the backend's upsert contract still
         # keeps unchanged-hash rows (and their embeddings) as-is.
@@ -830,21 +986,42 @@ async def reconcile_kg(
         await _upsert_in_doc_batches(idx, to_write)
         counters["chunks_written"] = len(to_write)
 
-    # 5. Ghosts: current docs not in the expected set. One diff covers every
+    # 6. Ghosts: snapshot docs not in the expected set. One diff covers every
     # bypass class — ER merges, normalization deletes, emptied docs, unmarked
-    # (decided-no) attributes.
-    if doc_listing_supported:
-        ghosts = sorted(set(current) - set(expected))
-        for entity_uri, attr in ghosts:
-            await idx.delete(entity_uri, tenant_id, kg_name=kg_name, attr=attr)
-        counters["ghosts_deleted"] = len(ghosts)
-    else:
+    # (decided-no) attributes. NEVER against a truncated scan: a partial
+    # expected set would mass-delete every healthy doc past the cutoff.
+    if not doc_listing_supported:
         logger.warning(
             "semantic_reconcile_ghost_scan_skipped",
             tenant_id=tenant_id,
             kg_name=kg_name,
             reason="backend predates the Protocol's list_docs method",
         )
+    elif scan_truncated:
+        logger.warning(
+            "semantic_reconcile_ghosts_skipped_scan_truncated",
+            tenant_id=tenant_id,
+            kg_name=kg_name,
+            reason=(
+                "the Neptune scan hit the page cap; the expected set is "
+                "partial, so ghost deletion is skipped this run (raise "
+                "COGRAPH_SEMANTIC_SCAN_PAGE_SIZE for KGs this large)"
+            ),
+        )
+    else:
+        ghosts = sorted(set(current) - set(expected))
+        if ghosts:
+            deleter = getattr(idx, "delete_docs", None)
+            if callable(deleter):
+                # One batched round trip for the whole ghost set.
+                await deleter(ghosts, tenant_id, kg_name=kg_name)
+            else:
+                # Third-party backend predating delete_docs: per-doc fallback.
+                for entity_uri, attr in ghosts:
+                    await idx.delete(
+                        entity_uri, tenant_id, kg_name=kg_name, attr=attr
+                    )
+        counters["ghosts_deleted"] = len(ghosts)
 
     logger.info(
         "semantic_reconcile",

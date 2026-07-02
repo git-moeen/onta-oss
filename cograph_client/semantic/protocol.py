@@ -203,9 +203,15 @@ class SemanticIndex(Protocol):
         :func:`cograph_client.semantic.extract.extract_semantic_chunks`
         produces (contiguous ``chunk_ix`` from 0). Within each doc:
 
-        * a row whose PK exists with the SAME ``content_hash`` is **kept as-is**
-          — crucially preserving an already-filled embedding, so replaying an
-          unchanged doc never re-queues embedding work (idempotent replay);
+        * a row whose PK exists with the SAME ``content_hash`` keeps its
+          text/hash/embedding/queue state as-is — crucially preserving an
+          already-filled embedding, so replaying an unchanged doc never
+          re-queues embedding work (idempotent replay) — but its denormalized
+          ``attrs`` are **always refreshed** from the incoming chunk: type and
+          label can change while the marked text does not (ER retype,
+          enrichment filling a label), and the display attrs must track the
+          entity, not the text (this is what makes the ONTA-181 reconciler an
+          actual corrective for the documented type-filter staleness);
         * a row whose PK exists with a DIFFERENT ``content_hash`` is replaced
           (embedding reset per the incoming chunk, normally ``None`` → queued);
         * rows with ``chunk_ix`` beyond the incoming doc's highest index are
@@ -271,33 +277,63 @@ class SemanticIndex(Protocol):
 
     async def list_docs(
         self, tenant_id: str, *, kg_name: Optional[str] = None
-    ) -> list[tuple[str, str, str]]:
-        """Enumerate indexed documents as ``(entity_uri, attr, content_hash)``
-        rows — one row per (entity, attr) **document**, never per chunk.
+    ) -> list[tuple[str, str, str, dict[str, Any]]]:
+        """Enumerate indexed documents as ``(entity_uri, attr, content_hash,
+        attrs)`` rows — one row per (entity, attr) **document**, never per
+        chunk. ``attrs`` is the doc's stored denormalized display attrs, taken
+        from its chunk-0 row (every chunk of a doc carries the same attrs when
+        written through :meth:`upsert_chunks`).
 
         The consumer is the ONTA-181 reconciler's claim diff: it compares this
         listing against what a fresh Neptune scan says SHOULD be indexed to
         (a) DELETE ghosts — docs whose (entity, attr) no longer exists in
         Neptune because an ER merge or a normalization delete bypassed the
-        write hook — and (b) SKIP re-upserting unchanged docs (the
-        ``skipped_unchanged_hash`` counter). Doc granularity is what makes
-        both cheap: ``content_hash`` is the sha256 of the canonicalized FULL
-        doc, identical across every chunk of the doc **by construction** (see
-        :class:`SemanticChunk`), so the doc-level triple is complete
-        change-detection currency without shipping chunk rows or text.
+        write hook — (b) SKIP re-upserting unchanged docs (the
+        ``skipped_unchanged_hash`` counter), and (c) REPAIR docs whose text is
+        unchanged but whose denormalized ``attrs`` drifted (type/label changed
+        without the marked text changing — the ``attrs_repaired`` counter).
+        Doc granularity is what makes all three cheap: ``content_hash`` is the
+        sha256 of the canonicalized FULL doc, identical across every chunk of
+        the doc **by construction** (see :class:`SemanticChunk`), and ``attrs``
+        is small by contract, so the doc-level row is complete change-detection
+        currency without shipping chunk rows or text — in ONE round trip.
 
         Scoping is identical to :meth:`search` / :meth:`clear`: ``tenant_id``
         is mandatory (a listing MUST NEVER cross tenants), ``kg_name`` narrows
         to one KG (``None`` = every KG in the tenant). The result is ordered
-        deterministically (sorted by the full tuple) so reconciler runs and
-        parity tests are reproducible across backends.
+        deterministically (sorted by ``(entity_uri, attr)``, which is unique
+        per doc) so reconciler runs and parity tests are reproducible across
+        backends.
 
-        HISTORY: this started as an OPTIONAL duck-typed seam because the
-        Protocol was frozen while ONTA-181 was built. It is now part of the
-        Protocol — both first-party backends implement it — but the reconciler
-        still looks it up with ``getattr`` and degrades gracefully (ghost
-        repair skipped, loudly logged) for third-party backends compiled
-        against the pre-``list_docs`` Protocol.
+        HISTORY: this started as an OPTIONAL duck-typed seam returning
+        3-tuples because the Protocol was frozen while ONTA-181 was built. It
+        is now part of the Protocol — both first-party backends implement the
+        4-tuple form — but the reconciler still looks it up with ``getattr``
+        and degrades gracefully: a missing method skips ghost repair (loudly
+        logged); a legacy 3-tuple listing still gets hash-diffing, only the
+        attrs-repair pass is skipped.
+        """
+        ...
+
+    async def delete_docs(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        tenant_id: str,
+        *,
+        kg_name: str,
+    ) -> None:
+        """Remove the ``(entity_uri, attr)`` docs in ``pairs`` from ONE KG, in
+        one batched call.
+
+        The reconciler's ghost-deletion primitive (ONTA-181): a reconcile of a
+        KG that lost many entities to an ER rebuild would otherwise issue one
+        :meth:`delete` round trip per ghost doc. Semantically identical to
+        calling ``delete(entity_uri, tenant_id, kg_name=…, attr=…)`` per pair
+        — same scoping rules (``tenant_id`` mandatory; ``kg_name`` REQUIRED
+        here because ghost diffs are always per-KG). An empty ``pairs`` is a
+        no-op. Third-party backends that predate the method degrade via the
+        reconciler's per-doc :meth:`delete` fallback; :meth:`delete` itself
+        remains the write hook's single-doc primitive.
         """
         ...
 

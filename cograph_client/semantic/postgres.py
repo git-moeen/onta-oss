@@ -438,20 +438,30 @@ class PostgresSemanticIndex:
         )
 
     # ----------------------------------------------------------------- writes
+    # ON CONFLICT split (protocol contract): ``attrs`` is ALWAYS refreshed —
+    # type/label can change while the marked text does not — but the
+    # text/hash/embedding/queue columns only move when the content_hash
+    # actually differs, so an unchanged-hash replay can never reset a filled
+    # embedding back to NULL. Every CASE reads {table}.content_hash, which in
+    # ON CONFLICT DO UPDATE is the OLD row's value for every SET expression.
     _UPSERT_SQL_TEMPLATE = """
         INSERT INTO {table}
             (tenant_id, kg_name, entity_uri, attr, chunk_ix, chunk_text,
              content_hash, embedding, embed_model, attempt_count, last_error, attrs)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::vector, $9, $10, $11, $12::jsonb)
         ON CONFLICT (tenant_id, kg_name, entity_uri, attr, chunk_ix) DO UPDATE SET
-            chunk_text    = EXCLUDED.chunk_text,
-            content_hash  = EXCLUDED.content_hash,
-            embedding     = EXCLUDED.embedding,
-            embed_model   = EXCLUDED.embed_model,
-            attempt_count = EXCLUDED.attempt_count,
-            last_error    = EXCLUDED.last_error,
-            attrs         = EXCLUDED.attrs
-        WHERE {table}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+            attrs         = EXCLUDED.attrs,
+            chunk_text    = CASE WHEN {table}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                                 THEN EXCLUDED.chunk_text ELSE {table}.chunk_text END,
+            embedding     = CASE WHEN {table}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                                 THEN EXCLUDED.embedding ELSE {table}.embedding END,
+            embed_model   = CASE WHEN {table}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                                 THEN EXCLUDED.embed_model ELSE {table}.embed_model END,
+            attempt_count = CASE WHEN {table}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                                 THEN EXCLUDED.attempt_count ELSE {table}.attempt_count END,
+            last_error    = CASE WHEN {table}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                                 THEN EXCLUDED.last_error ELSE {table}.last_error END,
+            content_hash  = EXCLUDED.content_hash
     """
 
     async def upsert_chunks(self, chunks: Sequence[SemanticChunk]) -> None:
@@ -459,11 +469,14 @@ class PostgresSemanticIndex:
 
         One transaction, two batched statements:
 
-        * an ``INSERT ... ON CONFLICT (pk) DO UPDATE ... WHERE content_hash IS
-          DISTINCT FROM EXCLUDED.content_hash`` — an unchanged-hash row is left
-          untouched (its filled embedding survives replay, never re-queued); a
-          changed-hash row is replaced wholesale (embedding reset per the
-          incoming chunk, normally NULL → queued);
+        * an ``INSERT ... ON CONFLICT (pk) DO UPDATE`` with a split SET: the
+          denormalized ``attrs`` are ALWAYS refreshed (type/label must track
+          the entity even when the text didn't change — the attrs-repair half
+          of the contract), while text/hash/embedding/queue state only change
+          when ``content_hash`` differs — an unchanged-hash row keeps its
+          filled embedding (survives replay, never re-queued); a changed-hash
+          row is replaced wholesale (embedding reset per the incoming chunk,
+          normally NULL → queued);
         * a tail ``DELETE ... chunk_ix >= doc_len`` per (entity, attr) doc —
           the stale-tail case when a doc re-chunked shorter.
         """
@@ -527,6 +540,34 @@ class PostgresSemanticIndex:
         async with pool.acquire() as conn:
             await conn.execute(sql, *params)
 
+    async def delete_docs(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        tenant_id: str,
+        *,
+        kg_name: str,
+    ) -> None:
+        """Batched (entity, attr) doc removal — the reconciler's ghost-deletion
+        primitive (Protocol contract): ONE ``DELETE ... USING unnest`` round
+        trip for the whole ghost set instead of one statement per doc."""
+        if not pairs:
+            return
+        pool = await self._ensure_pool()
+        sql = f"""
+            DELETE FROM {self._TABLE} AS t
+            USING unnest($3::text[], $4::text[]) AS u(entity_uri, attr)
+            WHERE t.tenant_id = $1 AND t.kg_name = $2
+              AND t.entity_uri = u.entity_uri AND t.attr = u.attr
+        """
+        async with pool.acquire() as conn:
+            await conn.execute(
+                sql,
+                tenant_id,
+                kg_name,
+                [e for e, _a in pairs],
+                [a for _e, a in pairs],
+            )
+
     async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
         pool = await self._ensure_pool()
         sql = f"DELETE FROM {self._TABLE} WHERE tenant_id = $1"
@@ -540,31 +581,38 @@ class PostgresSemanticIndex:
     # --------------------------- doc enumeration (reconciler ghost diff)
     async def list_docs(
         self, tenant_id: str, *, kg_name: Optional[str] = None
-    ) -> list[tuple[str, str, str]]:
-        """One ``(entity_uri, attr, content_hash)`` row per (entity, attr) doc
-        (the Protocol's doc-granularity contract), via ``SELECT DISTINCT``.
+    ) -> list[tuple[str, str, str, dict[str, Any]]]:
+        """One ``(entity_uri, attr, content_hash, attrs)`` row per (entity,
+        attr) doc (the Protocol's doc-granularity contract), via
+        ``DISTINCT ON (entity_uri, attr) … ORDER BY … chunk_ix`` — each doc is
+        represented by its chunk-0 row, in ONE round trip.
 
-        DISTINCT is safe at doc granularity because ``content_hash`` is the
+        Collapsing to one row per doc is safe because ``content_hash`` is the
         sha256 of the canonicalized FULL doc — identical across every chunk of
         a doc by construction (see :class:`~cograph_client.semantic.protocol.SemanticChunk`)
         — and :meth:`upsert_chunks` keeps that invariant durable: a doc's
         chunk-row rewrites AND its stale-tail delete commit in ONE transaction,
         so no committed state ever holds two hashes for one (entity, attr).
-        DISTINCT therefore collapses a doc's chunk rows to exactly one triple;
-        ``ORDER BY`` the full tuple keeps the listing deterministic (the same
-        ordering the InMemory backend produces by sorting).
+        ``attrs`` rides along from the chunk-0 row (written per doc by the
+        upsert) so the reconciler can repair attrs drift without a second
+        query. The (entity_uri, attr) ordering is deterministic — the pair is
+        unique per doc — matching the InMemory backend's sorted listing.
         """
         pool = await self._ensure_pool()
         sql = f"""
-            SELECT DISTINCT entity_uri, attr, content_hash
+            SELECT DISTINCT ON (entity_uri, attr)
+                   entity_uri, attr, content_hash, attrs
             FROM {self._TABLE}
             WHERE tenant_id = $1
               AND ($2::text IS NULL OR kg_name = $2::text)
-            ORDER BY entity_uri, attr, content_hash
+            ORDER BY entity_uri, attr, chunk_ix
         """
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, tenant_id, kg_name)
-        return [(r["entity_uri"], r["attr"], r["content_hash"]) for r in rows]
+        return [
+            (r["entity_uri"], r["attr"], r["content_hash"], _parse_attrs(r["attrs"]))
+            for r in rows
+        ]
 
     # ----------------------------------------------------------------- search
     @staticmethod
@@ -875,33 +923,37 @@ class PostgresSemanticIndex:
         if not chunks:
             return 0
         pool = await self._ensure_pool()
-        # content_hash is the optimistic-concurrency token: a fill only lands
-        # if the row still holds the SAME doc version and is still unembedded
-        # (protocol contract — a stale vector must never land on new text).
+        # ONE set-based UPDATE for the whole batch (unnest of parallel arrays
+        # carrying the PK + per-row content_hash) instead of a per-chunk
+        # statement loop. content_hash is the optimistic-concurrency token: a
+        # fill only lands if the row still holds the SAME doc version and is
+        # still unembedded (protocol contract — a stale vector must never land
+        # on new text). The single statement's rowcount IS the filled count.
         sql = f"""
-            UPDATE {self._TABLE}
-            SET embedding = $6::text::vector, embed_model = $7, last_error = NULL
-            WHERE tenant_id = $1 AND kg_name = $2 AND entity_uri = $3
-              AND attr = $4 AND chunk_ix = $5
-              AND content_hash = $8 AND embedding IS NULL
+            UPDATE {self._TABLE} AS t
+            SET embedding = u.embedding::vector, embed_model = $8, last_error = NULL
+            FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
+                        $5::int[], $6::text[], $7::text[])
+                 AS u(tenant_id, kg_name, entity_uri, attr, chunk_ix,
+                      content_hash, embedding)
+            WHERE t.tenant_id = u.tenant_id AND t.kg_name = u.kg_name
+              AND t.entity_uri = u.entity_uri AND t.attr = u.attr
+              AND t.chunk_ix = u.chunk_ix
+              AND t.content_hash = u.content_hash AND t.embedding IS NULL
         """
-        filled = 0
         async with pool.acquire() as conn:
-            async with conn.transaction():
-                for c, vec in zip(chunks, embeddings):
-                    status = await conn.execute(
-                        sql,
-                        c.tenant_id,
-                        c.kg_name,
-                        c.entity_uri,
-                        c.attr,
-                        c.chunk_ix,
-                        _vector_text([float(x) for x in vec]),
-                        embed_model,
-                        c.content_hash,
-                    )
-                    filled += _rowcount(status)
-        return filled
+            status = await conn.execute(
+                sql,
+                [c.tenant_id for c in chunks],
+                [c.kg_name for c in chunks],
+                [c.entity_uri for c in chunks],
+                [c.attr for c in chunks],
+                [c.chunk_ix for c in chunks],
+                [c.content_hash for c in chunks],
+                [_vector_text([float(x) for x in vec]) for vec in embeddings],
+                embed_model,
+            )
+        return _rowcount(status)
 
     async def mark_embed_failed(
         self, chunks: Sequence[SemanticChunk], *, error: str
@@ -909,28 +961,30 @@ class PostgresSemanticIndex:
         if not chunks:
             return 0
         pool = await self._ensure_pool()
-        # Same content_hash + still-NULL guard as fill_embeddings; the row
-        # stays queued (embedding NULL) until max_attempts dead-letters it.
+        # Same content_hash + still-NULL guard as fill_embeddings, same
+        # set-based unnest batching; the row stays queued (embedding NULL)
+        # until max_attempts dead-letters it.
         sql = f"""
-            UPDATE {self._TABLE}
-            SET attempt_count = attempt_count + 1, last_error = $6
-            WHERE tenant_id = $1 AND kg_name = $2 AND entity_uri = $3
-              AND attr = $4 AND chunk_ix = $5
-              AND content_hash = $7 AND embedding IS NULL
+            UPDATE {self._TABLE} AS t
+            SET attempt_count = t.attempt_count + 1, last_error = $7
+            FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
+                        $5::int[], $6::text[])
+                 AS u(tenant_id, kg_name, entity_uri, attr, chunk_ix,
+                      content_hash)
+            WHERE t.tenant_id = u.tenant_id AND t.kg_name = u.kg_name
+              AND t.entity_uri = u.entity_uri AND t.attr = u.attr
+              AND t.chunk_ix = u.chunk_ix
+              AND t.content_hash = u.content_hash AND t.embedding IS NULL
         """
-        marked = 0
         async with pool.acquire() as conn:
-            async with conn.transaction():
-                for c in chunks:
-                    status = await conn.execute(
-                        sql,
-                        c.tenant_id,
-                        c.kg_name,
-                        c.entity_uri,
-                        c.attr,
-                        c.chunk_ix,
-                        error,
-                        c.content_hash,
-                    )
-                    marked += _rowcount(status)
-        return marked
+            status = await conn.execute(
+                sql,
+                [c.tenant_id for c in chunks],
+                [c.kg_name for c in chunks],
+                [c.entity_uri for c in chunks],
+                [c.attr for c in chunks],
+                [c.chunk_ix for c in chunks],
+                [c.content_hash for c in chunks],
+                error,
+            )
+        return _rowcount(status)
