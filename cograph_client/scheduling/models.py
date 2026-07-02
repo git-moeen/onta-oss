@@ -27,7 +27,20 @@ from cograph_client.enrichment.models import JobCategory
 # The action a schedule fires — mirrors the Ask-AI action endpoints (COG-99):
 # find-merge-duplicates (dedupe), enrich (enrichment), suggest-relationships
 # (reconciliation). A schedule's ``category`` should agree with its action.
-ScheduleAction = Literal["find-merge-duplicates", "enrich", "suggest-relationships"]
+#
+# semantic-embed-fill / semantic-reconcile (ONTA-181) are the semantic
+# instance index's maintenance duties, expressed as ordinary Schedule rows so
+# they inherit the runner's FOR UPDATE SKIP LOCKED claim (overlapping ECS
+# tasks never double-run a sweep). They are dispatched to
+# ``semantic/reconciler.py`` and create NO job rows (see
+# ``dispatch_scheduled_action``).
+ScheduleAction = Literal[
+    "find-merge-duplicates",
+    "enrich",
+    "suggest-relationships",
+    "semantic-embed-fill",
+    "semantic-reconcile",
+]
 
 
 class Schedule(BaseModel):

@@ -20,6 +20,9 @@ Public surface:
   ``MAX_CHUNKS_PER_ENTITY``
 * selection: :func:`make_semantic_index`, :func:`get_semantic_index`,
   :func:`register_semantic_index`, :func:`reset_semantic_index`
+* maintenance (ONTA-181): :func:`semantic_index_enabled` (the master env gate),
+  :func:`run_embed_fill_sweep`, :func:`reconcile_kg` — the claim-based
+  reconciler duties (full design record in ``reconciler.py``)
 """
 
 from __future__ import annotations
@@ -32,6 +35,11 @@ from cograph_client.semantic.extract import (
     extract_semantic_chunks,
 )
 from cograph_client.semantic.memory import InMemorySemanticIndex
+from cograph_client.semantic.reconciler import (
+    reconcile_kg,
+    run_embed_fill_sweep,
+    semantic_index_enabled,
+)
 from cograph_client.semantic.protocol import (
     ChunkKey,
     SemanticChunk,
@@ -63,6 +71,9 @@ __all__ = [
     "get_semantic_index",
     "register_semantic_index",
     "reset_semantic_index",
+    "semantic_index_enabled",
+    "run_embed_fill_sweep",
+    "reconcile_kg",
 ]
 
 

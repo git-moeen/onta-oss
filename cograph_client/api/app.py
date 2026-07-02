@@ -171,6 +171,32 @@ async def lifespan(app: FastAPI):
             logger.info("schedule_runner_enabled")
     except Exception as exc:  # noqa: BLE001 - scheduling must not break startup
         logger.error("schedule_runner_start_failed", error=str(exc))
+    # ONTA-181: seed the semantic-maintenance schedule rows (the global
+    # embed-fill sweep; per-KG reconcile rows are ensured by the write hook /
+    # reindex route). Only meaningful when both the semantic index AND the
+    # runner are enabled — rows without a runner would never fire, so we warn
+    # instead of seeding. Best-effort: a seeding hiccup must not block startup.
+    try:
+        from cograph_client.semantic.reconciler import (
+            ensure_embed_fill_schedule,
+            semantic_index_enabled,
+        )
+
+        if semantic_index_enabled():
+            if app.state.schedule_runner is not None:
+                await ensure_embed_fill_schedule(app.state.schedule_store)
+                logger.info("semantic_maintenance_schedules_seeded")
+            else:
+                logger.warning(
+                    "semantic_index_enabled_without_scheduler",
+                    hint=(
+                        "COGRAPH_SEMANTIC_INDEX_ENABLED is set but the schedule "
+                        "runner is disabled — embed-fill/reconcile will not run "
+                        "(set OMNIX_DATABASE_URL or COGRAPH_SCHEDULER_ENABLED)."
+                    ),
+                )
+    except Exception as exc:  # noqa: BLE001 - seeding must not break startup
+        logger.error("semantic_schedule_seed_failed", error=str(exc))
     yield
     runner = getattr(app.state, "schedule_runner", None)
     if runner is not None:
