@@ -63,23 +63,25 @@ class PostGISSpatioTemporalIndex:
     def __init__(self, dsn: Optional[str] = None) -> None:
         self._dsn = dsn if dsn is not None else settings.database_url
         self._pool: Any = None
-        # asyncpg.Pool is created lazily; guard creation so concurrent callers
-        # don't each build a pool.
+        # DDL is applied lazily once; guard so concurrent first callers don't
+        # each run it. Pool creation itself is delegated to the process-wide
+        # shared pool (cograph_client.db.pool, ONTA-174) — one pool per DSN
+        # across all durable stores, not one per store.
         import asyncio
 
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ setup
     async def _ensure_pool(self) -> Any:
-        """Lazily create the asyncpg pool + table/index/extensions on first use."""
+        """Acquire the shared pool + apply table/index/extension DDL on first use."""
         if self._pool is not None:
             return self._pool
         async with self._lock:
             if self._pool is not None:
                 return self._pool
-            import asyncpg  # imported lazily so the dependency stays optional
+            from cograph_client.db.pool import get_pg_pool
 
-            pool = await asyncpg.create_pool(dsn=self._dsn)
+            pool = await get_pg_pool(self._dsn)
             async with pool.acquire() as conn:
                 # Extensions may need superuser; infra (COG-102) bootstraps them.
                 # Tolerate a permission error and let the DDL below surface any
