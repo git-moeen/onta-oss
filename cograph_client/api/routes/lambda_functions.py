@@ -18,10 +18,10 @@ from cograph_client.api.deps import get_neptune_client
 from cograph_client.auth.api_keys import TenantContext, get_tenant
 from cograph_client.functions.executor import FunctionExecutor
 from cograph_client.graph.client import NeptuneClient
+from cograph_client.graph.kg_writer import delete_facts, insert_facts, refresh_after_write
 from cograph_client.graph.ontology_queries import insert_attribute
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.queries import (
-    insert_triples,
     kg_graph_uri,
     list_functions_query,
     tenant_graph_uri,
@@ -276,14 +276,16 @@ async def invoke_function(
 
     # --- Step 4: Materialize result as triples on the entity ---
     new_triples: list[tuple[str, str, str]] = []
+    replaced_preds: list[str] = []
     for key, value in output.items():
         if value is None:
             continue
         attr_pred = f"https://cograph.tech/types/{entity_type}/attrs/{key}"
         new_triples.append((body.entity_uri, attr_pred, str(value)))
+        replaced_preds.append(attr_pred)
 
-        # Ensure the attribute exists in the ontology
-        # (use DELETE+INSERT pattern: first delete old value if any, then insert new)
+        # Ensure the attribute exists in the ontology (schema graph — unrelated to
+        # the instance-fact write below; left as-is).
         datatype = "string"
         if isinstance(value, int):
             datatype = "integer"
@@ -301,41 +303,30 @@ async def invoke_function(
 
     # Add provenance triple
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    new_triples.append((
-        body.entity_uri,
-        "https://cograph.tech/onto/lambda_refreshed_at",
-        now_iso,
-    ))
+    lambda_ts_pred = "https://cograph.tech/onto/lambda_refreshed_at"
+    new_triples.append((body.entity_uri, lambda_ts_pred, now_iso))
+    replaced_preds.append(lambda_ts_pred)
 
-    # Delete any existing lambda-computed attributes for this entity first
-    # to avoid duplicates on re-invoke
-    for key, value in output.items():
-        if value is None:
-            continue
-        attr_pred = f"https://cograph.tech/types/{entity_type}/attrs/{key}"
-        delete_sparql = (
-            f"DELETE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <{attr_pred}> ?old }} }}\n"
-            f"WHERE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <{attr_pred}> ?old }} }}"
-        )
-        try:
-            await client.update(delete_sparql)
-        except Exception:
-            pass  # no existing value — fine
-
-    # Also delete old provenance
-    delete_prov = (
-        f"DELETE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <https://cograph.tech/onto/lambda_refreshed_at> ?old }} }}\n"
-        f"WHERE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <https://cograph.tech/onto/lambda_refreshed_at> ?old }} }}"
-    )
-    try:
-        await client.update(delete_prov)
-    except Exception:
-        pass
-
-    # Insert the new triples into the KG-specific graph
+    # Persist via the shared write path (ADR 0007): an attribute update = clear the
+    # old value + insert the new. delete_facts with object=None is a predicate-scoped
+    # delete (drops any prior value of each replaced predicate, no-op when absent),
+    # insert_facts writes the new values batched, and ONE refresh_after_write carries
+    # the touched type — so this write fans out (index/cache/stats) like every other.
     if new_triples:
-        sparql_insert = insert_triples(instance_graph, new_triples)
-        await client.update(sparql_insert)
+        await delete_facts(
+            client,
+            instance_graph,
+            triples=[(body.entity_uri, pred, None) for pred in replaced_preds],
+            touched_types=[entity_type],
+            reason=f"lambda re-invoke: {function_name}",
+        )
+        await insert_facts(client, instance_graph, new_triples)
+        await refresh_after_write(
+            client,
+            tenant_id=tenant.tenant_id,
+            kg_name=body.kg_name,
+            affected_types=[entity_type],
+        )
 
     # --- Step 5: Discover linked entities for cascade ---
     discovered: list[DiscoveredEntity] = []
@@ -544,24 +535,16 @@ async def invoke_investor_portfolio(
     # Materialize results as triples on the Investor entity
     entity_type = "Investor"
     new_triples: list[tuple[str, str, str]] = []
+    replaced_preds: list[str] = []
     for key, value in output.items():
         if value is None:
             continue
         attr_pred = f"https://cograph.tech/types/{entity_type}/attrs/{key}"
-
-        # Delete old value first
-        delete_sparql = (
-            f"DELETE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <{attr_pred}> ?old }} }}\n"
-            f"WHERE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <{attr_pred}> ?old }} }}"
-        )
-        try:
-            await client.update(delete_sparql)
-        except Exception:
-            pass
-
         new_triples.append((body.entity_uri, attr_pred, str(value)))
+        replaced_preds.append(attr_pred)
 
-        # Ensure attribute in ontology
+        # Ensure attribute in ontology (schema graph — unrelated to the instance
+        # write below; left as-is).
         datatype = "integer" if key == "portfolio_count" else "string"
         attr_sparql = insert_attribute(
             ontology_graph, entity_type, key,
@@ -573,25 +556,29 @@ async def invoke_investor_portfolio(
         except Exception:
             pass
 
-    # Provenance
+    # Provenance timestamp
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    delete_prov = (
-        f"DELETE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <https://cograph.tech/onto/lambda_refreshed_at> ?old }} }}\n"
-        f"WHERE {{ GRAPH <{instance_graph}> {{ <{body.entity_uri}> <https://cograph.tech/onto/lambda_refreshed_at> ?old }} }}"
-    )
-    try:
-        await client.update(delete_prov)
-    except Exception:
-        pass
-    new_triples.append((
-        body.entity_uri,
-        "https://cograph.tech/onto/lambda_refreshed_at",
-        now_iso,
-    ))
+    lambda_ts_pred = "https://cograph.tech/onto/lambda_refreshed_at"
+    new_triples.append((body.entity_uri, lambda_ts_pred, now_iso))
+    replaced_preds.append(lambda_ts_pred)
 
+    # Persist via the shared write path (ADR 0007): clear each replaced predicate's
+    # prior value, insert the new values, then ONE refresh carrying the touched type.
     if new_triples:
-        sparql_insert = insert_triples(instance_graph, new_triples)
-        await client.update(sparql_insert)
+        await delete_facts(
+            client,
+            instance_graph,
+            triples=[(body.entity_uri, pred, None) for pred in replaced_preds],
+            touched_types=[entity_type],
+            reason="lambda re-invoke: investor-portfolio",
+        )
+        await insert_facts(client, instance_graph, new_triples)
+        await refresh_after_write(
+            client,
+            tenant_id=tenant.tenant_id,
+            kg_name=body.kg_name,
+            affected_types=[entity_type],
+        )
 
     duration_ms = (time.monotonic() - start) * 1000
 

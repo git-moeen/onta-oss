@@ -12,8 +12,24 @@ from unittest.mock import AsyncMock
 
 import cograph_client.api.routes.explore as explore_mod
 import cograph_client.nlp.pipeline as pipeline_mod
-from cograph_client.graph.kg_writer import insert_facts, refresh_after_write
+from cograph_client.graph.kg_writer import (
+    delete_facts,
+    insert_facts,
+    refresh_after_write,
+    rewrite_subject,
+)
 from cograph_client.graph.provenance import provenance_graph_uri
+from cograph_client.spatiotemporal.memory import InMemorySpatioTemporalIndex
+from cograph_client.spatiotemporal.protocol import SpatioTemporalFact
+from cograph_client.spatiotemporal.registry import (
+    register_spatiotemporal_index,
+    reset_spatiotemporal_index,
+)
+
+
+def _count_response(n: int) -> dict:
+    """A SPARQL SELECT (COUNT(*) AS ?n) response for the delete_facts count query."""
+    return {"head": {"vars": ["n"]}, "results": {"bindings": [{"n": {"value": str(n)}}]}}
 
 
 def test_insert_facts_batches_and_routes_provenance():
@@ -155,5 +171,218 @@ def test_refresh_after_write_skips_recompute_without_kg(monkeypatch):
         )
         await refresh_after_write(AsyncMock(), tenant_id="t", kg_name=None, affected_types={"X"})
         assert recomputed == []
+
+    asyncio.run(run())
+
+
+# --- delete_facts: batching, counting, provenance tombstone (ADR 0007) ---------
+
+
+def test_delete_facts_batches_concrete_triples_and_counts_exactly():
+    """Concrete-triple deletes go out as batched DELETE DATA (500/batch), the
+    count is exact (len), and NO count query is needed."""
+
+    async def run():
+        neptune = AsyncMock()
+        g = "https://cograph.tech/graphs/t/kg/k"
+        triples = [
+            (f"https://cograph.tech/entities/E/{i}", "https://cograph.tech/onto/p", f"v{i}")
+            for i in range(1200)
+        ]
+        removed = await delete_facts(neptune, g, triples=triples)
+        assert removed == 1200
+        assert neptune.update.await_count == 3  # 1200 / 500 = 3 DELETE DATA batches
+        assert neptune.query.await_count == 0  # exact count, no COUNT query
+        stmts = [c.args[0] for c in neptune.update.await_args_list]
+        assert all("DELETE DATA" in s and g in s for s in stmts)
+
+    asyncio.run(run())
+
+
+def test_delete_facts_predicate_scoped_uses_wildcard_and_counts():
+    """An object=None triple is a predicate-scoped delete (VALUES (?s ?p)), whose
+    removed count comes from a COUNT query."""
+
+    async def run():
+        neptune = AsyncMock()
+        neptune.query.return_value = _count_response(2)
+        g = "https://cograph.tech/graphs/t/kg/k"
+        removed = await delete_facts(
+            neptune, g, triples=[("e1", "p1", None), ("e1", "p2", None)]
+        )
+        assert removed == 2
+        assert neptune.query.await_count == 1
+        assert neptune.update.await_count == 1
+        stmt = neptune.update.await_args_list[0].args[0]
+        assert "VALUES (?s ?p)" in stmt and "DELETE { GRAPH" in stmt
+
+    asyncio.run(run())
+
+
+def test_delete_facts_whole_subject_uses_values_and_counts():
+    """subjects= deletes every triple of each URI (VALUES ?s), counted via COUNT."""
+
+    async def run():
+        neptune = AsyncMock()
+        neptune.query.return_value = _count_response(5)
+        g = "https://cograph.tech/graphs/t/kg/k"
+        removed = await delete_facts(neptune, g, subjects=["e1", "e2"])
+        assert removed == 5
+        assert neptune.update.await_count == 1
+        stmt = neptune.update.await_args_list[0].args[0]
+        assert "VALUES ?s" in stmt and "DELETE { GRAPH" in stmt
+
+    asyncio.run(run())
+
+
+def test_delete_facts_noop_on_empty():
+    async def run():
+        neptune = AsyncMock()
+        removed = await delete_facts(neptune, "https://g")
+        assert removed == 0
+        neptune.update.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_delete_facts_writes_tombstone_when_provenance_enabled(monkeypatch):
+    """With COGRAPH_PROVENANCE_ENABLED=1 a tombstone event lands in the companion
+    provenance graph (never the data graph)."""
+
+    async def run():
+        monkeypatch.setenv("COGRAPH_PROVENANCE_ENABLED", "1")
+        neptune = AsyncMock()
+        neptune.query.return_value = _count_response(1)
+        g = "https://cograph.tech/graphs/t/kg/k"
+        subj = "https://cograph.tech/entities/E/1"
+        await delete_facts(neptune, g, subjects=[subj], reason="unit-delete")
+        stmts = [c.args[0] for c in neptune.update.await_args_list]
+        prov_graph = provenance_graph_uri(g)
+        prov_stmts = [s for s in stmts if prov_graph in s]
+        assert prov_stmts, "a tombstone must be written to the provenance graph"
+        assert any("tombstone" in s for s in prov_stmts)
+        assert any(subj in s for s in prov_stmts)
+
+    asyncio.run(run())
+
+
+def test_delete_facts_no_tombstone_when_provenance_disabled(monkeypatch):
+    async def run():
+        monkeypatch.delenv("COGRAPH_PROVENANCE_ENABLED", raising=False)
+        neptune = AsyncMock()
+        neptune.query.return_value = _count_response(1)
+        g = "https://cograph.tech/graphs/t/kg/k"
+        await delete_facts(neptune, g, subjects=["e1"], reason="x")
+        prov_graph = provenance_graph_uri(g)
+        assert not any(prov_graph in c.args[0] for c in neptune.update.await_args_list)
+
+    asyncio.run(run())
+
+
+# --- rewrite_subject: two-direction move + rewrite provenance -------------------
+
+
+def test_rewrite_subject_moves_both_directions_and_records_event(monkeypatch):
+    async def run():
+        monkeypatch.setenv("COGRAPH_PROVENANCE_ENABLED", "1")
+        neptune = AsyncMock()
+        g = "https://cograph.tech/graphs/t/kg/k"
+        await rewrite_subject(neptune, g, "urn:old", "urn:new", reason="er-merge")
+        stmts = [c.args[0] for c in neptune.update.await_args_list]
+        # The merge SPARQL moves outgoing + incoming references.
+        assert any(
+            "DELETE { <urn:old> ?p ?o }" in s and "INSERT { <urn:new> ?p ?o }" in s
+            for s in stmts
+        )
+        # The rewrite event lands in the provenance graph, old -> new.
+        prov_graph = provenance_graph_uri(g)
+        prov = [s for s in stmts if prov_graph in s]
+        assert prov and any("rewrite" in s and "urn:new" in s for s in prov)
+
+    asyncio.run(run())
+
+
+def test_rewrite_subject_noop_on_same_uri():
+    async def run():
+        neptune = AsyncMock()
+        await rewrite_subject(neptune, "g", "same", "same")
+        neptune.update.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+# --- refresh_after_write: derived-index eviction / re-key (ADR 0007) ------------
+
+
+def _quiet_housekeeping(monkeypatch):
+    """Silence the ontology-cache / embed / stats steps so a refresh test isolates
+    the derived-index maintenance."""
+    monkeypatch.setattr(pipeline_mod.NLQueryPipeline, "invalidate_cache", lambda g: None)
+    monkeypatch.setattr(pipeline_mod, "get_embedding_service", lambda: None)
+    monkeypatch.setattr(explore_mod, "schedule_recompute", lambda *a, **k: None)
+
+
+def test_refresh_after_write_evicts_deleted_subjects(monkeypatch):
+    async def run():
+        _quiet_housekeeping(monkeypatch)
+        index = InMemorySpatioTemporalIndex()
+        register_spatiotemporal_index(index)
+        try:
+            await index.upsert(
+                SpatioTemporalFact(entity_uri="E1", tenant_id="t", kg_name="k", lon=1.0, lat=2.0)
+            )
+            await index.upsert(
+                SpatioTemporalFact(entity_uri="E2", tenant_id="t", kg_name="k", lon=3.0, lat=4.0)
+            )
+            await refresh_after_write(
+                AsyncMock(), tenant_id="t", kg_name="k", deleted_subjects=["E1"]
+            )
+            hits = await index.query_bbox("t", -180, -90, 180, 90, kg_name="k")
+            assert {h.entity_uri for h in hits} == {"E2"}
+        finally:
+            reset_spatiotemporal_index()
+
+    asyncio.run(run())
+
+
+def test_refresh_after_write_rekeys_rewritten_subjects(monkeypatch):
+    async def run():
+        _quiet_housekeeping(monkeypatch)
+        index = InMemorySpatioTemporalIndex()
+        register_spatiotemporal_index(index)
+        try:
+            await index.upsert(
+                SpatioTemporalFact(entity_uri="loser", tenant_id="t", kg_name="k", lon=1.0, lat=2.0)
+            )
+            await refresh_after_write(
+                AsyncMock(), tenant_id="t", kg_name="k", rewritten_subjects={"loser": "canon"},
+            )
+            hits = await index.query_bbox("t", -180, -90, 180, 90, kg_name="k")
+            assert {h.entity_uri for h in hits} == {"canon"}
+        finally:
+            reset_spatiotemporal_index()
+
+    asyncio.run(run())
+
+
+def test_refresh_after_write_deindex_is_noop_without_removals(monkeypatch):
+    """No deleted/rewritten subjects → the derived-index step touches nothing."""
+
+    async def run():
+        _quiet_housekeeping(monkeypatch)
+
+        class BoomIndex(InMemorySpatioTemporalIndex):
+            async def delete(self, *a, **k):  # pragma: no cover - must not be called
+                raise AssertionError("delete must not run without deleted_subjects")
+
+            async def rekey(self, *a, **k):  # pragma: no cover
+                raise AssertionError("rekey must not run without rewritten_subjects")
+
+        register_spatiotemporal_index(BoomIndex())
+        try:
+            # Should not raise — the deindex step early-returns.
+            await refresh_after_write(AsyncMock(), tenant_id="t", kg_name="k")
+        finally:
+            reset_spatiotemporal_index()
 
     asyncio.run(run())

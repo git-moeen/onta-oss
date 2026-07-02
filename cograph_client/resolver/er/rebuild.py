@@ -23,15 +23,18 @@ ER test suite asserts.
 
 Idempotent: a second run sees singleton clusters (nothing left to merge).
 
-The cluster computation (`compute_clusters`, `choose_canonical`,
-`merge_operations`) is pure and unit-tested without a graph; only
-`rebuild_type` / `rebuild_kg` touch Neptune.
+The cluster computation (`compute_clusters`, `choose_canonical`) is pure and
+unit-tested without a graph; only `rebuild_type` / `rebuild_kg` touch Neptune,
+and they fold each merge through the shared `kg_writer.rewrite_subject` primitive
+(ADR 0007) so a merged-away URI never lingers in a derived secondary index.
 """
 
 from __future__ import annotations
 
 import structlog
 
+from cograph_client.graph.kg_writer import refresh_after_write, rewrite_subject
+from cograph_client.graph.queries import parse_kg_graph_uri
 from cograph_client.resolver.er.blocking import SparqlBlocker, generate_block_keys
 from cograph_client.resolver.er.scoring import DefaultScorer
 from cograph_client.resolver.er.types import (
@@ -137,27 +140,9 @@ def choose_canonical(cluster: list[str], entities: dict[str, NormalizedSignals])
     )
 
 
-def merge_operations(instance_graph: str, canonical: str, loser: str) -> str:
-    """SPARQL update that folds `loser` into `canonical`: move every outgoing
-    triple, then every incoming reference. Idempotent under RDF set semantics
-    (re-running on already-merged data is a no-op). Returns one update string
-    with two ``;``-separated operations."""
-    return (
-        f"WITH <{instance_graph}>\n"
-        f"DELETE {{ <{loser}> ?p ?o }} INSERT {{ <{canonical}> ?p ?o }} "
-        f"WHERE {{ <{loser}> ?p ?o }} ;\n"
-        f"WITH <{instance_graph}>\n"
-        f"DELETE {{ ?s ?p <{loser}> }} INSERT {{ ?s ?p <{canonical}> }} "
-        f"WHERE {{ ?s ?p <{loser}> }}"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Graph-touching orchestration
 # ---------------------------------------------------------------------------
-
-# Number of (loser -> canonical) merges to batch into one SPARQL update request.
-_MERGE_CHUNK = 20
 
 
 async def rebuild_type(
@@ -191,11 +176,35 @@ async def rebuild_type(
             if uri != canonical:
                 merges.append((canonical, uri))
 
-    # Execute in chunked SPARQL update requests.
-    for i in range(0, len(merges), _MERGE_CHUNK):
-        chunk = merges[i : i + _MERGE_CHUNK]
-        update = " ;\n".join(merge_operations(instance_graph, c, l) for c, l in chunk)
-        await client.update(update)
+    # Fold each loser into its canonical through the shared rewrite primitive
+    # (ADR 0007): one batched URI rewrite per (loser -> canonical). A rewrite is a
+    # single semantic event, so the derived indexes re-key (cheap) rather than
+    # evict-and-recompute — done once, below, for the whole batch.
+    for canonical, loser in merges:
+        await rewrite_subject(
+            client,
+            instance_graph,
+            loser,
+            canonical,
+            touched_types=[type_name],
+            reason="er-merge rebuild",
+        )
+
+    # One post-write refresh per rebuild batch (NOT per entity): re-key the merged
+    # subjects in the derived indexes and recompute type-stats. Scope comes from
+    # the instance-graph URI; a non-KG graph (e.g. a test stub) yields no scope, so
+    # the refresh is skipped — the rewrites themselves already landed in Neptune.
+    if merges:
+        scope = parse_kg_graph_uri(instance_graph)
+        if scope is not None:
+            r_tenant, r_kg = scope
+            await refresh_after_write(
+                client,
+                tenant_id=r_tenant,
+                kg_name=r_kg,
+                affected_types=(),
+                rewritten_subjects={loser: canonical for canonical, loser in merges},
+            )
 
     after = before - len(merges)
     logger.info(

@@ -317,6 +317,48 @@ class PostGISSpatioTemporalIndex:
         async with pool.acquire() as conn:
             await conn.execute(sql, *params)
 
+    async def rekey(
+        self,
+        old_uri: str,
+        new_uri: str,
+        tenant_id: str,
+        *,
+        kg_name: Optional[str] = None,
+    ) -> None:
+        pool = await self._ensure_pool()
+        # Move old_uri's rows to new_uri, then drop the old rows — both in ONE
+        # transaction. ON CONFLICT DO NOTHING makes new_uri (the ER-merge winner)
+        # keep precedence when it already has a row at the same
+        # (tenant, kg, valid_time): the loser's row is dropped rather than
+        # clobbering the winner's geometry/attrs.
+        kg_filter = ""
+        move_params: list[Any] = [tenant_id, new_uri, old_uri]
+        del_params: list[Any] = [tenant_id, old_uri]
+        if kg_name is not None:
+            move_params.append(kg_name)
+            del_params.append(kg_name)
+            kg_filter_move = f" AND kg_name = ${len(move_params)}"
+            kg_filter_del = f" AND kg_name = ${len(del_params)}"
+        else:
+            kg_filter_move = ""
+            kg_filter_del = ""
+        move_sql = (
+            f"INSERT INTO {self._TABLE} "
+            f"(entity_uri, tenant_id, kg_name, geom, valid_time, attrs)\n"
+            f"SELECT $2, tenant_id, kg_name, geom, valid_time, attrs "
+            f"FROM {self._TABLE}\n"
+            f"WHERE tenant_id = $1 AND entity_uri = $3{kg_filter_move}\n"
+            f"ON CONFLICT (tenant_id, kg_name, entity_uri, valid_time) DO NOTHING"
+        )
+        del_sql = (
+            f"DELETE FROM {self._TABLE} "
+            f"WHERE tenant_id = $1 AND entity_uri = $2{kg_filter_del}"
+        )
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(move_sql, *move_params)
+                await conn.execute(del_sql, *del_params)
+
     async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
         pool = await self._ensure_pool()
         sql = f"DELETE FROM {self._TABLE} WHERE tenant_id = $1"
