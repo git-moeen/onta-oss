@@ -65,6 +65,15 @@ _INDEX_UPSERT_TIMEOUT_S = float(
     os.environ.get("COGRAPH_SPATIOTEMPORAL_UPSERT_TIMEOUT_S", "10")
 )
 
+
+def _semantic_upsert_timeout_s() -> float:
+    """Timeout for the semantic-index write hook (ONTA-181) — the same hang-to-
+    TimeoutError conversion as ``_INDEX_UPSERT_TIMEOUT_S``, with its own knob
+    because the semantic hook does strictly more work per write (marker-map
+    read + chunk upsert + empty-doc deletes). Read per call so tests/ops can
+    tune it without re-importing the module."""
+    return float(os.environ.get("COGRAPH_SEMANTIC_UPSERT_TIMEOUT_S", "10"))
+
 # KG-registration triple shape — the `<kg_uri> <onto/kg_name> "name"` record in
 # the tenant metadata graph that ``list_kgs`` reads to populate the Explorer
 # dropdown. Kept here (not imported from the API route) so this module stays in
@@ -173,6 +182,7 @@ async def insert_facts(
             await neptune.update(sparql)
     if instance_triples:
         await _index_spatiotemporal(instance_graph, instance_triples)
+        await _index_semantic(neptune, instance_graph, instance_triples)
 
 
 async def _index_spatiotemporal(
@@ -215,6 +225,110 @@ async def _index_spatiotemporal(
             instance_graph=instance_graph,
             exc_info=True,
         )
+
+
+async def _index_semantic(
+    neptune, instance_graph: str, instance_triples: list[Triple]
+) -> None:
+    """Populate the semantic instance index from the just-written triples (ONTA-181).
+
+    The FRESHNESS half of the ONTA-173 consistency model (the claim-based
+    reconciler in ``semantic/reconciler.py`` is the correctness half): chunks
+    of marked free-text attributes land in the same request that wrote Neptune,
+    with ``embedding=NULL`` — the store-side generated tsvector makes them
+    lexically searchable instantly; vector recall follows within one embed-fill
+    sweep. Kept HERE in the single insertion primitive (like the
+    spatio-temporal hook above) so EVERY converged writer auto-indexes with no
+    per-caller wiring.
+
+    Env-gated OFF by default (``COGRAPH_SEMANTIC_INDEX_ENABLED`` — cost/rollout
+    control: indexing implies embedding spend and index growth). Marker-driven:
+    only predicates the tenant's textKind map (``graph/text_markers.py``) marks
+    ``free_text`` are extracted — free text has no distinguishing datatype, so
+    unlike the spatio-temporal hook this one needs the ``neptune`` handle to
+    consult the (TTL-cached) marker map.
+
+    Empty-doc contract: a marked attr present in THIS WRITE whose canonicalized
+    doc came out empty (or was deduped away because it mirrors another attr's
+    doc) gets ``delete(entity, tenant, kg_name=…, attr=…)`` — per the ONTA-175
+    upsert contract an empty doc has no chunk rows to carry its key, so the
+    hook must issue the delete explicitly.
+
+    Best-effort and time-bounded exactly like ``_index_spatiotemporal``: the
+    whole body (marker read + upsert + deletes + schedule ensure) runs under
+    one ``asyncio.wait_for`` so a hung index backend can't block the KG write,
+    and ANY failure is logged, never raised — the KG write must NEVER fail on
+    an index hiccup (Neptune is already the source of truth at this point).
+    """
+    scope = parse_kg_graph_uri(instance_graph)
+    if scope is None:
+        return  # not a per-KG instance graph → nothing to scope an index row to
+    tenant_id, kg_name = scope
+    try:
+        from cograph_client.semantic.reconciler import semantic_index_enabled
+
+        if not semantic_index_enabled():
+            return
+        await asyncio.wait_for(
+            _index_semantic_inner(neptune, tenant_id, kg_name, instance_triples),
+            timeout=_semantic_upsert_timeout_s(),
+        )
+    except Exception:  # noqa: BLE001 — never fail a KG write on a derived-index hiccup
+        logger.warning(
+            "semantic_index_update_failed",
+            instance_graph=instance_graph,
+            exc_info=True,
+        )
+
+
+async def _index_semantic_inner(
+    neptune, tenant_id: str, kg_name: str, instance_triples: list[Triple]
+) -> None:
+    """The unguarded body of :func:`_index_semantic` (wrapped in one timeout).
+
+    Imports are lazy so ``graph/`` stays importable without pulling in the
+    semantic subsystem (mirrors the spatio-temporal hook's lazy imports).
+    """
+    from cograph_client.graph.text_markers import get_free_text_map
+    from cograph_client.semantic.extract import extract_semantic_chunks
+    from cograph_client.semantic.reconciler import (
+        ensure_reconcile_schedule_from_hook,
+        marked_doc_keys,
+    )
+    from cograph_client.semantic.registry import get_semantic_index
+
+    marker_map = await get_free_text_map(neptune, tenant_id)
+    marked = {uri for uri, is_free_text in marker_map.items() if is_free_text}
+    if marked:
+        index = get_semantic_index()
+        chunks = extract_semantic_chunks(
+            instance_triples,
+            tenant_id=tenant_id,
+            kg_name=kg_name,
+            marked_predicates=marked,
+        )
+        if chunks:
+            await index.upsert_chunks(chunks)
+        # Empty-doc deletes: marked (entity, attr) docs touched by THIS write
+        # that produced no chunks of their own (emptied or deduped — see the
+        # docstring above). Only docs in this write are considered — full ghost
+        # repair (deleted entities, marker flips) is the reconciler's job.
+        emitted = {(c.entity_uri, c.attr) for c in chunks}
+        emptied = marked_doc_keys(instance_triples, marked) - emitted
+        for entity_uri, attr in sorted(emptied):
+            await index.delete(entity_uri, tenant_id, kg_name=kg_name, attr=attr)
+        logger.info(
+            "semantic_index_hook",
+            tenant_id=tenant_id,
+            kg_name=kg_name,
+            chunks_written=len(chunks),
+            docs_deleted=len(emptied),
+        )
+    # Ensure the KG's recurring reconcile schedule exists (memoized — one
+    # store round-trip per (tenant, kg) per process), even when nothing is
+    # marked yet: the reconciler's default candidacy heuristic may mark
+    # attributes this hook can't (client-mapped CSV rows, enrichment-minted).
+    await ensure_reconcile_schedule_from_hook(tenant_id, kg_name)
 
 
 async def refresh_after_write(

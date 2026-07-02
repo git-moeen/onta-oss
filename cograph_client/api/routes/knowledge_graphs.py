@@ -6,10 +6,14 @@ All KGs share the tenant's ontology but have separate instance data.
 import asyncio
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from cograph_client.api.deps import get_enrichment_job_store, get_neptune_client
+from cograph_client.api.deps import (
+    get_enrichment_job_store,
+    get_neptune_client,
+    get_schedule_store,
+)
 from cograph_client.auth.api_keys import TenantContext, get_tenant
 from cograph_client.enrichment.models import JobCategory, JobStatus
 from cograph_client.graph.client import NeptuneClient
@@ -343,6 +347,7 @@ async def delete_kg(
     kg_name: str,
     tenant: TenantContext = Depends(get_tenant),
     client: NeptuneClient = Depends(get_neptune_client),
+    schedule_store=Depends(get_schedule_store),
 ):
     """Delete a knowledge graph and all its data."""
     base = tenant_graph_uri(tenant.tenant_id)
@@ -395,7 +400,94 @@ async def delete_kg(
     except Exception:
         pass  # Derived-index cleanup is best-effort, don't fail the delete
 
+    # Clear this KG's chunks from the SEMANTIC instance index (ONTA-181) — same
+    # (tenant_id, kg_name) scoping and same best-effort contract as the
+    # spatio-temporal clear above: only THIS KG's rows, never a sibling's.
+    try:
+        from cograph_client.semantic.registry import get_semantic_index
+        await get_semantic_index().clear(tenant.tenant_id, kg_name=kg_name)
+    except Exception:
+        pass  # Derived-index cleanup is best-effort, don't fail the delete
+
+    # Drop the KG's recurring semantic-reconcile schedule row (ONTA-181) so the
+    # runner doesn't keep scanning a graph that no longer exists. Best-effort.
+    try:
+        from cograph_client.semantic.reconciler import remove_reconcile_schedule
+        await remove_reconcile_schedule(schedule_store, tenant.tenant_id, kg_name)
+    except Exception:
+        pass  # Schedule cleanup is best-effort, don't fail the delete
+
     return {"deleted": kg_name}
+
+
+# ---------------------------------------------------------------------------
+# Semantic instance index: on-demand reindex (ONTA-181).
+# ---------------------------------------------------------------------------
+
+
+class ReindexAccepted(BaseModel):
+    """202 body for the on-demand semantic reindex trigger."""
+
+    status: str = "accepted"
+    kg_name: str
+    schedule_id: str
+    # "scheduled"       → a due-now schedule row was seeded; the claim-based
+    #                     runner fires it (multi-task safe via SKIP LOCKED).
+    # "background-task" → no runner in this deployment (zero-config OSS);
+    #                     the reconcile was fired as an in-process task.
+    mode: str
+
+
+@router.post(
+    "/{kg_name}/search/reindex", response_model=ReindexAccepted, status_code=202
+)
+async def reindex_kg_semantic(
+    kg_name: str,
+    request: Request,
+    tenant: TenantContext = Depends(get_tenant),
+    client: NeptuneClient = Depends(get_neptune_client),
+    schedule_store=Depends(get_schedule_store),
+):
+    """Trigger an on-demand semantic reconcile (= backfill) for one KG.
+
+    THE entry point for indexing an already-ingested KG without re-ingesting
+    (ONTA-181's parliamentary-speeches scenario): the reconciler's first run
+    against a KG is the backfill. Deliberately NOT an inline long-running
+    request — it seeds the KG's recurring reconcile schedule row with
+    ``next_run=now`` and returns 202 immediately; the claim-based schedule
+    runner picks it up within one poll interval, so overlapping ECS tasks never
+    double-scan. Deployments without a runner (no DSN, scheduler off) fall back
+    to a fire-and-forget in-process task — single process, so no claim needed.
+
+    503 when the semantic index is disabled (``COGRAPH_SEMANTIC_INDEX_ENABLED``
+    is the master gate for the write hook AND the reconciler): accepting the
+    request would acknowledge work that can never run.
+    """
+    from cograph_client.semantic.reconciler import (
+        ensure_reconcile_schedule,
+        schedule_reconcile_task,
+        semantic_index_enabled,
+    )
+
+    if not semantic_index_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Semantic indexing is disabled for this deployment "
+                "(set COGRAPH_SEMANTIC_INDEX_ENABLED=true to enable it)."
+            ),
+        )
+
+    schedule = await ensure_reconcile_schedule(
+        schedule_store, tenant.tenant_id, kg_name, due_now=True
+    )
+    runner = getattr(request.app.state, "schedule_runner", None)
+    if runner is None:
+        schedule_reconcile_task(client, tenant.tenant_id, kg_name)
+        mode = "background-task"
+    else:
+        mode = "scheduled"
+    return ReindexAccepted(kg_name=kg_name, schedule_id=schedule.id, mode=mode)
 
 
 # ---------------------------------------------------------------------------
