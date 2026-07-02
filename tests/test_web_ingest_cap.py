@@ -296,6 +296,83 @@ async def test_preview_degrades_to_flat_when_extract_fails(monkeypatch):
     assert step.preview["relationships"] == []
 
 
+async def test_slow_sample_degrades_to_confirmable_plan(monkeypatch):
+    """ROOT-CAUSE (Add-data-from-the-web timeout): a web source that can't return a
+    sample within the preview budget must NOT strand the user on the proxy's 504
+    'took too long'. plan() bounds the sample fetch (_SAMPLE_BUDGET_S) and, on a
+    timeout, degrades to a CONFIRMABLE flat-preview discovery plan (the full pull
+    still runs on confirm as a background job) — and returns promptly, not after
+    the provider's own 60s timeout."""
+    monkeypatch.setattr(web_ingest_cap, "_SAMPLE_BUDGET_S", 0.05)
+
+    class SlowSampleProvider(FakeProvider):
+        async def discover(self, query, *, sample, max_rows, hint_columns, context, urls=None):
+            if sample:
+                await asyncio.sleep(5)  # far exceeds the (patched) sample budget
+            return await super().discover(
+                query, sample=sample, max_rows=max_rows,
+                hint_columns=hint_columns, context=context, urls=urls,
+            )
+
+    register_web_source(SlowSampleProvider())
+
+    steps = await asyncio.wait_for(
+        WebIngestCapability().plan(
+            _ctx(), "models OpenRouter offers", parsed=CONFIRMED_SPEC
+        ),
+        timeout=2,  # the fix bounds it to ~0.05s; a hang here IS the regression
+    )
+    assert len(steps) == 1
+    step = steps[0]
+    # A confirmable plan — NOT the answer/clarify dead end that would strand the user.
+    assert step.action == "discover_ingest"
+    # Degraded flat preview: the proposed type + its attributes, no sample rows.
+    assert step.preview["sample_rows"] == []
+    assert step.preview["sources"] == []
+    dts = step.preview["discovered_types"]
+    assert len(dts) == 1 and dts[0]["name"] == "OpenRouterModel"
+    assert dts[0]["attributes"] == ["name", "context_length"]
+    assert step.preview["relationships"] == []
+    # Summary signals the degradation rather than over-claiming a discovered shape.
+    assert "couldn't fully preview" in step.preview["summary"].lower()
+    # The comprehensive fetch hint is still persisted so execute() runs the REAL,
+    # full discovery on confirm — nothing is lost, only the rich preview is skipped.
+    assert set(step.params["hint_columns"]) == {"name", "context_length", "provider"}
+
+
+async def test_slow_shape_estimate_degrades_to_flat_preview(monkeypatch):
+    """The sample renders fine but the ontology-shape extractor (whose own LLM
+    timeout is 60s, longer than the whole request budget) can't finish within the
+    shape budget → plan() bounds it (_SHAPE_BUDGET_S) and degrades to a flat
+    preview, still a confirmable plan, no timeout propagated to the request."""
+    monkeypatch.setattr(web_ingest_cap, "_SHAPE_BUDGET_S", 0.05)
+    register_web_source(FakeProvider())
+
+    async def fast_fetch_ontology(self, graph_uri):
+        return {}, {}
+
+    async def slow_extract(self, content, content_type, existing=None):
+        await asyncio.sleep(5)  # far exceeds the (patched) shape budget
+        return ExtractionResult(entities=[], relationships=[])
+
+    monkeypatch.setattr(SchemaResolver, "_fetch_ontology", fast_fetch_ontology)
+    monkeypatch.setattr(SchemaResolver, "_extract", slow_extract)
+
+    steps = await asyncio.wait_for(
+        WebIngestCapability().plan(
+            _ctx(), "models OpenRouter offers", parsed=CONFIRMED_SPEC
+        ),
+        timeout=2,
+    )
+    step = steps[0]
+    assert step.action == "discover_ingest"
+    # The SAMPLE rendered (rows present); only the shape estimate degraded to flat.
+    assert step.preview["sample_rows"]
+    dts = step.preview["discovered_types"]
+    assert len(dts) == 1 and dts[0]["name"] == "OpenRouterModel"
+    assert "couldn't fully preview" in step.preview["summary"].lower()
+
+
 async def test_commit_to_suggested_after_prior_clarify(monkeypatch):
     register_web_source(FakeProvider())
     _patch_preview(monkeypatch, entities=_single_type_entities())

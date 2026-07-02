@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -80,6 +81,23 @@ _PREVIEW_SOURCES = 5
 # Conservative default cap so a first (paid) discovery is BOUNDED and cheap to
 # inspect. Mirrors the enrich plan's _DEFAULT_PLAN_LIMIT. User-overridable.
 _DEFAULT_PLAN_CAP = 200
+
+# Wall-clock budgets for building the plan-time PREVIEW, sized well under the
+# Explorer proxy's 55s backend abort (web/app/api/demo/agent/route.ts
+# BACKEND_TIMEOUT_MS). The preview chains a paid web-search fan-out (the sample)
+# and one extraction LLM call (the shape estimate); each provider/LLM carries its
+# OWN timeout (30-60s) that rivals or EXCEEDS that whole request budget, so with no
+# outer bound a broad, source-less query (e.g. "physicians across two cities")
+# runs 65-75s and the proxy kills the request → the client's "took too long".
+# Bounding each heavy step keeps the turn IN budget; on a timeout we DEGRADE to a
+# confirmable flat-preview plan (execute() still runs the FULL discovery as a
+# background job, so no data is lost — only the rich preview is skipped). Env-
+# overridable so ops can retune without a deploy if the proxy budget changes.
+# Together (22 + 15 = 37s) they leave headroom under the 55s budget for the small
+# upstream classify + spec-resolve LLM calls; the sample's web fan-out is the
+# bigger variable, so it gets the larger share.
+_SAMPLE_BUDGET_S = float(os.environ.get("COGRAPH_WEB_SAMPLE_BUDGET_S", "22"))
+_SHAPE_BUDGET_S = float(os.environ.get("COGRAPH_WEB_SHAPE_BUDGET_S", "15"))
 
 
 def _spawn(coro) -> None:
@@ -170,19 +188,33 @@ class WebIngestCapability:
         # drives naming + preview above.
         hint_columns = _dedupe([key_attr, *confirmed, *suggested])
 
-        # 2. Cheap sample fetched with the COMPREHENSIVE hint so the preview sees
-        #    the same rich table the commit will. In URL mode the provider
-        #    extracts the sample FROM the supplied pages.
+        # 2. Cheap SAMPLE fetched with the COMPREHENSIVE hint so the preview sees
+        #    the same rich table the commit will. In URL mode the provider extracts
+        #    the sample FROM the supplied pages. Bounded by _SAMPLE_BUDGET_S: a
+        #    broad, source-less query can fan out for 60s+ and blow the proxy's 55s
+        #    request budget → the client's "took too long". On a TIMEOUT we don't
+        #    strand the user — we press on to a degraded-but-confirmable plan below
+        #    (the full discovery still runs on confirm as a background job). Only an
+        #    outright provider ERROR is a dead end worth surfacing.
+        sample = None
         try:
-            sample = await provider.discover(
-                query,
-                sample=True,
-                max_rows=_SAMPLE_ROWS,
-                hint_columns=hint_columns,
-                context=_provider_context(ctx),
-                urls=urls or None,
+            sample = await asyncio.wait_for(
+                provider.discover(
+                    query,
+                    sample=True,
+                    max_rows=_SAMPLE_ROWS,
+                    hint_columns=hint_columns,
+                    context=_provider_context(ctx),
+                    urls=urls or None,
+                ),
+                timeout=_SAMPLE_BUDGET_S,
             )
-        except Exception:  # noqa: BLE001 — a sample failure must never 500 the turn
+        except asyncio.TimeoutError:
+            # Slow web source, not a failure — degrade to a flat, confirmable plan.
+            logger.warning(
+                "web_ingest_sample_timeout", query=query, budget_s=_SAMPLE_BUDGET_S
+            )
+        except Exception:  # noqa: BLE001 — a sample ERROR must never 500 the turn
             logger.warning("web_ingest_sample_failed", exc_info=True)
             return [
                 _answer_step(
@@ -190,33 +222,69 @@ class WebIngestCapability:
                     "Try again in a moment or rephrase the request."
                 )
             ]
-        if not sample.rows:
+        # An empty (but successful) sample means the search genuinely found nothing
+        # — surface the informative message. A TIMEOUT (sample is None) is
+        # different: the discovery is viable, we just couldn't render its preview in
+        # time, so we proceed to a degraded-but-confirmable plan.
+        if sample is not None and not sample.rows:
             return [_answer_step(_empty_sample_message(query, urls, sample))]
+
+        preview_degraded = sample is None
+        sample_rows = list(getattr(sample, "rows", None) or [])
+        sample_sources = list(getattr(sample, "sources", None) or [])
 
         # Thread the per-record source URL onto the sampled rows so the PREVIEW
         # matches the COMMIT (the same invariant the URL persistence keeps): the
         # discovered-types card + sample rows show the `source_url` citation column
         # the ingest will mint. No-op when the provider supplied no provenance.
-        _attach_source_urls(sample.rows, getattr(sample, "provenance", None) or {})
+        if sample_rows:
+            _attach_source_urls(
+                sample_rows, getattr(sample, "provenance", None) or {}
+            )
 
         # 3. Estimate the DISCOVERED ontology shape from the sample — run the same
         #    multi-type + relationship extractor the commit will, so the plan card
-        #    shows the LIKELY types/edges the ingest will mint (not a flat
-        #    mapping). It's an estimate from the small sample, not a guarantee:
-        #    the full commit may surface more types/edges or differ in detail.
-        est_total = sample.estimated_total or len(sample.rows)
+        #    shows the LIKELY types/edges the ingest will mint (not a flat mapping).
+        #    It's an estimate from the small sample, not a guarantee: the full
+        #    commit may surface more types/edges or differ in detail. Bounded by
+        #    _SHAPE_BUDGET_S — the extraction LLM's own timeout (60s) is longer than
+        #    the whole request budget — and degraded to a flat preview on timeout /
+        #    error / no sample so the plan stays confirmable.
+        est_total = (
+            (getattr(sample, "estimated_total", 0) or len(sample_rows))
+            if sample is not None
+            else 0
+        )
         cap = _DEFAULT_PLAN_CAP
         cost = _estimate_cost(provider, est_total, cap)
-        resolver = _build_resolver(ctx)
-        try:
-            existing_types, _existing_attrs = await resolver._fetch_ontology(
-                tenant_graph_uri(ctx.tenant_id)
-            )
-            shape = await _preview_shape(
-                resolver, sample.rows, set(existing_types.keys())
-            )
-        except Exception:  # noqa: BLE001 — preview must NEVER 500 the turn
-            logger.warning("web_ingest_preview_failed", exc_info=True)
+        shape = None
+        if sample_rows:
+            resolver = _build_resolver(ctx)
+
+            async def _estimate_shape():
+                existing_types, _existing_attrs = await resolver._fetch_ontology(
+                    tenant_graph_uri(ctx.tenant_id)
+                )
+                return await _preview_shape(
+                    resolver, sample_rows, set(existing_types.keys())
+                )
+
+            try:
+                shape = await asyncio.wait_for(
+                    _estimate_shape(), timeout=_SHAPE_BUDGET_S
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "web_ingest_preview_timeout",
+                    query=query,
+                    budget_s=_SHAPE_BUDGET_S,
+                )
+            except Exception:  # noqa: BLE001 — preview must NEVER 500 the turn
+                logger.warning("web_ingest_preview_failed", exc_info=True)
+        if shape is None:
+            # No usable sample, or the shape estimate timed out / failed → a flat
+            # single-type preview keeps the plan card confirmable.
+            preview_degraded = True
             shape = _flat_shape(type_name, attributes, set())
         discovered_types = shape["discovered_types"]
         relationships = shape["relationships"]
@@ -247,15 +315,13 @@ class WebIngestCapability:
             ),
             confidence=0.7,
             preview={
-                "summary": (
-                    f"Estimated ~{len(discovered_types)} type(s) and "
-                    f"{len(relationships)} relationship(s) from a sample (the "
-                    f"full pull may differ); capped at {cap}, staged for review."
+                "summary": _preview_summary(
+                    discovered_types, relationships, cap, degraded=preview_degraded
                 ),
                 "discovered_types": discovered_types,
                 "relationships": relationships,
-                "sample_rows": sample.rows[:_PREVIEW_SAMPLE],
-                "sources": sample.sources[:_PREVIEW_SOURCES],
+                "sample_rows": sample_rows[:_PREVIEW_SAMPLE],
+                "sources": sample_sources[:_PREVIEW_SOURCES],
                 "estimated_total": est_total,
                 "cost_estimate": cost.get("note", ""),
             },
@@ -520,7 +586,11 @@ async def _resolve_spec(ctx: AgentContext, instruction: str) -> dict:
                 model=PRIMARY_MODEL,
                 temperature=0,
                 max_tokens=400,
-                timeout=30,
+                # Kept well under the preview budget: this small spec call runs
+                # BEFORE the sample fetch, so a slow one eats the sample's time.
+                # On timeout _resolve_spec degrades to the minimal spec (→ clarify),
+                # never 500s.
+                timeout=15,
             )
             parsed = _parse_json_object(text)
             if parsed:
@@ -639,6 +709,33 @@ async def _preview_shape(
         relationships.append({"source": src, "predicate": r.predicate, "target": tgt})
 
     return {"discovered_types": discovered, "relationships": relationships}
+
+
+def _preview_summary(
+    discovered_types: list[dict],
+    relationships: list[dict],
+    cap: int,
+    *,
+    degraded: bool,
+) -> str:
+    """The plan-card summary line.
+
+    Normal path: frame the discovered types/edges as an ESTIMATE from the sample
+    (only the column projection is stable preview→commit). Degraded path: the live
+    preview couldn't render within the request budget (a slow/broad web source), so
+    say that plainly and make clear the FULL discovery still runs on confirm — the
+    user gets a confirmable plan instead of a timeout."""
+    if degraded:
+        return (
+            "Couldn't fully preview this within the time limit — confirm to run "
+            f"the full discovery in the background, capped at {cap} and staged for "
+            "review."
+        )
+    return (
+        f"Estimated ~{len(discovered_types)} type(s) and "
+        f"{len(relationships)} relationship(s) from a sample (the full pull may "
+        f"differ); capped at {cap}, staged for review."
+    )
 
 
 def _flat_shape(
