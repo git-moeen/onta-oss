@@ -10,6 +10,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # Scratch Postgres with the pgvector extension for the DSN-gated semantic
+    # index integration tests (ONTA-176). The main pytest step deliberately
+    # does NOT get the DSN (the PostGIS-gated spatiotemporal test would fail —
+    # this image has no PostGIS); a dedicated step below exports it for the
+    # semantic test files only.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +50,20 @@ jobs:
         env:
           OMNIX_API_KEYS: '{"test-key": "test-tenant"}'
           OMNIX_NEPTUNE_ENDPOINT: "http://fake-neptune:8182"
+          PYTHONPATH: ${{ github.workspace }}
+
+      # DSN-gated pgvector integration tests (ONTA-176): re-run the semantic
+      # test files with the service-container DSN so the live-Postgres tests
+      # (skipped above) execute. Kept as a separate step so the DSN never
+      # reaches tests that need other extensions (e.g. PostGIS).
+      - name: Run semantic pgvector integration tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/test_semantic_postgres.py tests/test_semantic_parity.py -v --tb=short
+        env:
+          OMNIX_API_KEYS: '{"test-key": "test-tenant"}'
+          OMNIX_NEPTUNE_ENDPOINT: "http://fake-neptune:8182"
+          OMNIX_DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/postgres"
           PYTHONPATH: ${{ github.workspace }}
 
   # TS SDK (packages/cograph) — typecheck, build, and unit tests (vitest).

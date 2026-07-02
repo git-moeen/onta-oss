@@ -12,8 +12,9 @@ Public surface:
 * models: :class:`SemanticChunk`, :class:`SemanticHit`,
   :class:`SemanticSearchResult`, ``ChunkKey``
 * protocol: :class:`SemanticIndex`
-* backend: :class:`InMemorySemanticIndex` (zero-config default; the durable
-  pgvector adapter is ONTA-176)
+* backends: :class:`InMemorySemanticIndex` (zero-config default),
+  :class:`PostgresSemanticIndex` (durable pgvector adapter over a generic
+  Postgres DSN, ONTA-176 — imported lazily, see ``__getattr__`` below)
 * extraction: :func:`extract_semantic_chunks`, :func:`chunk_text`,
   :func:`canonicalize_values`, :func:`content_hash`,
   ``MAX_CHUNKS_PER_ENTITY``
@@ -52,6 +53,7 @@ __all__ = [
     "SemanticSearchResult",
     "SemanticIndex",
     "InMemorySemanticIndex",
+    "PostgresSemanticIndex",
     "MAX_CHUNKS_PER_ENTITY",
     "canonicalize_values",
     "chunk_text",
@@ -62,3 +64,14 @@ __all__ = [
     "register_semantic_index",
     "reset_semantic_index",
 ]
+
+
+def __getattr__(name: str):
+    # Lazy re-export so `from cograph_client.semantic import
+    # PostgresSemanticIndex` works without importing asyncpg/pgvector eagerly
+    # (mirrors cograph_client.spatiotemporal's PostGIS lazy export).
+    if name == "PostgresSemanticIndex":
+        from cograph_client.semantic.postgres import PostgresSemanticIndex as _PG
+
+        return _PG
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

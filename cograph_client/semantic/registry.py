@@ -3,9 +3,11 @@
 Mirrors ``spatiotemporal/registry.py`` (itself the ``register_job_backend`` /
 ``make_job_store`` pattern):
 
-* :func:`make_semantic_index` is the **factory** — today it returns the
-  zero-config :class:`InMemorySemanticIndex` unconditionally; the durable
-  pgvector branch lands with ONTA-176 (see the TODO seam in the function).
+* :func:`make_semantic_index` is the **factory** — it selects a backend from
+  configuration: the durable pgvector-backed
+  :class:`~cograph_client.semantic.postgres.PostgresSemanticIndex` when
+  ``settings.database_url`` is set (ONTA-176), else the zero-config
+  :class:`InMemorySemanticIndex`.
 * :func:`register_semantic_index` lets a premium/alternate backend override the
   process-wide instance (same plugin style as ``register_governance_panel`` /
   ``register_adapter``). Pass ``None`` to clear it.
@@ -19,6 +21,7 @@ from typing import Optional
 
 import structlog
 
+from cograph_client.config import settings
 from cograph_client.semantic.memory import InMemorySemanticIndex
 from cograph_client.semantic.protocol import SemanticIndex
 
@@ -31,19 +34,17 @@ _default: Optional[SemanticIndex] = None
 def make_semantic_index() -> SemanticIndex:
     """Select the semantic index backend from configuration.
 
-    Returns the zero-config :class:`InMemorySemanticIndex` unconditionally for
-    now — there is no durable backend yet. Never touches the network.
-
-    TODO(ONTA-176): when the pgvector adapter lands, branch here exactly like
-    ``make_spatiotemporal_index`` does — a durable backend when
-    ``settings.database_url`` is set (imported lazily so OSS installs without
-    a DSN never import asyncpg paths), else the in-memory default::
-
-        if settings.database_url:
-            from cograph_client.semantic.postgres import PostgresSemanticIndex
-
-            return PostgresSemanticIndex()
+    Returns a :class:`~cograph_client.semantic.postgres.PostgresSemanticIndex`
+    when ``settings.database_url`` is set (durable, shared across tasks —
+    pool/DDL created lazily on first use), else the zero-config
+    :class:`InMemorySemanticIndex`. Never touches the network.
     """
+    if settings.database_url:
+        # Imported lazily so OSS installs without a DSN never import
+        # asyncpg/pgvector paths (mirrors make_spatiotemporal_index).
+        from cograph_client.semantic.postgres import PostgresSemanticIndex
+
+        return PostgresSemanticIndex()
     return InMemorySemanticIndex()
 
 
