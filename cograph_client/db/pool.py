@@ -78,6 +78,18 @@ def register_pool_init(hook: Callable[[Any], Awaitable[None]]) -> None:
     the expiry properly awaited and deterministic: a pool can only be obtained
     through ``get_pg_pool``, so every consumer that acquires after this call
     sees hook-initialized connections.
+
+    Contract — register hooks BEFORE the first pool acquisition for a DSN.
+    The late-registration repair above only reaches pools whose DSN is
+    RE-REQUESTED through ``get_pg_pool``: consumers that cache the pool object
+    (both current consumers do — ``spatiotemporal/postgis.py`` and the
+    semantic index backend keep the pool on ``self``) never re-enter
+    ``get_pg_pool``, so a hook registered after such a consumer grabbed its
+    pool only takes effect on that pool if some other caller asks for the same
+    DSN again. The no-mixed-pool guarantee is therefore per-DSN and holds only
+    via ``get_pg_pool`` re-entry. Both current consumers register their hooks
+    before any acquisition, so this is a documented constraint today, not a
+    live gap — but new consumers must follow it.
     """
     _init_hooks.append(hook)
 
@@ -89,6 +101,14 @@ async def _expire_if_hooks_changed(dsn: str, pool: Any) -> None:
     ``get_pg_pool`` call retries rather than silently leaving a mixed pool."""
     if _pool_hook_counts.get(dsn) == len(_init_hooks):
         return
+    # Capture the hook count BEFORE the (potentially suspending) expire: a hook
+    # registered while ``expire_connections`` is being awaited must NOT be
+    # marked synchronized by this call. Recording the pre-await snapshot means
+    # the next ``get_pg_pool`` still sees a mismatch and expires again for the
+    # mid-expire hook. Real asyncpg's expire body never suspends today, so this
+    # is hardening against a future asyncpg (or a test fake) whose expiry
+    # actually yields.
+    count = len(_init_hooks)
     try:
         result = pool.expire_connections()
         if inspect.isawaitable(result):
@@ -96,7 +116,7 @@ async def _expire_if_hooks_changed(dsn: str, pool: Any) -> None:
     except Exception:  # noqa: BLE001 — retried on the next get_pg_pool call
         logger.warning("pg_pool_expire_failed", exc_info=True)
         return
-    _pool_hook_counts[dsn] = len(_init_hooks)
+    _pool_hook_counts[dsn] = count
 
 
 async def get_pg_pool(dsn: str) -> Any:

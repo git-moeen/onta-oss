@@ -1320,13 +1320,37 @@ export interface ConflictReview {
 
 // --- Recurring schedules (COG-135) ------------------------------------------- #
 
-/** The action a {@link Schedule} fires — mirrors the Ask-AI action endpoints:
- *  find-merge-duplicates (dedupe), enrich (enrichment), suggest-relationships
- *  (reconciliation). A schedule's `category` agrees with its `action`. */
-export type ScheduleAction =
+/** Actions a tenant may CREATE or UPDATE through the schedules CRUD routes —
+ *  mirrors the Ask-AI action endpoints: find-merge-duplicates (dedupe), enrich
+ *  (enrichment), suggest-relationships (reconciliation). A schedule's
+ *  `category` agrees with its `action`. The backend rejects any other action
+ *  on create/update with a 422 — see {@link ScheduleAction} for the
+ *  system-managed values that can still APPEAR in list/get responses. */
+export type UserSchedulableAction =
   | "find-merge-duplicates"
   | "enrich"
   | "suggest-relationships";
+
+/** The action a {@link Schedule} fires — the FULL read-side vocabulary, a
+ *  superset of {@link UserSchedulableAction}. `semantic-embed-fill` /
+ *  `semantic-reconcile` (ONTA-181) are SYSTEM-MANAGED semantic-index
+ *  maintenance rows the backend creates internally; they show up in a tenant's
+ *  schedule list/get responses, but create/update accept only the
+ *  user-schedulable subset (422 otherwise) and PATCHing a system row is a 403.
+ *  Exhaustive consumers of `Schedule.action` must handle all five arms. */
+export type ScheduleAction =
+  | UserSchedulableAction
+  | "semantic-embed-fill"
+  | "semantic-reconcile";
+
+/** Runtime companion of {@link UserSchedulableAction} (e.g. for building a
+ *  create-schedule action picker) — mirrors the backend's
+ *  `USER_SCHEDULABLE_ACTIONS` allowlist in `scheduling/models.py`. */
+export const USER_SCHEDULABLE_ACTIONS: readonly UserSchedulableAction[] = [
+  "find-merge-duplicates",
+  "enrich",
+  "suggest-relationships",
+] as const;
 
 /**
  * A recurring-action schedule for a tenant's KG (COG-135). Recurs on EXACTLY
@@ -1601,14 +1625,18 @@ export class RawApi {
     return this.client.requestRaw("GET", this.client.pSchedules(), init);
   }
 
-  /** `POST /graphs/{tenant}/schedules` — create a recurring schedule. Body
+  /** `POST /graphs/{tenant}/schedules` — create a recurring schedule. The
+   *  body's `action` must be a {@link UserSchedulableAction} (the backend
+   *  answers 422 for system-managed actions). Body
    *  `{kg_name, category, action, params?, cron?|interval_seconds, enabled?}`. */
   createSchedule(body: unknown, init?: RawInit): Promise<Response> {
     return this.client.requestRaw("POST", this.client.pSchedules(), { body, ...init });
   }
 
   /** `PATCH /graphs/{tenant}/schedules/{id}` — enable/disable or update a
-   *  schedule. Only provided fields change. */
+   *  schedule. Only provided fields change. System-managed rows (a
+   *  non-{@link UserSchedulableAction} `action`, e.g. `semantic-reconcile`)
+   *  reject every PATCH with 403. */
   updateSchedule(id: string, body: unknown, init?: RawInit): Promise<Response> {
     return this.client.requestRaw("PATCH", this.client.pSchedule(id), { body, ...init });
   }

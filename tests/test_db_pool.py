@@ -114,6 +114,66 @@ async def test_late_hook_expires_existing_pools(fresh):
     assert pool.expired == 1
 
 
+class SuspendingFakePool(FakePool):
+    """A pool whose ``expire_connections`` SUSPENDS mid-body on an event.
+
+    Real asyncpg's expire body never suspends today; this models a future
+    asyncpg (or any awaitable-returning fake) whose expiry yields, to pin the
+    hardening in ``_expire_if_hooks_changed``: the hook count is captured
+    BEFORE the await, so a hook registered while the expiry is suspended is
+    not silently marked synchronized.
+    """
+
+    def __init__(self, dsn, init):
+        super().__init__(dsn, init)
+        self.entered = asyncio.Event()  # set when expire_connections starts
+        self.gate = asyncio.Event()     # test releases the suspended expiry
+
+    async def expire_connections(self):
+        self.entered.set()
+        await self.gate.wait()
+        self.expired += 1
+
+
+async def test_hook_registered_mid_expire_still_triggers_later_expiry(monkeypatch, fresh):
+    """The hook count is snapshotted BEFORE the awaited expiry (FIX: ONTA-173).
+
+    If the count were recorded as ``len(_init_hooks)`` AFTER the await, a hook
+    registered while ``expire_connections`` was suspended would be marked
+    synchronized without any expiry having run for it — its codec would never
+    reach already-pooled connections. Recording the pre-await snapshot keeps
+    the next ``get_pg_pool`` call seeing a mismatch and expiring again.
+    """
+    import asyncpg
+
+    async def create_suspending(*, dsn, init=None):
+        return SuspendingFakePool(dsn, init)
+
+    monkeypatch.setattr(asyncpg, "create_pool", create_suspending)
+    pool = await get_pg_pool("postgres://u@h/db")
+
+    async def hook_a(conn):  # pragma: no cover - never invoked here
+        pass
+
+    async def hook_b(conn):  # pragma: no cover - never invoked here
+        pass
+
+    register_pool_init(hook_a)  # pool synchronized at 0 hooks → mismatch
+    task = asyncio.create_task(get_pg_pool("postgres://u@h/db"))
+    await pool.entered.wait()   # the expiry for hook_a is suspended mid-body
+    register_pool_init(hook_b)  # arrives DURING the in-flight expiry
+    pool.gate.set()
+    assert (await task) is pool
+    assert pool.expired == 1
+    # hook_b must still force one more expiry: the completed expire recorded
+    # the PRE-await snapshot (1 hook), not the post-await len (2).
+    await get_pg_pool("postgres://u@h/db")
+    assert pool.expired == 2
+    # ...and then it settles (no further churn once synchronized at 2).
+    await get_pg_pool("postgres://u@h/db")
+    assert pool.expired == 2
+
+
 async def test_close_pg_pools_closes_and_forgets(fresh):
     pool = await get_pg_pool("postgres://u@h/db")
     await close_pg_pools()

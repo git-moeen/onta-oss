@@ -42,6 +42,31 @@ ScheduleAction = Literal[
     "semantic-reconcile",
 ]
 
+#: Actions a TENANT may create/update through the schedules CRUD routes
+#: (``api/routes/schedules.py``). WHY this is a strict subset of
+#: :data:`ScheduleAction`: the semantic maintenance actions are SYSTEM-MANAGED.
+#: Their rows are created internally by ``semantic/reconciler.py`` straight
+#: through the store (deterministic ids, platform-tuned cadence), never via the
+#: tenant-facing routes, and letting a tenant mint them would be a
+#: cross-tenant + lifecycle hazard:
+#:
+#: * ``semantic-embed-fill`` dispatches the GLOBAL embed sweep
+#:   (``run_embed_fill_sweep`` -> ``fetch_pending(tenant_id=None)`` — no tenant
+#:   scoping), so a tenant-created row would run work spanning EVERY tenant at
+#:   a tenant-chosen cadence;
+#: * ``semantic-reconcile`` rows minted via the routes would carry random uuid
+#:   ids, which the KG-delete cleanup (keyed on the deterministic
+#:   ``semantic-reconcile:{tenant}:{kg}`` id) never removes — orphaned rows
+#:   that keep firing against a deleted KG.
+#:
+#: The store / runner / dispatch layers keep accepting the full
+#: ``ScheduleAction`` vocabulary; only the tenant-facing request models narrow
+#: to this set (422 otherwise), and the update route refuses to modify rows
+#: whose action lies outside it (403).
+USER_SCHEDULABLE_ACTIONS: frozenset[str] = frozenset(
+    {"find-merge-duplicates", "enrich", "suggest-relationships"}
+)
+
 
 class Schedule(BaseModel):
     """A recurring action definition for a tenant's KG.

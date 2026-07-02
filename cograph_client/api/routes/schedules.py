@@ -3,7 +3,9 @@
 Recurring-action schedules for a tenant: create / list / get / update / delete.
 A schedule describes a recurring action (find-merge-duplicates, enrich,
 suggest-relationships) over a KG and recurs on a cron expression OR a fixed
-interval. This is the DATA SEAM only — these routes persist schedules and
+interval. Create/update only accept the USER_SCHEDULABLE_ACTIONS subset of the
+schedule vocabulary — the semantic maintenance actions are system-managed rows
+the reconciler creates internally (see scheduling/models.py for the WHY). This is the DATA SEAM only — these routes persist schedules and
 compute their initial/updated ``next_run``; the firing loop that turns due
 schedules into jobs is a separate task and lives elsewhere.
 
@@ -19,18 +21,41 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
 from cograph_client.api.deps import get_schedule_store
 from cograph_client.auth.api_keys import TenantContext, get_tenant
 from cograph_client.enrichment.models import JobCategory
-from cograph_client.scheduling.models import Schedule, ScheduleAction
+from cograph_client.scheduling.models import (
+    USER_SCHEDULABLE_ACTIONS,
+    Schedule,
+    ScheduleAction,
+)
 from cograph_client.scheduling.next_run import compute_next_run
 
 router = APIRouter(prefix="/graphs/{tenant}/schedules")
 
 
 # --- Request bodies -----------------------------------------------------------
+
+
+def _require_user_schedulable(action: Optional[str]) -> Optional[str]:
+    """Reject system-managed actions on the tenant-facing request models.
+
+    ``ScheduleAction`` is the FULL vocabulary the store/runner understand, but
+    the semantic maintenance actions are system-managed rows created internally
+    by ``semantic/reconciler.py`` — see ``USER_SCHEDULABLE_ACTIONS`` in
+    ``scheduling/models.py`` for why tenants must not mint them (global
+    cross-tenant sweep cadence; uuid rows that KG-delete cleanup never removes).
+    Raising ``ValueError`` here surfaces as a standard 422 on the request body.
+    """
+    if action is not None and action not in USER_SCHEDULABLE_ACTIONS:
+        raise ValueError(
+            f"action '{action}' is system-managed (its schedule rows are "
+            "created and tuned by the platform, not via this API); "
+            f"user-schedulable actions: {sorted(USER_SCHEDULABLE_ACTIONS)}"
+        )
+    return action
 
 
 class ScheduleCreateRequest(BaseModel):
@@ -41,6 +66,11 @@ class ScheduleCreateRequest(BaseModel):
     cron: Optional[str] = None
     interval_seconds: Optional[int] = None
     enabled: bool = True
+
+    @field_validator("action")
+    @classmethod
+    def _action_user_schedulable(cls, v: str) -> str:
+        return _require_user_schedulable(v)  # type: ignore[return-value]
 
 
 class ScheduleUpdateRequest(BaseModel):
@@ -58,6 +88,11 @@ class ScheduleUpdateRequest(BaseModel):
     cron: Optional[str] = None
     interval_seconds: Optional[int] = None
     enabled: Optional[bool] = None
+
+    @field_validator("action")
+    @classmethod
+    def _action_user_schedulable(cls, v: Optional[str]) -> Optional[str]:
+        return _require_user_schedulable(v)
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -154,10 +189,29 @@ async def update_schedule(
 
     Only provided fields change. If the recurrence (``cron``/
     ``interval_seconds``) changes, ``next_run`` is recomputed from now.
+
+    System-managed rows (action outside ``USER_SCHEDULABLE_ACTIONS`` — the
+    per-KG ``semantic-reconcile:{tenant}:{kg}`` rows the reconciler auto-creates
+    carry the caller's tenant_id, so they ARE reachable here) are tenant-visible
+    but not tenant-tunable: every PATCH to such a row is rejected with 403.
+    Rejecting wholesale (rather than field-by-field) keeps the policy simple and
+    airtight — cadence/action/params are platform-owned (the reconciler re-tunes
+    them from env knobs), and even an ``enabled`` flip would silently switch off
+    index maintenance while the row still looks healthy. The 403 (vs 404) is
+    deliberate: the row is visible via GET/list, so pretending it doesn't exist
+    would be misleading.
     """
     existing = await store.get(schedule_id)
     if existing is None or existing.tenant_id != tenant.tenant_id:
         raise HTTPException(status_code=404, detail="schedule not found")
+    if existing.action not in USER_SCHEDULABLE_ACTIONS:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"schedule '{schedule_id}' is system-managed (action "
+                f"'{existing.action}') and cannot be modified via this API"
+            ),
+        )
 
     updates = body.model_dump(exclude_unset=True)
     recurrence_changed = "cron" in updates or "interval_seconds" in updates
@@ -189,7 +243,14 @@ async def delete_schedule(
     tenant: TenantContext = Depends(get_tenant),
     store=Depends(get_schedule_store),
 ):
-    """Delete a schedule (scoped to the authorized tenant)."""
+    """Delete a schedule (scoped to the authorized tenant).
+
+    Deleting a system-managed semantic row (action outside
+    ``USER_SCHEDULABLE_ACTIONS``) is allowed but is NOT a durable opt-out: the
+    reconciler's ensure-* hooks recreate the row on the next KG write or
+    reindex request. Disabling semantic maintenance is done via its feature
+    flag, not by deleting rows.
+    """
     existing = await store.get(schedule_id)
     if existing is None or existing.tenant_id != tenant.tenant_id:
         raise HTTPException(status_code=404, detail="schedule not found")
