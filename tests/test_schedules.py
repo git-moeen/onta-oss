@@ -397,6 +397,167 @@ def test_route_create_rejects_both_recurrences(client, auth_headers):
     assert r.status_code == 422
 
 
+def test_route_create_rejects_system_managed_actions(client, auth_headers):
+    """ONTA-173: 'semantic-embed-fill' / 'semantic-reconcile' are system-managed.
+
+    They are valid ScheduleAction members (the store/runner dispatch them) but
+    must not be creatable through the tenant-facing routes — the embed sweep is
+    GLOBAL (fetch_pending(tenant_id=None)) and route-minted reconcile rows get
+    uuid ids the KG-delete cleanup never removes.
+    """
+    from cograph_client.config import settings
+
+    settings.database_url = ""
+    for action in ("semantic-embed-fill", "semantic-reconcile"):
+        r = client.post(
+            "/graphs/test-tenant/schedules",
+            headers=auth_headers,
+            json={
+                "kg_name": "kg",
+                "category": "reconciliation",
+                "action": action,
+                "interval_seconds": 3600,
+            },
+        )
+        assert r.status_code == 422, r.text
+        assert "system-managed" in r.text
+
+
+def test_route_create_accepts_all_user_schedulable_actions(client, auth_headers):
+    """The three user-schedulable actions still work end-to-end (create → get
+    → patch → delete)."""
+    from cograph_client.config import settings
+
+    settings.database_url = ""
+    for action, category in (
+        ("find-merge-duplicates", "dedupe"),
+        ("enrich", "enrichment"),
+        ("suggest-relationships", "reconciliation"),
+    ):
+        r = client.post(
+            "/graphs/test-tenant/schedules",
+            headers=auth_headers,
+            json={
+                "kg_name": "kg",
+                "category": category,
+                "action": action,
+                "interval_seconds": 3600,
+            },
+        )
+        assert r.status_code == 201, r.text
+        sid = r.json()["id"]
+        assert r.json()["action"] == action
+        got = client.get(f"/graphs/test-tenant/schedules/{sid}", headers=auth_headers)
+        assert got.status_code == 200
+        patched = client.patch(
+            f"/graphs/test-tenant/schedules/{sid}",
+            headers=auth_headers,
+            json={"enabled": False},
+        )
+        assert patched.status_code == 200
+        assert patched.json()["enabled"] is False
+        deleted = client.delete(
+            f"/graphs/test-tenant/schedules/{sid}", headers=auth_headers
+        )
+        assert deleted.status_code == 204
+
+
+def _seed_system_reconcile_row(app) -> Schedule:
+    """Put an auto-created-style semantic-reconcile row (deterministic id,
+    real tenant_id — exactly what semantic/reconciler.py mints via the store)
+    into the app's schedule store, bypassing the routes like the reconciler
+    does."""
+    store = InMemoryScheduleStore()
+    app.state.schedule_store = store
+    row = Schedule(
+        id="semantic-reconcile:test-tenant:kg",
+        tenant_id="test-tenant",
+        kg_name="kg",
+        category=JobCategory.reconciliation,
+        action="semantic-reconcile",
+        interval_seconds=900,
+        enabled=True,
+        created_at=datetime.now(timezone.utc),
+    )
+    asyncio.run(store.create(row))
+    return row
+
+
+def test_route_update_rejects_system_managed_row(app, client, auth_headers):
+    """Every PATCH to a system-managed row is a 403 — cadence, action flips,
+    even an enabled toggle (silently pausing index maintenance)."""
+    from cograph_client.config import settings
+
+    settings.database_url = ""
+    row = _seed_system_reconcile_row(app)
+    # The row IS tenant-visible (list + get) — 403 on PATCH, not a hidden 404.
+    listing = client.get("/graphs/test-tenant/schedules", headers=auth_headers).json()
+    assert any(s["id"] == row.id for s in listing)
+    for body in (
+        {"interval_seconds": 5},          # tenant-tuned cadence on a global duty
+        {"action": "enrich"},             # flipping a system row to a user action
+        {"enabled": False},               # silent maintenance opt-out
+        {"params": {"anything": True}},
+    ):
+        r = client.patch(
+            f"/graphs/test-tenant/schedules/{row.id}",
+            headers=auth_headers,
+            json=body,
+        )
+        assert r.status_code == 403, (body, r.text)
+        assert "system-managed" in r.text
+    # And the untouched row still has its original cadence.
+    got = client.get(
+        f"/graphs/test-tenant/schedules/{row.id}", headers=auth_headers
+    ).json()
+    assert got["interval_seconds"] == 900
+    assert got["enabled"] is True
+
+
+def test_route_update_rejects_flipping_user_row_to_system_action(client, auth_headers):
+    """PATCHing a user row's action TO a system-managed value is a 422 (body
+    validator) — a tenant must not convert an ordinary row into a semantic
+    maintenance row."""
+    from cograph_client.config import settings
+
+    settings.database_url = ""
+    created = client.post(
+        "/graphs/test-tenant/schedules",
+        headers=auth_headers,
+        json={
+            "kg_name": "kg",
+            "category": "enrichment",
+            "action": "enrich",
+            "interval_seconds": 3600,
+        },
+    ).json()
+    r = client.patch(
+        f"/graphs/test-tenant/schedules/{created['id']}",
+        headers=auth_headers,
+        json={"action": "semantic-reconcile"},
+    )
+    assert r.status_code == 422, r.text
+    assert "system-managed" in r.text
+
+
+def test_route_delete_system_managed_row_allowed(app, client, auth_headers):
+    """DELETE of a system row is deliberately allowed (documented as NOT a
+    durable opt-out — the reconciler's ensure-* hooks recreate it on the next
+    KG write / reindex)."""
+    from cograph_client.config import settings
+
+    settings.database_url = ""
+    row = _seed_system_reconcile_row(app)
+    r = client.delete(
+        f"/graphs/test-tenant/schedules/{row.id}", headers=auth_headers
+    )
+    assert r.status_code == 204
+    missing = client.get(
+        f"/graphs/test-tenant/schedules/{row.id}", headers=auth_headers
+    )
+    assert missing.status_code == 404
+
+
 def test_route_get_patch_delete(client, auth_headers):
     from cograph_client.config import settings
 

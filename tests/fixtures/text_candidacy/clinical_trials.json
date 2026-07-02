@@ -1,0 +1,153 @@
+{
+  "description": "Clinical trial registry shape: brief_summary is unambiguous long prose (auto tier, recording carries no field for it) while eligibility_criteria sits in the ambiguous band and is marked only because the recording adjudicated it free_text.",
+  "headers": [
+    "nct_id",
+    "brief_summary",
+    "eligibility_criteria",
+    "enrollment"
+  ],
+  "rows": [
+    {
+      "nct_id": "NCT0031200",
+      "brief_summary": "This randomized double-blind study evaluates whether a twelve week course of the investigational compound reduces fasting glucose in adults with newly diagnosed type 2 diabetes compared with placebo.",
+      "eligibility_criteria": "Adults aged 18 to 65 with confirmed type 2 diabetes and no prior insulin use",
+      "enrollment": "40"
+    },
+    {
+      "nct_id": "NCT0031201",
+      "brief_summary": "A multicenter open-label extension assessing the long term safety and tolerability of the study drug in participants who completed the parent protocol without serious adverse events over two years.",
+      "eligibility_criteria": "Completed the parent study and remained free of serious adverse events",
+      "enrollment": "65"
+    },
+    {
+      "nct_id": "NCT0031202",
+      "brief_summary": "This phase two crossover trial measures changes in six minute walk distance among adults with pulmonary arterial hypertension receiving the inhaled formulation alongside standard background therapy.",
+      "eligibility_criteria": "Diagnosed pulmonary arterial hypertension in functional class two or three",
+      "enrollment": "90"
+    },
+    {
+      "nct_id": "NCT0031203",
+      "brief_summary": "An observational cohort following patients after coronary stent placement to quantify the incidence of late stent thrombosis under three different antiplatelet regimens in routine clinical practice.",
+      "eligibility_criteria": "Coronary stent placed within the past thirty days at a participating site",
+      "enrollment": "115"
+    },
+    {
+      "nct_id": "NCT0031204",
+      "brief_summary": "This dose escalation study identifies the maximum tolerated dose of the oral kinase inhibitor in patients with relapsed solid tumors who have exhausted at least two prior lines of systemic therapy.",
+      "eligibility_criteria": "Relapsed solid tumor after at least two prior lines of systemic therapy",
+      "enrollment": "140"
+    },
+    {
+      "nct_id": "NCT0031205",
+      "brief_summary": "A pragmatic cluster randomized trial testing whether pharmacist led medication reviews in primary care reduce unplanned hospital admissions among adults taking ten or more chronic medications.",
+      "eligibility_criteria": "Community dwelling adults prescribed ten or more chronic medications",
+      "enrollment": "165"
+    },
+    {
+      "nct_id": "NCT0031206",
+      "brief_summary": "This single arm pilot evaluates the feasibility of a home based telerehabilitation program delivered by tablet for stroke survivors discharged within the previous ninety days from inpatient care.",
+      "eligibility_criteria": "Stroke within ninety days and discharged home with tablet internet access",
+      "enrollment": "190"
+    },
+    {
+      "nct_id": "NCT0031207",
+      "brief_summary": "A double blind placebo controlled study of a monoclonal antibody for moderate to severe atopic dermatitis measuring change in eczema area and severity index score at week sixteen from baseline.",
+      "eligibility_criteria": "Moderate to severe atopic dermatitis inadequately controlled by topicals",
+      "enrollment": "215"
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "trial",
+          "type_name": "ClinicalTrial",
+          "key_strategy": "column",
+          "key_columns": [
+            "nct_id"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "nct_id",
+          "role": "key",
+          "entity": "trial",
+          "predicate_or_attr": "nct_id"
+        },
+        {
+          "column": "brief_summary",
+          "role": "attribute",
+          "entity": "trial",
+          "predicate_or_attr": "brief_summary"
+        },
+        {
+          "column": "eligibility_criteria",
+          "role": "attribute",
+          "entity": "trial",
+          "predicate_or_attr": "eligibility_criteria",
+          "text_kind": "free_text",
+          "why": "free-running inclusion prose"
+        },
+        {
+          "column": "enrollment",
+          "role": "attribute",
+          "entity": "trial",
+          "predicate_or_attr": "enrollment"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "ClinicalTrial",
+    "entities": [
+      {
+        "name": "trial",
+        "type_name": "ClinicalTrial",
+        "key_strategy": "column",
+        "id_column": "nct_id",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "nct_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "nct_id",
+        "entity": "trial",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "brief_summary",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "brief_summary",
+        "entity": "trial",
+        "target_type": null,
+        "text_kind": "free_text"
+      },
+      {
+        "column_name": "eligibility_criteria",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "eligibility_criteria",
+        "entity": "trial",
+        "target_type": null,
+        "text_kind": "free_text"
+      },
+      {
+        "column_name": "enrollment",
+        "role": "attribute",
+        "datatype": "integer",
+        "attribute_name": "enrollment",
+        "entity": "trial",
+        "target_type": null,
+        "text_kind": null
+      }
+    ],
+    "relationships": null
+  }
+}

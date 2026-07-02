@@ -43,6 +43,11 @@ from cograph_client.resolver.models import (
     TypeExtension,
     ValueShape,
 )
+from cograph_client.graph.text_markers import TextCandidacy, classify_text_candidacy
+from cograph_client.graph.ontology_queries import (
+    TEXT_KIND_FREE_TEXT,
+    TEXT_KIND_NOT_TEXT,
+)
 from cograph_client.resolver.llm_router import PRIMARY_MODEL, openrouter_chat
 from cograph_client.resolver.profiler import profile_table
 
@@ -221,13 +226,25 @@ NAMES / LABELS (a name is optional, not mandatory)
   or composite column as its "name", and prefer a composite/synthetic key over keying it on such a
   label. It is identified by its value + the entities it links to.
 
+FREE-TEXT ADJUDICATION (semantic-index candidacy)
+- A column whose profiled shape is "text" is a CANDIDATE for a free-text semantic index. For each such
+  candidate, judge from the column NAME plus the profile evidence whether its values are free-running
+  PROSE — descriptions, reviews, speeches, notes, transcripts, summaries. If so, add
+  "text_kind":"free_text" to that column's entry. Structured strings that merely look text-shaped —
+  postal addresses, person or organization names, titles used as labels, delimited value lists — are
+  NOT free text: set "text_kind":null EXPLICITLY (an explicit null records your decided NO durably;
+  omitting the field leaves candidacy undecided). Never emit text_kind for a column whose shape is not
+  "text". This is the ONE decision where the column name is consulted directly: the name-blind profiler
+  only proposes candidates, and the pipeline discards text_kind on any non-text-shaped column.
+
 TYPE REUSE
 - The user message lists the tenant's EXISTING ontology types. Reuse one ONLY when your entity is genuinely
   the SAME real-world concept. If none genuinely matches, propose a NEW accurate PascalCase type name —
   NEVER force-fit a different concept onto an available type just because it exists.
 
 Output strict JSON: {"entities":[{"name","type_name","key_strategy":"column|composite|synthetic","key_columns":[...],
-"why","confidence"}], "columns":[{"column","role":"attribute|relationship|key","entity","predicate_or_attr","why","confidence"}],
+"why","confidence"}], "columns":[{"column","role":"attribute|relationship|key","entity","predicate_or_attr","why","confidence",
+"text_kind":null|"free_text"}],
 "relationships":[{"subject","predicate","object","why"}]}.
 A column with role "relationship" references a shared out-of-row entity that is NOT one of your in-row
 entities: its "entity" is the in-row source, "predicate_or_attr" is the edge predicate, and it must also
@@ -458,10 +475,16 @@ For EACH column in the batch, decide:
 - entity: the NAME of the decided entity this column belongs to.
 - predicate_or_attr: a snake_case attribute name, or the edge predicate for a
   relationship (a role/verb, never the raw column name).
+- text_kind: for a column whose profiled shape is "text", set "free_text" when
+  its values are free-running PROSE (descriptions, reviews, notes, transcripts);
+  set null EXPLICITLY for structured strings (addresses, person/organization
+  names, titles used as labels — an explicit null records a decided NO, while
+  omitting the field leaves it undecided). Omit for every non-text-shaped column.
 Datatypes are derived later from the profile — do not emit them.
 Tag EVERY column in the batch exactly once. Output strict JSON ONLY:
 {"columns":[{"column","role":"attribute|relationship|key","entity",
-"predicate_or_attr","target_type":null|"<T>","why","confidence"}]}
+"predicate_or_attr","target_type":null|"<T>","why","confidence",
+"text_kind":null|"free_text"}]}
 JSON only."""
 
 COLUMN_ASSIGN_USER = """\
@@ -745,11 +768,26 @@ class CSVResolver:
             )
             extensions = _check_complete_shape(completed)
 
-        mapping = self._convert_v2(corrected, violations, profile, extensions)
+        # ONTA-177: name-blind free-text candidacy per header, computed from the
+        # same sample the profile was (profiler proposes; the REASON output's
+        # text_kind field only adjudicates WITHIN these proposals — see
+        # _decide_text_kind for the gate).
+        text_candidacy = {
+            h: classify_text_candidacy([row.get(h) for row in sample_rows])
+            for h in headers
+        }
+
+        mapping = self._convert_v2(
+            corrected, violations, profile, extensions, text_candidacy=text_candidacy,
+        )
         logger.info(
             "csv_schema_inferred_v2",
             entities=[e.type_name for e in (mapping.entities or [])],
             columns=len(mapping.columns),
+            free_text=[
+                c.column_name for c in mapping.columns
+                if c.text_kind == TEXT_KIND_FREE_TEXT
+            ],
             violations=[v.template for v in mapping.violations],
             promotions=[
                 t.type_name for t in extensions.types if t.promoted_from_attribute
@@ -938,6 +976,7 @@ class CSVResolver:
         violations: list[dict],
         profile: TableProfile,
         extensions: OntologyExtensions | None = None,
+        text_candidacy: dict[str, TextCandidacy] | None = None,
     ) -> CSVSchemaMapping:
         """Convert a (corrected) Pass B/C schema into the ``CSVSchemaMapping``
         contract consumed by ``apply_mapping`` and the web Explorer.
@@ -955,7 +994,20 @@ class CSVResolver:
         - Datatypes are derived deterministically from the Pass A value-shape
           evidence (the v2 schema carries none — the profile already measured
           the values).
+        - ``text_kind`` (ONTA-177/ONTA-173): attribute columns carry the
+          free-text candidacy verdict via :func:`_decide_text_kind` —
+          deterministic ``"free_text"`` for unambiguously long prose, the
+          REASON pass's name-informed adjudication for the ambiguous band
+          (``"free_text"``, or the durable decided-no ``"not_text"`` when the
+          pass explicitly declined), and NEVER set when the name-blind
+          classifier found the column non-text-shaped (the profiler is
+          authoritative over candidacy; an LLM-volunteered ``text_kind`` on a
+          code/number column is discarded). Relationship columns become
+          edges, not literals — no marker. Old recordings without the field
+          simply leave the ambiguous band UNDECIDED (no marker of either
+          polarity).
         """
+        text_candidacy = text_candidacy or {}
         specs: list[EntitySpec] = []
         for ent in corrected.get("entities", []):
             type_name = ent["type_name"]
@@ -1030,6 +1082,13 @@ class CSVResolver:
                 columns.append(ColumnMapping(
                     role=ColumnRole.ATTRIBUTE,
                     datatype=_datatype_from_profile(profile.column(column_name)),
+                    text_kind=_decide_text_kind(
+                        text_candidacy.get(column_name),
+                        # Sentinel default: an ABSENT field (old recording /
+                        # backfilled column) is undecided; an explicit null is
+                        # a genuine adjudicated NO (→ durable "not_text").
+                        col.get("text_kind", _TEXT_KIND_UNSET),
+                    ),
                     **shared,
                 ))
 
@@ -2005,6 +2064,51 @@ def _check_complete_shape(data: dict) -> OntologyExtensions:
             ),
         ))
     return OntologyExtensions(types=parsed)
+
+
+#: Sentinel for "the REASON/COLUMN-ASSIGN output carried NO text_kind field at
+#: all" — distinguishable from an explicit ``null``. Explicit null is a genuine
+#: adjudicated NO (the prompt mandates it for structured strings) and persists
+#: as the durable ``not_text`` marker (ONTA-173); an absent field means the
+#: model never adjudicated the column (old recordings that predate ONTA-177,
+#: or columns backfilled deterministically by the wide-table coverage repair)
+#: and MUST stay undecided.
+_TEXT_KIND_UNSET = object()
+
+
+def _decide_text_kind(
+    candidacy: TextCandidacy | None, llm_verdict: object,
+) -> str | None:
+    """Combine the name-blind candidacy proposal with the REASON pass's
+    name-informed adjudication (ONTA-177 — "profiler proposes, LLM adjudicates";
+    ONTA-173 — a decided NO persists durably):
+
+    - ``FREE_TEXT`` (unambiguously long prose) → marked deterministically; the
+      LLM output is irrelevant, so old recordings without the field still mark.
+    - ``AMBIGUOUS`` → ``"free_text"`` iff the REASON pass emitted it for the
+      column (the ONE place the column NAME is consulted — ADR 0003 keeps
+      names out of every deterministic layer); ``"not_text"`` when the pass
+      EXPLICITLY declined (the field is present but not ``"free_text"``, e.g.
+      an explicit null) — the schema pass genuinely decided, and an
+      unpersisted NO would be re-sampled by the reconciler forever and could
+      later be overruled by the name-blind auto tier; ``None`` (undecided)
+      when the field is absent (``_TEXT_KIND_UNSET``: old recordings,
+      backfilled columns the model never saw).
+    - ``NOT_CANDIDATE`` / unknown column → never marked (neither polarity),
+      even when the LLM volunteered the field: candidacy authority stays with
+      the value-shape evidence, so a hallucinated ``text_kind`` on a
+      code/number column is discarded rather than written into the ontology,
+      and non-candidates stay unmarked (the reconciler's cheap heuristic
+      re-classifies them itself).
+    """
+    if candidacy is TextCandidacy.FREE_TEXT:
+        return TEXT_KIND_FREE_TEXT
+    if candidacy is TextCandidacy.AMBIGUOUS:
+        if llm_verdict == TEXT_KIND_FREE_TEXT:
+            return TEXT_KIND_FREE_TEXT
+        if llm_verdict is not _TEXT_KIND_UNSET:
+            return TEXT_KIND_NOT_TEXT
+    return None
 
 
 def _as_violation(v: dict) -> SchemaViolation:

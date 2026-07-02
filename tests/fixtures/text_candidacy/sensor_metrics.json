@@ -1,0 +1,151 @@
+{
+  "description": "Numeric/timestamp telemetry: no column is even a candidate; a fully legacy recording round-trips with every text_kind None.",
+  "headers": [
+    "reading_id",
+    "recorded_at",
+    "temperature_c",
+    "humidity_pct"
+  ],
+  "rows": [
+    {
+      "reading_id": "RD-000",
+      "recorded_at": "2026-01-01T00:15:00",
+      "temperature_c": "18.1",
+      "humidity_pct": "40.5"
+    },
+    {
+      "reading_id": "RD-001",
+      "recorded_at": "2026-01-02T01:15:00",
+      "temperature_c": "19.2",
+      "humidity_pct": "42.5"
+    },
+    {
+      "reading_id": "RD-002",
+      "recorded_at": "2026-01-03T02:15:00",
+      "temperature_c": "20.3",
+      "humidity_pct": "44.5"
+    },
+    {
+      "reading_id": "RD-003",
+      "recorded_at": "2026-01-04T03:15:00",
+      "temperature_c": "21.4",
+      "humidity_pct": "46.5"
+    },
+    {
+      "reading_id": "RD-004",
+      "recorded_at": "2026-01-05T04:15:00",
+      "temperature_c": "22.5",
+      "humidity_pct": "48.5"
+    },
+    {
+      "reading_id": "RD-005",
+      "recorded_at": "2026-01-06T05:15:00",
+      "temperature_c": "23.6",
+      "humidity_pct": "50.5"
+    },
+    {
+      "reading_id": "RD-006",
+      "recorded_at": "2026-01-07T06:15:00",
+      "temperature_c": "24.7",
+      "humidity_pct": "52.5"
+    },
+    {
+      "reading_id": "RD-007",
+      "recorded_at": "2026-01-08T07:15:00",
+      "temperature_c": "25.8",
+      "humidity_pct": "54.5"
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "reading",
+          "type_name": "SensorReading",
+          "key_strategy": "column",
+          "key_columns": [
+            "reading_id"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "reading_id",
+          "role": "key",
+          "entity": "reading",
+          "predicate_or_attr": "reading_id"
+        },
+        {
+          "column": "recorded_at",
+          "role": "attribute",
+          "entity": "reading",
+          "predicate_or_attr": "recorded_at"
+        },
+        {
+          "column": "temperature_c",
+          "role": "attribute",
+          "entity": "reading",
+          "predicate_or_attr": "temperature_c"
+        },
+        {
+          "column": "humidity_pct",
+          "role": "attribute",
+          "entity": "reading",
+          "predicate_or_attr": "humidity_pct"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "SensorReading",
+    "entities": [
+      {
+        "name": "reading",
+        "type_name": "SensorReading",
+        "key_strategy": "column",
+        "id_column": "reading_id",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "reading_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "reading_id",
+        "entity": "reading",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "recorded_at",
+        "role": "attribute",
+        "datatype": "datetime",
+        "attribute_name": "recorded_at",
+        "entity": "reading",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "temperature_c",
+        "role": "attribute",
+        "datatype": "float",
+        "attribute_name": "temperature_c",
+        "entity": "reading",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "humidity_pct",
+        "role": "attribute",
+        "datatype": "float",
+        "attribute_name": "humidity_pct",
+        "entity": "reading",
+        "target_type": null,
+        "text_kind": null
+      }
+    ],
+    "relationships": null
+  }
+}

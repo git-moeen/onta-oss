@@ -365,6 +365,65 @@ def test_refresh_after_write_rekeys_rewritten_subjects(monkeypatch):
     asyncio.run(run())
 
 
+def test_refresh_after_write_evicts_deleted_subjects_from_semantic_index(monkeypatch):
+    """The ONTA-173 half of the _deindex_secondary seam: deletes and rewrites
+    evict semantic docs exactly like spatiotemporal rows (rewrites evict the
+    stale key; re-indexing the new key is the hook/reconciler's job). Gated:
+    with the env gate off the semantic backend must not even be touched."""
+    from cograph_client.semantic.memory import InMemorySemanticIndex
+    from cograph_client.semantic.protocol import SemanticChunk
+    from cograph_client.semantic.registry import (
+        register_semantic_index,
+        reset_semantic_index,
+    )
+
+    async def run():
+        _quiet_housekeeping(monkeypatch)
+        monkeypatch.setenv("COGRAPH_SEMANTIC_INDEX_ENABLED", "true")
+        sem = InMemorySemanticIndex()
+        register_semantic_index(sem)
+        try:
+            for uri in ("E1", "E2", "loser"):
+                await sem.upsert_chunks(
+                    [
+                        SemanticChunk(
+                            tenant_id="t",
+                            kg_name="k",
+                            entity_uri=uri,
+                            attr="desc",
+                            chunk_ix=0,
+                            chunk_text=f"text of {uri}",
+                            content_hash=f"h-{uri}",
+                        )
+                    ]
+                )
+            await refresh_after_write(
+                AsyncMock(),
+                tenant_id="t",
+                kg_name="k",
+                deleted_subjects=["E1"],
+                rewritten_subjects={"loser": "canon"},
+            )
+            remaining = {e for e, _a, _h, _at in await sem.list_docs("t", kg_name="k")}
+            assert remaining == {"E2"}
+
+            # Gate off: the backend must not be touched at all.
+            monkeypatch.delenv("COGRAPH_SEMANTIC_INDEX_ENABLED", raising=False)
+
+            class Exploding:
+                def __getattr__(self, name):
+                    raise AssertionError("semantic backend touched with gate off")
+
+            register_semantic_index(Exploding())
+            await refresh_after_write(
+                AsyncMock(), tenant_id="t", kg_name="k", deleted_subjects=["E2"]
+            )
+        finally:
+            reset_semantic_index()
+
+    asyncio.run(run())
+
+
 def test_refresh_after_write_deindex_is_noop_without_removals(monkeypatch):
     """No deleted/rewritten subjects → the derived-index step touches nothing."""
 

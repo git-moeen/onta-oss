@@ -1,0 +1,151 @@
+{
+  "description": "Ticket subject lines are text-shaped but title-like: ambiguous and unadjudicated (no field in the recording) \u2192 unmarked; the body is unambiguous prose \u2192 auto-marked.",
+  "headers": [
+    "ticket_id",
+    "subject",
+    "body",
+    "opened_at"
+  ],
+  "rows": [
+    {
+      "ticket_id": "TK-9000",
+      "subject": "Cannot log in to the billing portal after password reset",
+      "body": "After resetting my password this morning I am redirected back to the login page in an endless loop, tried three browsers and an incognito window, cleared cookies twice, and the problem persists on both my laptop and my phone.",
+      "opened_at": "2026-03-01"
+    },
+    {
+      "ticket_id": "TK-9001",
+      "subject": "Exported CSV is missing the last column of every row",
+      "body": "Every CSV exported since Tuesday drops the final column silently, the header is present but the values are gone, which broke our nightly reconciliation script and forced the finance team to re-enter figures by hand for two days.",
+      "opened_at": "2026-03-02"
+    },
+    {
+      "ticket_id": "TK-9002",
+      "subject": "Dashboard widgets render blank on the Safari browser",
+      "body": "All six dashboard widgets render as empty white cards in Safari 18 while Chrome shows them correctly, the browser console logs a cross origin font error followed by a hydration mismatch warning on every single page refresh.",
+      "opened_at": "2026-03-03"
+    },
+    {
+      "ticket_id": "TK-9003",
+      "subject": "Two factor codes arrive fifteen minutes late by SMS",
+      "body": "Our on call engineers rely on SMS two factor codes and since the weekend the codes arrive up to fifteen minutes late, by which time they have expired, locking people out during incidents and forcing password resets at 3am.",
+      "opened_at": "2026-03-04"
+    },
+    {
+      "ticket_id": "TK-9004",
+      "subject": "Invoice PDF shows the wrong currency for EU accounts",
+      "body": "Invoices generated for our European subsidiaries display amounts in dollars instead of euros even though the account currency is set correctly, accounting has flagged this as a compliance issue for the quarterly audit.",
+      "opened_at": "2026-03-05"
+    },
+    {
+      "ticket_id": "TK-9005",
+      "subject": "Search returns no results for archived project names",
+      "body": "Searching for any project that was archived before January returns an empty list although the projects are visible when I follow a direct link, so our support staff cannot locate historical tickets during customer calls.",
+      "opened_at": "2026-03-06"
+    },
+    {
+      "ticket_id": "TK-9006",
+      "subject": "Webhook retries hammer our endpoint every ten seconds",
+      "body": "Since enabling webhooks the retry policy fires every ten seconds after a single failure instead of backing off exponentially, which overwhelmed our staging endpoint and produced forty thousand duplicate events overnight.",
+      "opened_at": "2026-03-07"
+    },
+    {
+      "ticket_id": "TK-9007",
+      "subject": "Dark mode toggle resets after every single deployment",
+      "body": "The dark mode preference reverts to light theme after every deployment you ship, our whole team notices it weekly, and resetting it across dozens of saved dashboards has genuinely become a small recurring chore for everyone.",
+      "opened_at": "2026-03-08"
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "ticket",
+          "type_name": "SupportTicket",
+          "key_strategy": "column",
+          "key_columns": [
+            "ticket_id"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "ticket_id",
+          "role": "key",
+          "entity": "ticket",
+          "predicate_or_attr": "ticket_id"
+        },
+        {
+          "column": "subject",
+          "role": "attribute",
+          "entity": "ticket",
+          "predicate_or_attr": "subject"
+        },
+        {
+          "column": "body",
+          "role": "attribute",
+          "entity": "ticket",
+          "predicate_or_attr": "body"
+        },
+        {
+          "column": "opened_at",
+          "role": "attribute",
+          "entity": "ticket",
+          "predicate_or_attr": "opened_at"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "SupportTicket",
+    "entities": [
+      {
+        "name": "ticket",
+        "type_name": "SupportTicket",
+        "key_strategy": "column",
+        "id_column": "ticket_id",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "ticket_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "ticket_id",
+        "entity": "ticket",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "subject",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "subject",
+        "entity": "ticket",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "body",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "body",
+        "entity": "ticket",
+        "target_type": null,
+        "text_kind": "free_text"
+      },
+      {
+        "column_name": "opened_at",
+        "role": "attribute",
+        "datatype": "datetime",
+        "attribute_name": "opened_at",
+        "entity": "ticket",
+        "target_type": null,
+        "text_kind": null
+      }
+    ],
+    "relationships": null
+  }
+}

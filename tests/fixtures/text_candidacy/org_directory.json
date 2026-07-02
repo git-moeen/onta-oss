@@ -1,0 +1,129 @@
+{
+  "description": "Organization proper names: ambiguous band with an EXPLICIT null text_kind in the recording \u2014 a genuine adjudicated NO, persisted as the durable 'not_text' verdict (ONTA-173) so the reconciler stops re-sampling it and the name-blind auto tier can never overrule the LLM.",
+  "headers": [
+    "org_id",
+    "organization_name",
+    "founded_year"
+  ],
+  "rows": [
+    {
+      "org_id": "ORG-000",
+      "organization_name": "Global Health Initiative Foundation",
+      "founded_year": "1955"
+    },
+    {
+      "org_id": "ORG-001",
+      "organization_name": "Pacific Northwest Timber Cooperative",
+      "founded_year": "1962"
+    },
+    {
+      "org_id": "ORG-002",
+      "organization_name": "Center for Applied Marine Research",
+      "founded_year": "1969"
+    },
+    {
+      "org_id": "ORG-003",
+      "organization_name": "United Federation of Independent Grocers",
+      "founded_year": "1976"
+    },
+    {
+      "org_id": "ORG-004",
+      "organization_name": "Institute for Sustainable Urban Design",
+      "founded_year": "1983"
+    },
+    {
+      "org_id": "ORG-005",
+      "organization_name": "Alliance of Community Credit Unions",
+      "founded_year": "1990"
+    },
+    {
+      "org_id": "ORG-006",
+      "organization_name": "National Bureau of Weather Analytics",
+      "founded_year": "1997"
+    },
+    {
+      "org_id": "ORG-007",
+      "organization_name": "Coastal Heritage Preservation Society",
+      "founded_year": "2004"
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "org",
+          "type_name": "Organization",
+          "key_strategy": "column",
+          "key_columns": [
+            "org_id"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "org_id",
+          "role": "key",
+          "entity": "org",
+          "predicate_or_attr": "org_id"
+        },
+        {
+          "column": "organization_name",
+          "role": "attribute",
+          "entity": "org",
+          "predicate_or_attr": "name",
+          "text_kind": null,
+          "why": "proper name, not free text"
+        },
+        {
+          "column": "founded_year",
+          "role": "attribute",
+          "entity": "org",
+          "predicate_or_attr": "founded_year"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "Organization",
+    "entities": [
+      {
+        "name": "org",
+        "type_name": "Organization",
+        "key_strategy": "column",
+        "id_column": "org_id",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "org_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "org_id",
+        "entity": "org",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "organization_name",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "name",
+        "entity": "org",
+        "target_type": null,
+        "text_kind": "not_text"
+      },
+      {
+        "column_name": "founded_year",
+        "role": "attribute",
+        "datatype": "integer",
+        "attribute_name": "founded_year",
+        "entity": "org",
+        "target_type": null,
+        "text_kind": null
+      }
+    ],
+    "relationships": null
+  }
+}

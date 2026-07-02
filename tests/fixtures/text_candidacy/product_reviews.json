@@ -1,0 +1,129 @@
+{
+  "description": "Medium-length review text: ambiguous band, marked because the REASON recording adjudicated text_kind=free_text using the column name.",
+  "headers": [
+    "review_id",
+    "rating",
+    "review_text"
+  ],
+  "rows": [
+    {
+      "review_id": "RV-000",
+      "rating": "4",
+      "review_text": "Great blender, crushes ice quickly but the lid seals rather poorly."
+    },
+    {
+      "review_id": "RV-001",
+      "rating": "5",
+      "review_text": "Arrived two days late and the box was dented, motor still works fine."
+    },
+    {
+      "review_id": "RV-002",
+      "rating": "3",
+      "review_text": "Quieter than my old model although the jar scratches very easily."
+    },
+    {
+      "review_id": "RV-003",
+      "rating": "2",
+      "review_text": "Perfect for smoothies, struggles a little with frozen mango chunks."
+    },
+    {
+      "review_id": "RV-004",
+      "rating": "5",
+      "review_text": "The speed dial feels loose but blending performance is excellent."
+    },
+    {
+      "review_id": "RV-005",
+      "rating": "4",
+      "review_text": "Stopped working after a month, support replaced it without any fuss."
+    },
+    {
+      "review_id": "RV-006",
+      "rating": "1",
+      "review_text": "Looks premium on the counter and cleans up in about thirty seconds."
+    },
+    {
+      "review_id": "RV-007",
+      "rating": "3",
+      "review_text": "Decent value for the price though the cord is frustratingly short."
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "review",
+          "type_name": "ProductReview",
+          "key_strategy": "column",
+          "key_columns": [
+            "review_id"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "review_id",
+          "role": "key",
+          "entity": "review",
+          "predicate_or_attr": "review_id"
+        },
+        {
+          "column": "rating",
+          "role": "attribute",
+          "entity": "review",
+          "predicate_or_attr": "rating"
+        },
+        {
+          "column": "review_text",
+          "role": "attribute",
+          "entity": "review",
+          "predicate_or_attr": "review_text",
+          "text_kind": "free_text",
+          "why": "free-running customer prose"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "ProductReview",
+    "entities": [
+      {
+        "name": "review",
+        "type_name": "ProductReview",
+        "key_strategy": "column",
+        "id_column": "review_id",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "review_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "review_id",
+        "entity": "review",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "rating",
+        "role": "attribute",
+        "datatype": "integer",
+        "attribute_name": "rating",
+        "entity": "review",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "review_text",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "review_text",
+        "entity": "review",
+        "target_type": null,
+        "text_kind": "free_text"
+      }
+    ],
+    "relationships": null
+  }
+}

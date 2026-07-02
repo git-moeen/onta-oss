@@ -8,7 +8,7 @@ from slowapi.errors import RateLimitExceeded
 
 from cograph_client.api.middleware import RequestLoggingMiddleware
 from cograph_client.api.rate_limit import limiter
-from cograph_client.api.routes import actions, agent, ask, conversations, enrich, explore, functions, health, ingest, jobs, knowledge_graphs, lambda_functions, normalize, ontology, query, schedules, tenants, triples
+from cograph_client.api.routes import actions, agent, ask, conversations, enrich, explore, functions, health, ingest, jobs, knowledge_graphs, lambda_functions, normalize, ontology, query, schedules, search, tenants, triples
 from cograph_client.config import settings
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.logging import setup_logging
@@ -171,6 +171,32 @@ async def lifespan(app: FastAPI):
             logger.info("schedule_runner_enabled")
     except Exception as exc:  # noqa: BLE001 - scheduling must not break startup
         logger.error("schedule_runner_start_failed", error=str(exc))
+    # ONTA-181: seed the semantic-maintenance schedule rows (the global
+    # embed-fill sweep; per-KG reconcile rows are ensured by the write hook /
+    # reindex route). Only meaningful when both the semantic index AND the
+    # runner are enabled — rows without a runner would never fire, so we warn
+    # instead of seeding. Best-effort: a seeding hiccup must not block startup.
+    try:
+        from cograph_client.semantic.reconciler import (
+            ensure_embed_fill_schedule,
+            semantic_index_enabled,
+        )
+
+        if semantic_index_enabled():
+            if app.state.schedule_runner is not None:
+                await ensure_embed_fill_schedule(app.state.schedule_store)
+                logger.info("semantic_maintenance_schedules_seeded")
+            else:
+                logger.warning(
+                    "semantic_index_enabled_without_scheduler",
+                    hint=(
+                        "COGRAPH_SEMANTIC_INDEX_ENABLED is set but the schedule "
+                        "runner is disabled — embed-fill/reconcile will not run "
+                        "(set OMNIX_DATABASE_URL or COGRAPH_SCHEDULER_ENABLED)."
+                    ),
+                )
+    except Exception as exc:  # noqa: BLE001 - seeding must not break startup
+        logger.error("semantic_schedule_seed_failed", error=str(exc))
     yield
     runner = getattr(app.state, "schedule_runner", None)
     if runner is not None:
@@ -214,6 +240,9 @@ def create_app() -> FastAPI:
     app.include_router(tenants.router, tags=["tenants"])
     app.include_router(agent.router, tags=["agent"])
     app.include_router(conversations.router, tags=["conversations"])
+    # ONTA-178: the canonical semantic instance search (webapp/CLI/MCP all ride
+    # this one route — interface-convergence rule).
+    app.include_router(search.router, tags=["search"])
     _register_agent_capabilities()
     _load_router_plugins(app)
     return app

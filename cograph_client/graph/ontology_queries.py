@@ -254,6 +254,76 @@ def retract_object_property(graph_uri: str, type_name: str, attr_name: str) -> s
     )
 
 
+#: Canonical value of the ``textKind`` marker for free-running prose
+#: attributes (ONTA-177). Kept as a plain literal (not a boolean) so future
+#: kinds ("code", "label", …) can share the same single-valued predicate.
+TEXT_KIND_FREE_TEXT = "free_text"
+
+#: Canonical value of the ``textKind`` marker for a DURABLE decided-NO
+#: candidacy verdict (ONTA-173): the candidacy tier genuinely ADJUDICATED this
+#: attribute (the LLM REASON layer declined a TEXT-shaped column, or the
+#: reconciler's name-blind heuristic classified it NOT_CANDIDATE) and found it
+#: not free text. Persisting the NO matters: absence from the marker map means
+#: "never decided" — the reconciler would re-sample the attribute every run,
+#: and the name-blind ≥120-char auto tier could later overrule the LLM's
+#: explicit NO. In ``text_markers.get_free_text_map`` any kind other than
+#: ``free_text`` reads back as ``is_free_text=False`` while remaining PRESENT
+#: in the map (presence = decided), which is exactly the skip signal the
+#: reconciler keys on. NOTE: ``semantic/reconciler.py`` predates this constant
+#: and carries a same-valued local duplicate (``TEXT_KIND_NOT_TEXT`` at module
+#: scope) — converge it onto this one in a follow-up.
+TEXT_KIND_NOT_TEXT = "not_text"
+
+
+def upsert_attribute_text_kind(
+    graph_uri: str, type_name: str, attr_name: str, text_kind: str = TEXT_KIND_FREE_TEXT,
+) -> str:
+    """Idempotently set ONLY an attribute's ``<onto/textKind>`` marker
+    (single-valued), leaving every other triple of the property untouched.
+
+    ONTA-177: schema-time free-text candidacy (profiler ``ValueShape.TEXT``
+    proposes, the LLM REASON layer adjudicates ambiguous cases) is persisted
+    as ``<attr_uri> <onto/textKind> "free_text"`` so the semantic instance
+    index (ONTA-173) and the query-side type filter (ONTA-176) can read the
+    verdict without re-deciding it. Follows the same atomic
+    ``DELETE/INSERT/WHERE`` pattern as :func:`upsert_type_comment` /
+    :func:`upsert_attribute` for single-valued predicates: re-ingesting the
+    same file replaces the marker instead of stacking duplicates, and a
+    changed verdict (e.g. a future re-adjudication) never leaves two
+    conflicting kinds behind. An empty ``text_kind`` clears any existing
+    marker without inserting a replacement (the clear-on-empty rule the rest
+    of this module's upserts use).
+    """
+    a_uri = attr_uri(type_name, attr_name)
+    if text_kind:
+        kind_insert = (
+            f"INSERT {{ GRAPH <{graph_uri}> {{ <{a_uri}> <{OMNIX_ONTO}/textKind> \"{_esc(text_kind)}\" }} }}\n"
+        )
+    else:
+        kind_insert = ""
+    return (
+        f"DELETE {{ GRAPH <{graph_uri}> {{ <{a_uri}> <{OMNIX_ONTO}/textKind> ?k }} }}\n"
+        f"{kind_insert}"
+        f"WHERE {{ GRAPH <{graph_uri}> {{ OPTIONAL {{ <{a_uri}> <{OMNIX_ONTO}/textKind> ?k }} }} }}"
+    )
+
+
+def text_kind_map_query(graph_uri: str) -> str:
+    """Select every ``textKind`` marker in a graph: ``?attr ?kind`` rows.
+
+    Feeds the per-tenant ``{attribute predicate URI -> is_free_text}`` cache in
+    :mod:`cograph_client.graph.text_markers` (ONTA-177), which query-side
+    consumers (semantic instance index routing, ONTA-176) read instead of
+    hitting Neptune per request.
+    """
+    return (
+        f"SELECT ?attr ?kind FROM <{graph_uri}>\n"
+        f"WHERE {{\n"
+        f"  ?attr <{OMNIX_ONTO}/textKind> ?kind .\n"
+        f"}}"
+    )
+
+
 def mark_core_slot(graph_uri: str, type_name: str, slot_name: str) -> str:
     """Mark one of ``type_name``'s declared attributes/relationship slots as
     CONSTITUTIVE (a core slot, ADR 0003 §3 / Pass D).

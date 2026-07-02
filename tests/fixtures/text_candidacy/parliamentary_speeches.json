@@ -1,0 +1,153 @@
+{
+  "description": "Long parliamentary speeches: unambiguous free text, auto-marked by the name-blind tier. The recording predates ONTA-177 (no text_kind field anywhere) \u2014 old recordings must stay valid AND still produce the marker.",
+  "headers": [
+    "speech_id",
+    "speaker_name",
+    "party",
+    "speech_text"
+  ],
+  "rows": [
+    {
+      "speech_id": "SP-0000",
+      "speaker_name": "Margaret Holloway",
+      "party": "Labour",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of rural infrastructure funding, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    },
+    {
+      "speech_id": "SP-0001",
+      "speaker_name": "Tom Whitfield",
+      "party": "Conservative",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of coastal flood defences, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    },
+    {
+      "speech_id": "SP-0002",
+      "speaker_name": "Priya Natarajan",
+      "party": "Liberal",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of primary school staffing, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    },
+    {
+      "speech_id": "SP-0003",
+      "speaker_name": "Owen Vance",
+      "party": "Green",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of regional rail electrification, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    },
+    {
+      "speech_id": "SP-0004",
+      "speaker_name": "Lucia Ferreira",
+      "party": "Labour",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of small business rate relief, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    },
+    {
+      "speech_id": "SP-0005",
+      "speaker_name": "Declan Moore",
+      "party": "Conservative",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of affordable housing supply, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    },
+    {
+      "speech_id": "SP-0006",
+      "speaker_name": "Hana Suzuki",
+      "party": "Liberal",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of fisheries quota reform, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    },
+    {
+      "speech_id": "SP-0007",
+      "speaker_name": "Robert Ainsley",
+      "party": "Green",
+      "speech_text": "The honourable member rose to address the chamber on the pressing question of public library closures, arguing at considerable length that the government must reconsider its position before the next session and lay a revised statement before the house."
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "speech",
+          "type_name": "ParliamentarySpeech",
+          "key_strategy": "column",
+          "key_columns": [
+            "speech_id"
+          ],
+          "why": "complete unique key",
+          "confidence": 0.95
+        }
+      ],
+      "columns": [
+        {
+          "column": "speech_id",
+          "role": "key",
+          "entity": "speech",
+          "predicate_or_attr": "speech_id"
+        },
+        {
+          "column": "speaker_name",
+          "role": "attribute",
+          "entity": "speech",
+          "predicate_or_attr": "speaker_name"
+        },
+        {
+          "column": "party",
+          "role": "attribute",
+          "entity": "speech",
+          "predicate_or_attr": "party"
+        },
+        {
+          "column": "speech_text",
+          "role": "attribute",
+          "entity": "speech",
+          "predicate_or_attr": "speech_text"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "ParliamentarySpeech",
+    "entities": [
+      {
+        "name": "speech",
+        "type_name": "ParliamentarySpeech",
+        "key_strategy": "column",
+        "id_column": "speech_id",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "speech_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "speech_id",
+        "entity": "speech",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "speaker_name",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "speaker_name",
+        "entity": "speech",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "party",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "party",
+        "entity": "speech",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "speech_text",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "speech_text",
+        "entity": "speech",
+        "target_type": null,
+        "text_kind": "free_text"
+      }
+    ],
+    "relationships": null
+  }
+}

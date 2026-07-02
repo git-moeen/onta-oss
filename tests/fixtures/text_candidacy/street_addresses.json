@@ -1,0 +1,128 @@
+{
+  "description": "Postal addresses: text-shaped (spaces, avg > 25 chars) hence ambiguous, but NOT prose \u2014 the recording OMITS text_kind entirely, so candidacy stays UNDECIDED (no marker of either polarity; only an explicit null/false is a persisted decided-no \u2014 ONTA-173).",
+  "headers": [
+    "parcel_id",
+    "site_address",
+    "zoning"
+  ],
+  "rows": [
+    {
+      "parcel_id": "P-1000",
+      "site_address": "1420 Willow Creek Road, Springfield",
+      "zoning": "R-1"
+    },
+    {
+      "parcel_id": "P-1001",
+      "site_address": "88 East Harbour View Terrace, Portsmouth",
+      "zoning": "C-2"
+    },
+    {
+      "parcel_id": "P-1002",
+      "site_address": "9 Old Mill Lane, Upper Bramford",
+      "zoning": "R-1"
+    },
+    {
+      "parcel_id": "P-1003",
+      "site_address": "2751 North Cascade Avenue, Fort Collins",
+      "zoning": "M-1"
+    },
+    {
+      "parcel_id": "P-1004",
+      "site_address": "6 Waterloo Gardens, Cardiff Bay",
+      "zoning": "R-2"
+    },
+    {
+      "parcel_id": "P-1005",
+      "site_address": "310 South Prairie View Drive, Ames",
+      "zoning": "C-1"
+    },
+    {
+      "parcel_id": "P-1006",
+      "site_address": "72 Chestnut Hollow Court, New Canaan",
+      "zoning": "R-1"
+    },
+    {
+      "parcel_id": "P-1007",
+      "site_address": "1815 Rue de la Montagne Apt 4, Montreal",
+      "zoning": "R-3"
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "parcel",
+          "type_name": "Parcel",
+          "key_strategy": "column",
+          "key_columns": [
+            "parcel_id"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "parcel_id",
+          "role": "key",
+          "entity": "parcel",
+          "predicate_or_attr": "parcel_id"
+        },
+        {
+          "column": "site_address",
+          "role": "attribute",
+          "entity": "parcel",
+          "predicate_or_attr": "site_address",
+          "why": "near-unique location string, not prose"
+        },
+        {
+          "column": "zoning",
+          "role": "attribute",
+          "entity": "parcel",
+          "predicate_or_attr": "zoning"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "Parcel",
+    "entities": [
+      {
+        "name": "parcel",
+        "type_name": "Parcel",
+        "key_strategy": "column",
+        "id_column": "parcel_id",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "parcel_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "parcel_id",
+        "entity": "parcel",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "site_address",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "site_address",
+        "entity": "parcel",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "zoning",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "zoning",
+        "entity": "parcel",
+        "target_type": null,
+        "text_kind": null
+      }
+    ],
+    "relationships": null
+  }
+}

@@ -14,9 +14,13 @@ opportunistically — their private pools keep working meanwhile.
 Connection-init hooks (:func:`register_pool_init`) let a consumer install
 per-connection setup — e.g. the semantic index registers pgvector's
 ``register_vector`` codec (ONTA-176) — without this module importing optional
-dependencies. Hooks run on every NEW connection; registering a hook after a
-pool already exists expires that pool's connections so the hook applies to
-every connection handed out from then on.
+dependencies. Hooks run on every NEW connection; when a hook is registered
+after a pool already exists, that pool's connections are expired (properly
+awaited — asyncpg's ``Pool.expire_connections`` is a coroutine) on the next
+:func:`get_pg_pool` call for its DSN, so the hook applies to every connection
+handed out from then on. Registrants always re-enter :func:`get_pg_pool`
+before acquiring (that is the only way this module hands out pools), so no
+connection is checked out hook-less.
 
 Lazy by construction: importing this module never touches the network, and
 ``asyncpg`` is imported only on first use so OSS installs without a DSN never
@@ -26,6 +30,7 @@ need it (same contract as the stores' original private pools).
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any, Awaitable, Callable
 
 import structlog
@@ -37,6 +42,10 @@ logger = structlog.stdlib.get_logger("cograph.db.pool")
 _init_hooks: list[Callable[[Any], Awaitable[None]]] = []
 
 _pools: dict[str, Any] = {}
+#: Hook-list length each pool was last synchronized with; a mismatch means a
+#: hook was registered after the pool existed and its connections must be
+#: expired before the pool is handed out again (see get_pg_pool).
+_pool_hook_counts: dict[str, int] = {}
 _lock: asyncio.Lock | None = None
 
 
@@ -57,16 +66,57 @@ def register_pool_init(hook: Callable[[Any], Awaitable[None]]) -> None:
     """Register a per-connection init hook (e.g. pgvector codec registration).
 
     Applies to every NEW connection of every pool. If pools already exist,
-    their current connections are expired so subsequent checkouts are fresh
-    connections that run the hook — a late-registered hook can therefore never
-    leave a mixed pool (some connections with the codec, some without).
+    their current connections are expired on the next :func:`get_pg_pool` call
+    for their DSN, so subsequent checkouts are fresh connections that run the
+    hook — a late-registered hook can therefore never leave a mixed pool (some
+    connections with the codec, some without).
+
+    The expiry deliberately does NOT happen here: this function is sync, but
+    asyncpg's ``Pool.expire_connections`` is a coroutine whose body only runs
+    when awaited — the previous fire-and-forget call was a silent no-op on
+    real pools (ONTA-176 review finding). Deferring to ``get_pg_pool`` keeps
+    the expiry properly awaited and deterministic: a pool can only be obtained
+    through ``get_pg_pool``, so every consumer that acquires after this call
+    sees hook-initialized connections.
+
+    Contract — register hooks BEFORE the first pool acquisition for a DSN.
+    The late-registration repair above only reaches pools whose DSN is
+    RE-REQUESTED through ``get_pg_pool``: consumers that cache the pool object
+    (both current consumers do — ``spatiotemporal/postgis.py`` and the
+    semantic index backend keep the pool on ``self``) never re-enter
+    ``get_pg_pool``, so a hook registered after such a consumer grabbed its
+    pool only takes effect on that pool if some other caller asks for the same
+    DSN again. The no-mixed-pool guarantee is therefore per-DSN and holds only
+    via ``get_pg_pool`` re-entry. Both current consumers register their hooks
+    before any acquisition, so this is a documented constraint today, not a
+    live gap — but new consumers must follow it.
     """
     _init_hooks.append(hook)
-    for pool in _pools.values():
-        try:
-            pool.expire_connections()
-        except Exception:  # noqa: BLE001 — best-effort; new conns still get the hook
-            logger.warning("pg_pool_expire_failed", exc_info=True)
+
+
+async def _expire_if_hooks_changed(dsn: str, pool: Any) -> None:
+    """Expire ``pool``'s connections iff hooks were registered since it was
+    last synchronized. Awaitable-aware: real asyncpg returns a coroutine, test
+    fakes may be sync. On failure the count is NOT recorded, so the next
+    ``get_pg_pool`` call retries rather than silently leaving a mixed pool."""
+    if _pool_hook_counts.get(dsn) == len(_init_hooks):
+        return
+    # Capture the hook count BEFORE the (potentially suspending) expire: a hook
+    # registered while ``expire_connections`` is being awaited must NOT be
+    # marked synchronized by this call. Recording the pre-await snapshot means
+    # the next ``get_pg_pool`` still sees a mismatch and expires again for the
+    # mid-expire hook. Real asyncpg's expire body never suspends today, so this
+    # is hardening against a future asyncpg (or a test fake) whose expiry
+    # actually yields.
+    count = len(_init_hooks)
+    try:
+        result = pool.expire_connections()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # noqa: BLE001 — retried on the next get_pg_pool call
+        logger.warning("pg_pool_expire_failed", exc_info=True)
+        return
+    _pool_hook_counts[dsn] = count
 
 
 async def get_pg_pool(dsn: str) -> Any:
@@ -77,15 +127,18 @@ async def get_pg_pool(dsn: str) -> Any:
     """
     pool = _pools.get(dsn)
     if pool is not None:
+        await _expire_if_hooks_changed(dsn, pool)
         return pool
     async with _get_lock():
         pool = _pools.get(dsn)
         if pool is not None:
+            await _expire_if_hooks_changed(dsn, pool)
             return pool
         import asyncpg  # imported lazily so the dependency stays optional
 
         pool = await asyncpg.create_pool(dsn=dsn, init=_run_init_hooks)
         _pools[dsn] = pool
+        _pool_hook_counts[dsn] = len(_init_hooks)
         logger.info("pg_pool_created", pools=len(_pools))
         return pool
 
@@ -94,6 +147,7 @@ async def close_pg_pools() -> None:
     """Close every shared pool (app shutdown)."""
     global _pools
     pools, _pools = _pools, {}
+    _pool_hook_counts.clear()
     for pool in pools.values():
         try:
             await pool.close()
@@ -105,5 +159,6 @@ def reset_pg_pools() -> None:
     """Test helper — forget pools and hooks WITHOUT closing (tests own fakes)."""
     global _lock
     _pools.clear()
+    _pool_hook_counts.clear()
     _init_hooks.clear()
     _lock = None

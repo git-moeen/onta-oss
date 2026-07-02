@@ -1,0 +1,129 @@
+{
+  "description": "Pure code/number columns with an ADVERSARIAL recording that claims text_kind=free_text on them: the profiler-proposes gate discards the LLM verdict \u2014 no non-text column can ever be marked.",
+  "headers": [
+    "sku",
+    "warehouse_code",
+    "quantity"
+  ],
+  "rows": [
+    {
+      "sku": "SKU-88100-A",
+      "warehouse_code": "WH-00",
+      "quantity": "12"
+    },
+    {
+      "sku": "SKU-88101-A",
+      "warehouse_code": "WH-01",
+      "quantity": "24"
+    },
+    {
+      "sku": "SKU-88102-A",
+      "warehouse_code": "WH-02",
+      "quantity": "36"
+    },
+    {
+      "sku": "SKU-88103-A",
+      "warehouse_code": "WH-00",
+      "quantity": "48"
+    },
+    {
+      "sku": "SKU-88104-A",
+      "warehouse_code": "WH-01",
+      "quantity": "60"
+    },
+    {
+      "sku": "SKU-88105-A",
+      "warehouse_code": "WH-02",
+      "quantity": "72"
+    },
+    {
+      "sku": "SKU-88106-A",
+      "warehouse_code": "WH-00",
+      "quantity": "84"
+    },
+    {
+      "sku": "SKU-88107-A",
+      "warehouse_code": "WH-01",
+      "quantity": "96"
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "item",
+          "type_name": "InventoryItem",
+          "key_strategy": "column",
+          "key_columns": [
+            "sku"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "sku",
+          "role": "key",
+          "entity": "item",
+          "predicate_or_attr": "sku",
+          "text_kind": "free_text"
+        },
+        {
+          "column": "warehouse_code",
+          "role": "attribute",
+          "entity": "item",
+          "predicate_or_attr": "warehouse_code"
+        },
+        {
+          "column": "quantity",
+          "role": "attribute",
+          "entity": "item",
+          "predicate_or_attr": "quantity",
+          "text_kind": "free_text"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "InventoryItem",
+    "entities": [
+      {
+        "name": "item",
+        "type_name": "InventoryItem",
+        "key_strategy": "column",
+        "id_column": "sku",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "sku",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "sku",
+        "entity": "item",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "warehouse_code",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "warehouse_code",
+        "entity": "item",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "quantity",
+        "role": "attribute",
+        "datatype": "integer",
+        "attribute_name": "quantity",
+        "entity": "item",
+        "target_type": null,
+        "text_kind": null
+      }
+    ],
+    "relationships": null
+  }
+}

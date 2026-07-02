@@ -23,6 +23,8 @@ import structlog
 from cograph_client.graph.client import NeptuneClient
 from cograph_client.graph.ontology_queries import (
     PRIMITIVE_TYPES,
+    TEXT_KIND_FREE_TEXT,
+    TEXT_KIND_NOT_TEXT,
     batch_entity_exists_query,
     entity_exists_query,
     get_full_ontology_query,
@@ -32,22 +34,30 @@ from cograph_client.graph.ontology_queries import (
     parent_map_query,
     set_object_property_range,
     type_uri,
+    upsert_attribute_text_kind,
     upsert_type,
     upsert_type_comment,
     attr_uri,
 )
 from cograph_client.graph.layers import LayerStack, type_name_from_uri
+from cograph_client.graph.text_markers import (
+    TextCandidacy,
+    classify_text_candidacy,
+    invalidate_for_graph as invalidate_text_marker_cache,
+)
 from cograph_client.graph.parser import parse_sparql_results
 from cograph_client.graph.kg_writer import insert_facts
 from cograph_client.graph.provenance import build_provenance_triples, provenance_graph_uri
 from cograph_client.graph.queries import BATCH_PREDICATE, batched_insert_triples, delete_batch_query, insert_triples, tenant_graph_uri
 from cograph_client.resolver.attribute_resolver import (
     AttributeSchema,
+    _normalize_attr_name,
     check_promotion,
     resolve_attribute,
 )
 from cograph_client.resolver.models import (
     AttrAction,
+    ColumnRole,
     CSVSchemaMapping,
     ExtractionResult,
     ExtractedAttribute,
@@ -193,6 +203,44 @@ Return JSON:
     }}
   ]
 }}"""
+
+
+# --- ONTA-177: free-text candidacy adjudication (the REASON layer) ----------
+# The name-blind classifier (graph/text_markers.classify_text_candidacy —
+# profiler ValueShape.TEXT proposes, ADR 0003 litmus) hands the AMBIGUOUS band
+# to this prompt: text-shaped attributes whose values could equally be prose
+# or structured strings (addresses, org names, composite titles). This is the
+# ONE layer where the attribute NAME may be consulted. Verdicts become
+# `<attr> <onto/textKind> "free_text"` ontology markers for the semantic
+# instance index (ONTA-173) and its query-side filter (ONTA-176).
+
+TEXT_CANDIDACY_SYSTEM = """\
+You adjudicate FREE-TEXT candidacy for knowledge-graph attributes feeding a semantic \
+(meaning-based) search index. Every candidate below is text-SHAPED (multi-word string \
+values) but not obviously prose. Using each attribute's NAME plus its sample values, \
+decide whether its values are free-running PROSE — descriptions, reviews, speeches, \
+notes, transcripts, summaries, commentary — worth semantic indexing. Structured strings \
+are NOT free text: postal addresses, person or organization names, titles used as \
+identifiers or labels, delimited value lists, codes or paths containing spaces.
+
+Respond with strict JSON only:
+{"attributes":[{"type":"<TypeName>","attribute":"<attr_name>","free_text":true|false,"why":"<brief>"}]}
+Include EVERY candidate exactly once. JSON only."""
+
+TEXT_CANDIDACY_USER = """\
+Candidate attributes (each with up to {n_samples} sample values):
+{candidates}
+
+Return the adjudication JSON now."""
+
+#: Per-attribute cap on collected sample values for candidacy evidence — keeps
+#: memory bounded on large batches; the shape statistics stabilize long before
+#: this many samples.
+_TEXT_EVIDENCE_MAX_VALUES = 50
+#: How many sample values (truncated) each ambiguous attribute contributes to
+#: the adjudication prompt.
+_TEXT_ADJUDICATION_SAMPLES = 5
+_TEXT_ADJUDICATION_SAMPLE_MAX_LEN = 140
 
 
 class SchemaResolver:
@@ -371,6 +419,10 @@ class SchemaResolver:
             final = await self._resolve_and_insert(
                 extraction, graph_uri, existing_types, existing_attrs,
                 source, result, entity_uri_map, entity_type_map, batch_id,
+                # ONTA-177: text/JSON/web-discovery ingest IS the schema pass
+                # for these modalities (extract + apply happen in one call),
+                # so free-text candidacy is decided here.
+                decide_text_candidacy=True,
             )
             # Never present a run as complete while a whole chunk was lost to
             # truncation (FIX 1): a non-zero drop count after recovery is an
@@ -410,6 +462,7 @@ class SchemaResolver:
         entity_uri_map: dict[str, str],
         entity_type_map: dict[str, str],
         batch_id: str,
+        decide_text_candidacy: bool = False,
     ) -> IngestResult:
         """Inner pipeline: resolve entities, insert triples. Separated for rollback.
 
@@ -417,8 +470,22 @@ class SchemaResolver:
           Pass 1: Resolve types for all entities, compute URIs
           Batch check: Which URIs already exist in Neptune (one query per 500)
           Pass 2: Resolve attributes, validate, insert triples
+
+        ``decide_text_candidacy`` (ONTA-177): when True, string-attribute
+        values are sampled during pass 2 and free-text candidacy is decided +
+        persisted as ``textKind`` ontology markers after the write — set by
+        :meth:`ingest` (text/JSON/web-discovery), where this call IS the
+        schema pass. Deliberately OFF by default: ``/ingest/csv/rows`` calls
+        this method with a client-supplied mapping and never runs a schema
+        pass — its contract is "no LLM call", and its candidacy is covered
+        later by a reconciler-side default heuristic (ONTA-181).
         """
         instance_graph = getattr(self, "_instance_graph", graph_uri)
+        # ONTA-177: (resolved_type, attr_name) -> sampled string values,
+        # filled by _resolve_and_insert_entity during pass 2.
+        text_values: dict[tuple[str, str], list[str]] | None = (
+            {} if decide_text_candidacy else None
+        )
 
         # Pass 1: Resolve types and compute entity URIs
         resolved_types: dict[str, str] = {}  # entity.id → resolved_type
@@ -553,6 +620,7 @@ class SchemaResolver:
                 _collect_triples=all_entity_triples,
                 _collect_provenance=all_provenance_triples,
                 also_types=entity_also_types.get(entity.id),
+                _collect_text_values=text_values,
             )
 
         # Append ER index triples (block keys + denormalized signals) to the
@@ -574,6 +642,12 @@ class SchemaResolver:
                 all_entity_triples,
                 provenance_triples=all_provenance_triples or None,
             )
+
+        # ONTA-177: decide + persist free-text candidacy for the attributes this
+        # schema pass touched — written alongside the other attribute upserts of
+        # pass 2, best-effort (never blocks or fails ingest).
+        if text_values:
+            await self._mark_free_text_attributes(graph_uri, text_values, result)
 
         # Incrementally embed newly created types for future embedding pre-filter matches
         if result.types_created and self._embedding_service is not None:
@@ -752,6 +826,11 @@ class SchemaResolver:
             # Pass 1: Resolve types and compute URIs
             pending_uris: list[str] = []
             resolved_types: dict[str, str] = {}
+            # Mapping-declared type name -> resolved ontology type name, so the
+            # schema-time text_kind verdicts (keyed by the mapping's types) can
+            # target the attr URIs actually written (ONTA-177). setdefault: the
+            # first resolution wins, matching how attributes are declared.
+            resolved_by_decl_type: dict[str, str] = {}
             for i, entity in enumerate(entities):
                 if i > 0 and i % self.ONTOLOGY_REFRESH_INTERVAL == 0:
                     await self._refresh_ontology(graph_uri, existing_types, existing_attrs)
@@ -761,6 +840,7 @@ class SchemaResolver:
                 )
                 if resolved_type:
                     resolved_types[entity.id] = resolved_type
+                    resolved_by_decl_type.setdefault(entity.type_name, resolved_type)
                     entity_uri = f"https://cograph.tech/entities/{resolved_type}/{_safe_id(entity.id)}"
                     entity_uri_map[entity.id] = entity_uri
                     entity_type_map[entity.id] = resolved_type
@@ -791,6 +871,17 @@ class SchemaResolver:
                     entity, resolved_type, entity_uri, is_duplicate,
                     graph_uri, existing_types, existing_attrs, source, result, batch_id,
                 )
+
+            # ONTA-177: persist the schema pass's free-text verdicts (the
+            # mapping's per-column text_kind, decided ONCE at schema-inference
+            # time by the REASON pass + name-blind auto tier) as textKind
+            # ontology markers on the resolved attribute URIs. No re-decision
+            # here — a legacy/hand-written mapping without text_kind writes no
+            # markers (candidacy undecided; ONTA-181's reconciler-side
+            # heuristic covers those attributes later).
+            await self._apply_mapping_text_markers(
+                mapping, resolved_by_decl_type, graph_uri, result,
+            )
 
             # Step 4: Batch-insert relationships
             rel_triples: list[tuple[str, str, str]] = []
@@ -1522,6 +1613,7 @@ class SchemaResolver:
         _collect_triples: list[tuple[str, str, str]] | None = None,
         _collect_provenance: list[tuple[str, str, str]] | None = None,
         also_types: list[str] | None = None,
+        _collect_text_values: dict[tuple[str, str], list[str]] | None = None,
     ) -> None:
         """Pass 2: Resolve attributes, validate, and collect triples for one entity.
 
@@ -1536,6 +1628,12 @@ class SchemaResolver:
 
         `also_types` are genuine independent co-classifications (ADR rule 1): each
         gets its own asserted rdf:type triple alongside the primary resolved_type.
+
+        If _collect_text_values is provided (ONTA-177), validated STRING
+        attribute values are sampled into it keyed by (resolved_type,
+        resolved attr name) — free-text candidacy evidence the caller decides
+        on after the write. Values only, never names: the name-blind
+        classification happens downstream (ADR 0003 litmus).
         """
         type_attrs = existing_attrs.get(resolved_type, {})
 
@@ -1660,6 +1758,14 @@ class SchemaResolver:
                     triples_to_insert.append((validated.subject, validated.predicate, validated.object))
                     attr_facts.append((validated.subject, validated.predicate, validated.object))
                     result.triples_inserted += 1
+                    # ONTA-177: sample validated string values as free-text
+                    # candidacy evidence (bounded per attribute).
+                    if _collect_text_values is not None and resolved.datatype == "string":
+                        samples = _collect_text_values.setdefault(
+                            (resolved_type, resolved.name), [],
+                        )
+                        if len(samples) < _TEXT_EVIDENCE_MAX_VALUES:
+                            samples.append(validated.object)
                 else:
                     result.rejections.append(validated)
 
@@ -1704,6 +1810,252 @@ class SchemaResolver:
                 for sparql in batched_insert_triples(instance_graph, triples_to_insert):
                     await self._neptune.update(sparql)
                 result.triples_inserted += len(triples_to_insert)
+
+    # --- ONTA-177: free-text candidacy (semantic instance index) ------------
+
+    async def _mark_free_text_attributes(
+        self,
+        graph_uri: str,
+        text_values: dict[tuple[str, str], list[str]],
+        result: IngestResult,
+    ) -> None:
+        """Decide + persist free-text candidacy for schema-pass attributes.
+
+        The seam lives HERE (not only in the CSV resolver) so every ingest
+        modality that runs a schema pass — text, JSON ``/ingest``, and
+        web-discovery — produces ``textKind`` markers, not just CSV
+        (ONTA-177: candidacy must not be CSV-only).
+
+        Two-tier decision, mirroring the CSV pipeline's:
+
+        1. Name-blind classification of the sampled values
+           (:func:`classify_text_candidacy` — the profiler's ``ValueShape.TEXT``
+           proposes; ADR 0003 litmus: no attribute-name inspection here).
+           Unambiguously long prose is marked directly.
+        2. The AMBIGUOUS band (text-shaped but borderline: could be addresses,
+           org names, composite titles) goes to ONE LLM adjudication call
+           (:meth:`_adjudicate_free_text`) — the REASON layer, the only place
+           the attribute NAME may be consulted.
+
+        Confirmed attributes get the single-valued, idempotent
+        ``<attr> <onto/textKind> "free_text"`` upsert; attributes the LLM
+        EXPLICITLY declined get the durable decided-no ``"not_text"`` upsert
+        (ONTA-173: an unpersisted NO is indistinguishable from never-decided —
+        the reconciler would re-sample it every run and its name-blind
+        ≥120-char auto tier could later overrule the LLM). Non-candidates
+        (non-TEXT shapes) are never marked at all — absence = not-a-candidate,
+        and the reconciler's cheap heuristic re-classifies them itself. Both
+        upserts are written alongside the other schema-apply attribute upserts,
+        and the tenant's marker cache is invalidated HERE (the write site owns
+        it — refresh_after_write deliberately doesn't). Best-effort throughout:
+        any failure logs a warning and never blocks or fails the ingest (the
+        ONTA-181 reconciler heuristic can revisit undecided attributes).
+        """
+        try:
+            auto: list[tuple[str, str]] = []
+            ambiguous: dict[tuple[str, str], list[str]] = {}
+            for (type_name, attr_name), values in text_values.items():
+                verdict = classify_text_candidacy(values)
+                if verdict is TextCandidacy.FREE_TEXT:
+                    auto.append((type_name, attr_name))
+                elif verdict is TextCandidacy.AMBIGUOUS:
+                    ambiguous[(type_name, attr_name)] = values
+            confirmed: set[tuple[str, str]] = set(auto)
+            declined: set[tuple[str, str]] = set()
+            if ambiguous:
+                adjudicated_yes, adjudicated_no = await self._adjudicate_free_text(
+                    ambiguous
+                )
+                confirmed |= adjudicated_yes
+                declined |= adjudicated_no - confirmed
+            for type_name, attr_name in sorted(confirmed):
+                await self._neptune.update(
+                    upsert_attribute_text_kind(graph_uri, type_name, attr_name)
+                )
+                result.free_text_attributes.append(f"{type_name}.{attr_name}")
+            for type_name, attr_name in sorted(declined):
+                await self._neptune.update(
+                    upsert_attribute_text_kind(
+                        graph_uri, type_name, attr_name, TEXT_KIND_NOT_TEXT
+                    )
+                )
+            if confirmed or declined:
+                # Marker write site self-invalidates (mirrors the reconciler's
+                # heuristic) so query-side consumers see the fresh verdicts
+                # before the TTL; the TTL stays the cross-process backstop.
+                invalidate_text_marker_cache(graph_uri)
+                logger.info(
+                    "free_text_attributes_marked",
+                    auto=len(auto),
+                    adjudicated=len(confirmed) - len(auto),
+                    declined=len(declined),
+                    attributes=sorted(f"{t}.{a}" for t, a in confirmed),
+                    not_text_attributes=sorted(f"{t}.{a}" for t, a in declined),
+                )
+        except Exception:
+            logger.warning("free_text_marking_failed", exc_info=True)
+
+    async def _adjudicate_free_text(
+        self, candidates: dict[tuple[str, str], list[str]],
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+        """One REASON-layer LLM call adjudicating AMBIGUOUS free-text candidates.
+
+        This is the only layer where the attribute NAME is consulted
+        (ADR 0003 keeps names out of the deterministic layers; ONTA-177).
+        Returns ``(confirmed, declined)`` — the ``(type_name, attr_name)``
+        pairs the model judged free-running prose, and the pairs it EXPLICITLY
+        judged not (``free_text`` falsy in its response). Both sets are
+        filtered to the offered candidate set — the model cannot mint (or
+        decline) candidacy for attributes the name-blind classifier never
+        proposed. A candidate absent from the response stays UNDECIDED (in
+        neither set): a genuine adjudication is required before ONTA-173's
+        durable ``not_text`` marker may be persisted. Fail-closed and
+        best-effort: any LLM/parse failure returns two empty sets (attributes
+        stay unmarked AND undecided; a later re-ingest or the ONTA-181
+        reconciler heuristic gets another look), never raises.
+        """
+        try:
+            lines = []
+            for (type_name, attr_name), values in sorted(candidates.items()):
+                samples = [
+                    v[:_TEXT_ADJUDICATION_SAMPLE_MAX_LEN]
+                    for v in values[:_TEXT_ADJUDICATION_SAMPLES]
+                ]
+                lines.append(json.dumps({
+                    "type": type_name,
+                    "attribute": attr_name,
+                    "sample_values": samples,
+                }))
+            user_content = TEXT_CANDIDACY_USER.format(
+                n_samples=_TEXT_ADJUDICATION_SAMPLES,
+                candidates="\n".join(lines),
+            )
+            if self.EXTRACT_PROVIDER == "openrouter" and self._openrouter_key:
+                text = await openrouter_chat(
+                    self._openrouter_key,
+                    TEXT_CANDIDACY_SYSTEM,
+                    user_content,
+                    model=self.EXTRACT_MODEL,
+                    temperature=0,
+                    max_tokens=2048,
+                    timeout=60,
+                )
+            else:
+                msg = await self._anthropic.messages.create(
+                    model=self.INFER_MODEL,
+                    max_tokens=2048,
+                    system=TEXT_CANDIDACY_SYSTEM,
+                    messages=[{"role": "user", "content": user_content}],
+                )
+                text = msg.content[0].text
+            stripped = text.strip()
+            if stripped.startswith("```"):
+                stripped = "\n".join(
+                    l for l in stripped.split("\n") if not l.strip().startswith("```")
+                )
+            data = json.loads(stripped)
+            confirmed: set[tuple[str, str]] = set()
+            declined: set[tuple[str, str]] = set()
+            for item in data.get("attributes", []):
+                if not isinstance(item, dict):
+                    continue
+                key = (str(item.get("type")), str(item.get("attribute")))
+                if key not in candidates:
+                    continue  # offered candidates only — never mint new ones
+                if item.get("free_text"):
+                    confirmed.add(key)
+                else:
+                    # An entry the model returned with free_text falsy is a
+                    # genuine adjudicated NO — persisted durably by the caller.
+                    declined.add(key)
+            logger.info(
+                "free_text_adjudicated",
+                candidates=len(candidates),
+                confirmed=len(confirmed),
+                declined=len(declined),
+            )
+            return confirmed, declined
+        except Exception:
+            logger.warning(
+                "free_text_adjudication_failed",
+                candidates=len(candidates),
+                exc_info=True,
+            )
+            return set(), set()
+
+    async def _apply_mapping_text_markers(
+        self,
+        mapping: CSVSchemaMapping,
+        resolved_by_decl_type: dict[str, str],
+        graph_uri: str,
+        result: IngestResult,
+    ) -> None:
+        """Persist a mapping's schema-time ``text_kind`` verdicts as markers.
+
+        The CSV pipeline decides candidacy ONCE, at schema-inference time
+        (profiler proposes → REASON pass adjudicates → the verdict rides on
+        ``ColumnMapping.text_kind``, ONTA-177); this applies that verdict at
+        schema-apply time as the idempotent ``textKind`` upsert on the
+        RESOLVED attribute URI (the mapping's declared type may have been
+        matched onto an existing ontology type). BOTH verdict polarities are
+        persisted (ONTA-173): ``"free_text"`` marks the attribute for the
+        semantic index; ``"not_text"`` (the REASON pass explicitly declined a
+        TEXT-shaped column) durably records the decided NO so the reconciler
+        stops re-sampling it and its name-blind auto tier can never overrule
+        the LLM. Attribute names are normalized exactly like the ingest pass
+        normalizes them (:func:`_normalize_attr_name`) so the marker lands on
+        the same attr URI the instance triples use. Legacy / hand-written
+        mappings carry no ``text_kind`` → no markers, no LLM (candidacy
+        undecided; the reconciler-side default heuristic covers those later —
+        ONTA-181). After any marker write the tenant's marker cache is
+        invalidated HERE (write sites own it — refresh_after_write
+        deliberately doesn't). Best-effort: failures log a warning and never
+        block ingest.
+        """
+        try:
+            specs_by_name = {s.name: s for s in (mapping.entities or [])}
+            seen: set[tuple[str, str]] = set()
+            marked_free_text: list[str] = []
+            marked_not_text: list[str] = []
+            for col in mapping.columns:
+                if col.role != ColumnRole.ATTRIBUTE or col.text_kind not in (
+                    TEXT_KIND_FREE_TEXT,
+                    TEXT_KIND_NOT_TEXT,
+                ):
+                    continue
+                if col.entity and col.entity in specs_by_name:
+                    decl_type = specs_by_name[col.entity].type_name
+                else:
+                    decl_type = mapping.entity_type
+                if not decl_type:
+                    continue
+                resolved_type = resolved_by_decl_type.get(decl_type, decl_type)
+                attr_name = _normalize_attr_name(col.attribute_name or col.column_name)
+                key = (resolved_type, attr_name)
+                if not attr_name or key in seen:
+                    continue
+                seen.add(key)
+                await self._neptune.update(
+                    upsert_attribute_text_kind(
+                        graph_uri, resolved_type, attr_name, col.text_kind
+                    )
+                )
+                if col.text_kind == TEXT_KIND_FREE_TEXT:
+                    result.free_text_attributes.append(f"{resolved_type}.{attr_name}")
+                    marked_free_text.append(f"{resolved_type}.{attr_name}")
+                else:
+                    marked_not_text.append(f"{resolved_type}.{attr_name}")
+            if seen:
+                # Marker write site self-invalidates (mirrors the reconciler's
+                # heuristic); the TTL stays the cross-process backstop.
+                invalidate_text_marker_cache(graph_uri)
+                logger.info(
+                    "free_text_mapping_markers_applied",
+                    attributes=sorted(marked_free_text),
+                    not_text_attributes=sorted(marked_not_text),
+                )
+        except Exception:
+            logger.warning("free_text_mapping_markers_failed", exc_info=True)
 
 
 def _safe_id(raw_id: str) -> str:

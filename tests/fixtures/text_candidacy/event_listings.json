@@ -1,0 +1,184 @@
+{
+  "description": "Multi-entity table: the event description is adjudicated free_text on the EVENT entity; the venue proper name stays unmarked; the relationship-role city column can never carry text_kind, even though the adversarial recording claims it.",
+  "headers": [
+    "event_id",
+    "event_description",
+    "venue_name",
+    "venue_city"
+  ],
+  "rows": [
+    {
+      "event_id": "EV-100",
+      "event_description": "An evening of experimental jazz featuring three local quartets and a late improvised set on the rooftop stage.",
+      "venue_name": "The Grand Palace Convention Center",
+      "venue_city": "Portland"
+    },
+    {
+      "event_id": "EV-101",
+      "event_description": "Hands-on workshop introducing beginners to wheel throwing with all clay and firing costs included in the price.",
+      "venue_name": "Riverside Arts Warehouse",
+      "venue_city": "Austin"
+    },
+    {
+      "event_id": "EV-102",
+      "event_description": "Annual charity gala with a silent auction, a five course tasting menu, and speeches from this year's grant recipients.",
+      "venue_name": "Hotel Meridian Rooftop Terrace",
+      "venue_city": "Chicago"
+    },
+    {
+      "event_id": "EV-103",
+      "event_description": "Outdoor screening of restored silent films with a live orchestral accompaniment and food trucks along the promenade.",
+      "venue_name": "Old Harbour Botanical Pavilion",
+      "venue_city": "Halifax"
+    },
+    {
+      "event_id": "EV-104",
+      "event_description": "Regional startup pitch night where eight founders present to a panel of investors followed by open networking.",
+      "venue_name": "The Foundry Innovation Hall",
+      "venue_city": "Portland"
+    },
+    {
+      "event_id": "EV-105",
+      "event_description": "Guided sunrise bird walk through the wetland reserve with loaner binoculars and a field notebook for every guest.",
+      "venue_name": "Wetland Reserve Visitor Lodge",
+      "venue_city": "Austin"
+    },
+    {
+      "event_id": "EV-106",
+      "event_description": "Community repair cafe where volunteers help fix small appliances, bicycles, and clothing free of charge all afternoon.",
+      "venue_name": "Northgate Community Workshop",
+      "venue_city": "Chicago"
+    },
+    {
+      "event_id": "EV-107",
+      "event_description": "Two day letterpress printing intensive covering type setting, ink mixing, and binding a small edition of your own.",
+      "venue_name": "Bindery Lane Print Studio",
+      "venue_city": "Halifax"
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "event",
+          "type_name": "Event",
+          "key_strategy": "column",
+          "key_columns": [
+            "event_id"
+          ]
+        },
+        {
+          "name": "venue",
+          "type_name": "Venue",
+          "key_strategy": "composite",
+          "key_columns": [
+            "venue_name"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "event_id",
+          "role": "key",
+          "entity": "event",
+          "predicate_or_attr": "event_id"
+        },
+        {
+          "column": "event_description",
+          "role": "attribute",
+          "entity": "event",
+          "predicate_or_attr": "event_description",
+          "text_kind": "free_text",
+          "why": "free-running promotional prose"
+        },
+        {
+          "column": "venue_name",
+          "role": "attribute",
+          "entity": "venue",
+          "predicate_or_attr": "name"
+        },
+        {
+          "column": "venue_city",
+          "role": "relationship",
+          "entity": "venue",
+          "predicate_or_attr": "located_in",
+          "target_type": "City",
+          "text_kind": "free_text"
+        }
+      ],
+      "relationships": [
+        {
+          "subject": "event",
+          "predicate": "held_at",
+          "object": "venue"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "entity_type": "Event",
+    "entities": [
+      {
+        "name": "event",
+        "type_name": "Event",
+        "key_strategy": "column",
+        "id_column": "event_id",
+        "id_from": null
+      },
+      {
+        "name": "venue",
+        "type_name": "Venue",
+        "key_strategy": "composite",
+        "id_column": null,
+        "id_from": [
+          "venue_name"
+        ]
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "event_id",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "event_id",
+        "entity": "event",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "event_description",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "event_description",
+        "entity": "event",
+        "target_type": null,
+        "text_kind": "free_text"
+      },
+      {
+        "column_name": "venue_name",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "name",
+        "entity": "venue",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "venue_city",
+        "role": "relationship",
+        "datatype": "string",
+        "attribute_name": "located_in",
+        "entity": "venue",
+        "target_type": "City",
+        "text_kind": null
+      }
+    ],
+    "relationships": [
+      {
+        "subject": "event",
+        "predicate": "held_at",
+        "object": "venue"
+      }
+    ]
+  }
+}

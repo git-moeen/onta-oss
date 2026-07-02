@@ -1,0 +1,290 @@
+{
+  "_readme": [
+    "Relevance golden-queries fixture for the semantic instance index (ONTA-178).",
+    "Deterministic + CI-safe: NO network. Embeddings are hand-built topic-axis",
+    "vectors — every doc carries a `topics` weight map over `axes`, and every",
+    "query carries its own; the test converts both to fixed-dimension vectors",
+    "(dim == len(axes) == 8, matching the vector(8) table the other DSN-gated",
+    "semantic tests create in CI). Paraphrase queries reuse their target doc's",
+    "topic mix (near in cosine space); unrelated docs use disjoint axes (far).",
+    "The LAST axis (`offtopic`) is reserved for exact-quote query vectors and is",
+    "never used by any doc, making those query vectors orthogonal to the whole",
+    "corpus: an exact-quote hit can only be carried by the FTS leg — which is",
+    "precisely what that query class exists to guard.",
+    "Query classes and their documented hit@k (entity-level):",
+    "  exact      k=1  — verbatim quotes; FTS must win (embedding is orthogonal)",
+    "  paraphrase k=3  — reworded topics; the dense leg must win (k=3 absorbs",
+    "                    RRF interference from incidental lexical matches)",
+    "  filtered   k=2  — kg_name / type scoping; results must stay inside the",
+    "                    filter (the test also asserts exclusion)",
+    "Queries with `dense_only: true` share NO token with their target doc (by",
+    "construction, incl. stopwords) — lexical-only search must NOT find them.",
+    "Queries with `from_second_chunk: true` quote text that lives past the",
+    "2048-char chunk boundary of a long doc — proving later chunks are indexed",
+    "and guarding the chunker's size constants."
+  ],
+  "axes": ["energy", "health", "transport", "education", "defense", "agriculture", "housing", "offtopic"],
+  "docs": [
+    {
+      "id": "solar",
+      "entity_uri": "https://cograph.tech/entities/Speech/solar-subsidies-2025",
+      "kg": "parliament-2025",
+      "type": "Speech",
+      "label": "Margaret Okafor on rooftop solar subsidies",
+      "topics": {"energy": 1.0, "housing": 0.3},
+      "text": "Madam Speaker, I rise to speak about the government's rooftop solar subsidy scheme, and about the households in my constituency who have been left behind by it. Three years ago the Minister promised that every family who wanted photovoltaic panels fitted to their roof would receive support within six weeks of applying. In the town of Harleton the average wait now stands at eleven months, and four hundred unopened applications sit in a regional office staffed by two people.\n\nThe feed-in tariff has become a lottery of postcodes. A household in the south west receives payments forty per cent higher than an identical household in the north east, for the same panels, the same sunlight and the same investment. Meanwhile the installers report that certification delays have pushed dozens of small firms to the edge of insolvency. We were told the scheme would create ten thousand jobs in the renewable energy sector; the industry association can count fewer than three thousand.\n\nLet me turn to social housing, because council tenants stand to gain the most from cheaper electricity and yet council landlords are excluded from the enhanced subsidy band. If we fitted panels to every south facing council roof in this country we would generate more clean power than two gas fired stations, and we would cut the fuel bills of the poorest tenants by a third. The Minister tells us the budget will not stretch. I observe that the budget already stretches to tax relief for private landlords who install nothing at all.\n\nThere is also the question of skills. Colleges in three neighbouring towns applied to run accredited installer courses and were refused capital funding, even as the industry warns of a shortage of four thousand qualified fitters. Every one of those courses would pay for itself within two years in tax receipts alone, and every graduate would step into work the week they finished.\n\nFinally, storage. Panels without batteries are a promise kept only while the sun is shining. The pilot programme that placed shared batteries in every substation in Grellford cut evening peak demand by eighteen per cent in its first winter. I urge the Minister to extend that pilot nationally, to publish the long delayed certification review, and to bring the revised subsidy bands before this House for a vote ahead of the summer recess."
+    },
+    {
+      "id": "wind",
+      "entity_uri": "https://cograph.tech/entities/Speech/offshore-wind-2025",
+      "kg": "parliament-2025",
+      "type": "Speech",
+      "label": "Tomas Brandt on offshore wind manufacturing",
+      "topics": {"energy": 1.0, "agriculture": 0.25},
+      "text": "Thank you, Madam Speaker. The turbines off the Merrow coast now supply a tenth of this country's electricity, yet their blades are forged four thousand miles away and shipped here on diesel freighters. My constituency built ships for two centuries; it could build turbine blades next year if the port infrastructure fund were finally released. I would also remind the House that turbines and livestock coexist happily: hill farmers in the Dales earn a steadier income from hosting three masts than from a decade of wool. What is missing is neither wind nor land but grid capacity, with some completed projects waiting nine years for a connection. Release the fund, reform the connection queue, and the north east will power half this island."
+    },
+    {
+      "id": "hospital",
+      "entity_uri": "https://cograph.tech/entities/Debate/ae-waiting-times-2025",
+      "kg": "parliament-2025",
+      "type": "Debate",
+      "label": "Debate on accident and emergency waiting times",
+      "topics": {"health": 1.0},
+      "text": "I beg to move that this House has considered accident and emergency waiting times. Behind every statistic in tonight's debate there is a person. Last month a retired schoolteacher from my constituency waited through the night at the Royal Deneside Infirmary. Twelve hours on a trolley in a corridor is not care; it is the absence of care dressed in a hospital gown.\n\nThe elective waiting list has grown to seven and a half million procedures. Hip replacements that once took eighteen weeks are now scheduled two years out, and while patients wait they deteriorate: physiotherapy referrals double, painkiller prescriptions triple, and the eventual operations become longer, riskier and more expensive than they needed to be.\n\nWe cannot debate waiting times without debating the workforce. There are forty thousand unfilled nursing posts across the service. Newly qualified nurses tell us they cannot afford to live in the cities where the vacancies are, and one in three leaves the profession within five years. The trusts then fill the gaps with agency staff at triple the cost, which drains the very budgets that were meant to open new assessment wards.\n\nThen there is the exit door. One in seven beds tonight is occupied by somebody who is medically fit to leave but has no community care package waiting for them. Until social care assessments happen inside seventy two hours, the ambulances will keep queuing on the tarmac because the wards cannot empty and the corridors cannot clear.\n\nAnd behind the emergency department stands a diagnostic queue that never appears on the evening news. One and a half million people are waiting for a scan or an endoscopy; the radiology vacancy rate has doubled in five years; and the new community diagnostic centres, welcome as they are, open nine to five in buildings the local bus reaches twice a day. An emergency pathway is only ever as fast as the slowest test inside it, and tonight the slowest test is measured in months.\n\nSo I ask the Minister for three commitments: ring fence the winter resilience fund so it cannot be raided for capital projects, publish the corridor care audit in full, and set a statutory maximum of six hours between arrival and admission. Targets did not create this crisis, but abandoning them has certainly deepened it."
+    },
+    {
+      "id": "clinics",
+      "entity_uri": "https://cograph.tech/entities/Speech/rural-clinics-2025",
+      "kg": "parliament-2025",
+      "type": "Speech",
+      "label": "Eleri Vaughan on rural clinic closures",
+      "topics": {"health": 0.85, "agriculture": 0.35},
+      "text": "The village surgery in Netherfold closed its doors in March. The nearest alternative is fourteen miles away along a road with no bus after four in the afternoon. Since the closure, district nurses have been driving forty miles a day between farm households, and family doctors in the market town report a surge in missed appointments among the over seventies. Farming communities already carry the highest rates of untreated hypertension in the country, and rural village surgery closures sever the last routine contact many agricultural workers have with the health service. The Minister's dispersed care strategy reads well in Whitehall, but a strategy is not a surgery, and a video consultation is no use to a dairyman with no signal in the milking shed. I ask the department to fund the retained rural surgery scheme before another village loses its doctor."
+    },
+    {
+      "id": "rail",
+      "entity_uri": "https://cograph.tech/entities/Speech/pennine-electrification-2025",
+      "kg": "parliament-2025",
+      "type": "Speech",
+      "label": "Ade Fashola on Pennine line electrification",
+      "topics": {"transport": 1.0, "energy": 0.3},
+      "text": "The Pennine main line still runs on diesel under skies we have promised to clean. Electrification was approved in 2019, paused in 2021, descoped in 2023 and is now, we are told, under review. Meanwhile the overhead wiring gantries bought for the project rust in a depot outside Calverton. Every week of delay keeps thirty year old diesel units burning fuel through the tunnels of the Standedge route, and every freight operator that cannot get a path guarantee puts another forty lorries on the motorway instead. The economics are not in dispute: an electrified line is cheaper to run, quicker to accelerate, and doubles the freight tonnage the gradient can carry. What is in dispute, apparently, is whether the north deserves the wiring the south received forty years ago. Finish the job to Marsden, publish the freight electrification map, and give the supply chain the certainty to invest in the training halls they have already built."
+    },
+    {
+      "id": "school",
+      "entity_uri": "https://cograph.tech/entities/Debate/school-funding-formula-2025",
+      "kg": "parliament-2025",
+      "type": "Debate",
+      "label": "Debate on the national school funding formula",
+      "topics": {"education": 1.0},
+      "text": "This debate concerns the national funding formula and the small schools it is quietly closing. The formula was sold to this House as fairness itself: money following the pupil, wherever the pupil lives. But a village primary with sixty pupils cannot shed a fraction of a caretaker when three families move away, and a sparsity weighting set in Whitehall does not keep the lights on in a two classroom school heated by a boiler older than its head teacher. Head teachers in my constituency now teach on Thursdays and Fridays to save the cost of supply cover, and class sizes in the junior years have passed thirty four. The funding formula punishes exactly the schools it was designed to protect, and it does so with an arithmetic so opaque that two neighbouring authorities cannot agree on what their own allocations will be next April. I ask the Minister to publish the sparsity review, to restore the minimum per pupil guarantee in real terms, and to give rural primaries a three year settlement they can actually plan against."
+    },
+    {
+      "id": "defense",
+      "entity_uri": "https://cograph.tech/entities/Speech/frigate-procurement-2025",
+      "kg": "parliament-2025",
+      "type": "Speech",
+      "label": "Iain Craddock on frigate procurement",
+      "topics": {"defense": 1.0},
+      "text": "The Type 31 frigate programme is now seven years late and a billion pounds over budget, and the House deserves to know why. The prime contractor has rewritten its delivery schedule four times. The fitting out of the first hull stopped for nine months while two departments argued over which of them had approved a change to the radar mast. Our allies watch the gap grow: the navy will operate nine escort vessels fewer at the end of this decade than the defence review itself called the minimum for a credible presence in the North Atlantic. Procurement reform has been promised by every government I have served under. Yet still we write contracts that reward delay, still we change specifications mid build, and still the National Audit Office reports land on the table of a committee with no power to act on them. Fix the contracting model before the next programme is signed, or we will be back here in five years debating the same failure at a higher price."
+    },
+    {
+      "id": "grain",
+      "entity_uri": "https://cograph.tech/entities/Debate/grain-tariffs-2025",
+      "kg": "parliament-2025",
+      "type": "Debate",
+      "label": "Debate on grain tariffs and the eastern growers",
+      "topics": {"agriculture": 1.0},
+      "text": "I rise on behalf of the wheat and barley growers of the eastern counties, who harvested their best crop in a decade and then watched the price collapse beneath a flood of cheap grain from abroad. The tariff schedule agreed two winters ago was supposed to taper gradually; instead the threshold volumes were set so high that the taper has never once been triggered. Growers sold this year's wheat below the cost of the diesel that drilled it. The department tells farmers to diversify. The eastern counties have diversified for four hundred years; what they cannot do is compete with produce grown under standards this House would not permit here, hauled in tariff free, and sold at a loss to clear another continent's surplus. Set the threshold at the volumes the industry proposed, apply the same welfare and residue standards at the border that we apply on our own farms, and grain farming in this country will ask for nothing else."
+    },
+    {
+      "id": "housing",
+      "entity_uri": "https://cograph.tech/entities/Speech/social-housing-2025",
+      "kg": "parliament-2025",
+      "type": "Speech",
+      "label": "Priya Shankar on the housing waiting list",
+      "topics": {"housing": 1.0, "health": 0.25},
+      "text": "Madam Speaker, the housing waiting list in my borough passed twenty two thousand families this spring. Twenty two thousand families means classrooms of children doing homework in bed and breakfast rooms, nurses commuting ninety minutes because a flat near the ward swallows two thirds of their pay, and pensioners trapped on third floors when the lift has been broken for a year.\n\nWe are told the market will build our way out. The market has delivered luxury towers with lightless service flats sold overseas and left standing empty, while the affordable quota on every large development is negotiated downwards the moment the diggers arrive. Viability assessments have become a conjuring trick performed behind closed doors, and the public is not even allowed to see the deck of cards.\n\nCouncil house building remains at a fraction of what this country managed in far poorer decades. The right to buy receipts that were supposed to fund replacement homes sit unspent because the rules forbid combining them with grant funding, and one council in the north built precisely four homes last year while selling thirty one.\n\nAnd the homes we do have are making people ill. The coroner's report into the death of a two year old in a rented flat found spores in every room of the property. General practitioners in my constituency now write letters to landlords as part of asthma treatment plans. When a doctor must prescribe a repair, the housing system has failed twice over.\n\nNor can we pretend the private rented sector will absorb the overflow. Rents in the borough rose nineteen per cent in two years while wages rose four. Letting agents openly advertise bidding wars, a practice this House said it would outlaw in the last session, and tenants who complain about disrepair find an eviction notice on the mat within the month. Deposit protection was a fine reform of its decade; it is no answer to a market this overheated.\n\nI have stood in those flats myself and seen black mould creeping across the ceilings of homes that we ourselves own as a city. So let this House act: lift the borrowing cap on housing revenue accounts, let councils keep every penny of every sale, and legislate the decency standard for private rentals this session, not the next one."
+    },
+    {
+      "id": "bus",
+      "entity_uri": "https://cograph.tech/entities/Debate/rural-bus-network-2025",
+      "kg": "parliament-2025",
+      "type": "Debate",
+      "label": "Debate on the rural bus network",
+      "topics": {"transport": 0.85, "education": 0.25},
+      "text": "Yesterday morning the seven fifteen bus from Alderthwaite did not come, and eleven children missed the first lesson of their mock examinations. That bus has been cancelled thirty times this term. When the county rationalised the rural network, we were promised demand responsive transport within a year; what arrived was an app that shows no vehicles after six in the evening and none at all on Sundays. A sixth former in my constituency now cycles nine miles each way to college in the dark, because the concessionary pass her family relies on is not valid on the one commercial route that survives. Rural bus routes for schoolchildren are not a luxury; they are the difference between staying in education and dropping out at sixteen. Fund the connectivity guarantee the county submitted, and audit every cancellation against the operator's subsidy."
+    },
+    {
+      "id": "solar24",
+      "entity_uri": "https://cograph.tech/entities/Speech/solar-planning-2024",
+      "kg": "parliament-2024",
+      "type": "Speech",
+      "label": "Margaret Okafor on solar planning reform (2024)",
+      "topics": {"energy": 0.9, "housing": 0.2},
+      "text": "Two years ago this House loosened the planning rules for rooftop solar, and the results have exceeded every forecast the department published. Permitted development now covers panels on terraced housing, and installations have doubled in a single year. But the subsidy ladder has not kept pace with the planning reform. A family fitting panels under the 2024 scheme waits five months for the export payment registration that the brochure promises in three weeks, and the approved installer register still lists firms that ceased trading before last Christmas. If we want the planning victory to become an energy victory, the registration backlog must be cleared and the export tariff uprated with inflation. Rooftop solar is the one energy policy on which every party in this chamber agrees; it deserves administration worthy of that consensus."
+    },
+    {
+      "id": "health24",
+      "entity_uri": "https://cograph.tech/entities/Debate/winter-pressures-2024",
+      "kg": "parliament-2024",
+      "type": "Debate",
+      "label": "Debate on winter pressures in the health service (2024)",
+      "topics": {"health": 0.9, "transport": 0.15},
+      "text": "I secured this debate after nineteen ambulances stood queuing outside hospitals across this county on a single January night. Paramedics spent their shifts as corridor orderlies while emergency calls stacked up across half the region, and the average handover, which should take fifteen minutes, ran to four hours. Winter pressure is no longer a season; it is the permanent weather of the service. Community step down beds were cut in the spring reorganisation on the promise of virtual wards, but a tablet computer cannot take a temperature at three in the morning or catch a fall before it happens. Reopen the sixty step down beds, publish handover times trust by trust, and give the ambulance service the surge staffing it requested in its winter plan."
+    }
+  ],
+  "queries": [
+    {
+      "id": "exact-solar-tariff-lottery",
+      "class": "exact",
+      "query": "the feed-in tariff has become a lottery of postcodes",
+      "expect": "https://cograph.tech/entities/Speech/solar-subsidies-2025",
+      "topics": {"offtopic": 1.0}
+    },
+    {
+      "id": "exact-hospital-trolley",
+      "class": "exact",
+      "query": "twelve hours on a trolley in a corridor is not care",
+      "expect": "https://cograph.tech/entities/Debate/ae-waiting-times-2025",
+      "topics": {"offtopic": 1.0}
+    },
+    {
+      "id": "exact-housing-mould-second-chunk",
+      "class": "exact",
+      "query": "black mould creeping across the ceilings of homes that we ourselves own",
+      "expect": "https://cograph.tech/entities/Speech/social-housing-2025",
+      "topics": {"offtopic": 1.0},
+      "from_second_chunk": true
+    },
+    {
+      "id": "exact-defense-over-budget",
+      "class": "exact",
+      "query": "seven years late and a billion pounds over budget",
+      "expect": "https://cograph.tech/entities/Speech/frigate-procurement-2025",
+      "topics": {"offtopic": 1.0}
+    },
+    {
+      "id": "exact-school-formula",
+      "class": "exact",
+      "query": "the funding formula punishes exactly the schools it was designed to protect",
+      "expect": "https://cograph.tech/entities/Debate/school-funding-formula-2025",
+      "topics": {"offtopic": 1.0}
+    },
+    {
+      "id": "exact-solar-substation-second-chunk",
+      "class": "exact",
+      "query": "shared batteries in every substation in Grellford",
+      "expect": "https://cograph.tech/entities/Speech/solar-subsidies-2025",
+      "topics": {"offtopic": 1.0},
+      "from_second_chunk": true
+    },
+    {
+      "id": "para-solar-sunlight",
+      "class": "paraphrase",
+      "query": "harnessing sunlight on household rooftops to cut electricity bills",
+      "expect": "https://cograph.tech/entities/Speech/solar-subsidies-2025",
+      "topics": {"energy": 1.0, "housing": 0.3}
+    },
+    {
+      "id": "para-hospital-backlog",
+      "class": "paraphrase",
+      "query": "patients deteriorating while they queue for operations",
+      "expect": "https://cograph.tech/entities/Debate/ae-waiting-times-2025",
+      "topics": {"health": 1.0}
+    },
+    {
+      "id": "para-rail-wiring",
+      "class": "paraphrase",
+      "query": "modernising railway lines with overhead electric wiring",
+      "expect": "https://cograph.tech/entities/Speech/pennine-electrification-2025",
+      "topics": {"transport": 1.0, "energy": 0.3}
+    },
+    {
+      "id": "para-grain-levies",
+      "class": "paraphrase",
+      "query": "cereal levies",
+      "expect": "https://cograph.tech/entities/Debate/grain-tariffs-2025",
+      "topics": {"agriculture": 1.0},
+      "dense_only": true
+    },
+    {
+      "id": "para-housing-affordable",
+      "class": "paraphrase",
+      "query": "families priced out of affordable homes",
+      "expect": "https://cograph.tech/entities/Speech/social-housing-2025",
+      "topics": {"housing": 1.0, "health": 0.25}
+    },
+    {
+      "id": "para-clinics-physicians",
+      "class": "paraphrase",
+      "query": "countryside physicians shutting practices",
+      "expect": "https://cograph.tech/entities/Speech/rural-clinics-2025",
+      "topics": {"health": 0.85, "agriculture": 0.35},
+      "dense_only": true
+    },
+    {
+      "id": "para-defense-overspend",
+      "class": "paraphrase",
+      "query": "warship purchasing overspend",
+      "expect": "https://cograph.tech/entities/Speech/frigate-procurement-2025",
+      "topics": {"defense": 1.0},
+      "dense_only": true
+    },
+    {
+      "id": "para-school-overcrowding",
+      "class": "paraphrase",
+      "query": "overcrowded classrooms and stretched teacher budgets",
+      "expect": "https://cograph.tech/entities/Debate/school-funding-formula-2025",
+      "topics": {"education": 1.0}
+    },
+    {
+      "id": "filter-type-hospital-debate",
+      "class": "filtered",
+      "query": "accident and emergency waiting times",
+      "expect": "https://cograph.tech/entities/Debate/ae-waiting-times-2025",
+      "topics": {"health": 1.0},
+      "type": "Debate"
+    },
+    {
+      "id": "filter-type-clinics-speech",
+      "class": "filtered",
+      "query": "rural village surgery closures",
+      "expect": "https://cograph.tech/entities/Speech/rural-clinics-2025",
+      "topics": {"health": 0.85, "agriculture": 0.35},
+      "type": "Speech"
+    },
+    {
+      "id": "filter-kg-solar-2025",
+      "class": "filtered",
+      "query": "rooftop solar subsidy scheme",
+      "expect": "https://cograph.tech/entities/Speech/solar-subsidies-2025",
+      "topics": {"energy": 1.0, "housing": 0.3},
+      "kg": "parliament-2025"
+    },
+    {
+      "id": "filter-kg-solar-2024",
+      "class": "filtered",
+      "query": "rooftop solar planning rules",
+      "expect": "https://cograph.tech/entities/Speech/solar-planning-2024",
+      "topics": {"energy": 0.9, "housing": 0.2},
+      "kg": "parliament-2024"
+    },
+    {
+      "id": "filter-type-bus-debate",
+      "class": "filtered",
+      "query": "rural bus routes for schoolchildren",
+      "expect": "https://cograph.tech/entities/Debate/rural-bus-network-2025",
+      "topics": {"transport": 0.85, "education": 0.25},
+      "type": "Debate"
+    },
+    {
+      "id": "filter-kg-ambulances-2024",
+      "class": "filtered",
+      "query": "ambulances queuing outside hospitals",
+      "expect": "https://cograph.tech/entities/Debate/winter-pressures-2024",
+      "topics": {"health": 0.9, "transport": 0.15},
+      "kg": "parliament-2024"
+    }
+  ]
+}

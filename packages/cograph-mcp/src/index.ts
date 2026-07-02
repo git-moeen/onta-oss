@@ -98,6 +98,69 @@ server.registerTool(
   },
 );
 
+// ONTA-178: thin over the canonical `POST /graphs/{tenant}/search` route (via
+// the SDK's `search`) — the ONE search endpoint every interface rides. The
+// server embeds the query and ranks; this tool only renders hits.
+server.registerTool(
+  "search",
+  {
+    description:
+      "Semantic search over the free-text attributes of entities (descriptions, " +
+      "bios, notes, speeches, …): find WHICH entities talk about a topic, with a " +
+      "matching snippet as the citation. Hybrid keyword + meaning search — use it " +
+      'for "which entities mention/discuss X"; use `ask` for aggregate or ' +
+      "structured questions.",
+    inputSchema: {
+      query: z.string().describe("Free-text search query (topic, phrase, or quote)."),
+      kg_name: z
+        .string()
+        .optional()
+        .describe(
+          "Optional knowledge graph to search within. Omit to search every KG " +
+            "in the tenant. Use list_knowledge_graphs to see available KGs.",
+        ),
+      type: z
+        .string()
+        .optional()
+        .describe('Optional entity type filter (e.g. "Speech").'),
+      top_k: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Max entities to return (server clamps to 1..50; default 10)."),
+    },
+  },
+  async ({ query, kg_name, type, top_k }) => {
+    try {
+      const res = await client().search(query, { kg: kg_name, type, topK: top_k });
+      if (!res.hits.length) return textResult("No matching entities found.");
+      const lines = res.hits.map((h, i) => {
+        const label =
+          typeof h.attrs?.label === "string" && h.attrs.label
+            ? h.attrs.label
+            : h.entity_uri;
+        const kind =
+          typeof h.attrs?.type === "string" && h.attrs.type
+            ? ` (${h.attrs.type})`
+            : "";
+        return `${i + 1}. ${label}${kind} — ${h.entity_uri}\n   [${h.attr}] ${h.snippet}`;
+      });
+      if (res.degraded) {
+        lines.push(
+          "",
+          "Note: results are keyword-only (reduced recall) — the embedding " +
+            "service was unavailable for this query.",
+        );
+      }
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
 server.registerTool(
   "ingest_csv",
   {

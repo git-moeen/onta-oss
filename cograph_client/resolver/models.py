@@ -185,6 +185,28 @@ class ColumnMapping(BaseModel):
         default=None,
         description="Profile-evidence rationale for this column decision (v2 inference)",
     )
+    # ONTA-177: schema-time free-text candidacy verdict for the semantic
+    # instance index. "free_text" = this column's values are free-running
+    # prose (profiler ValueShape.TEXT proposed it; unambiguously long text is
+    # set deterministically, borderline cases carry the REASON pass's
+    # name-informed adjudication). "not_text" (ONTA-173) = the column was a
+    # TEXT-shaped candidate and the REASON pass EXPLICITLY declined it — a
+    # durable decided-no, persisted so the reconciler stops re-sampling the
+    # attribute and its name-blind auto tier can never overrule the LLM.
+    # None = candidacy undecided: a non-candidate column (non-TEXT shape —
+    # never marked either way), a mapping that predates ONTA-177, or a
+    # hand-written mapping (ONTA-181's reconciler-side heuristic covers those
+    # later). Default keeps old serialized mappings parsing unchanged.
+    text_kind: str | None = Field(
+        default=None,
+        description=(
+            "'free_text' when this column holds free-running prose worth "
+            "semantic indexing (ONTA-177); 'not_text' when a text-shaped "
+            "column was explicitly adjudicated NOT prose (durable decided-no, "
+            "ONTA-173); both persisted as an ontology `textKind` marker on "
+            "the attribute at ingest time; None = undecided"
+        ),
+    )
 
 
 class EntitySpec(BaseModel):
@@ -618,5 +640,15 @@ class IngestResult(BaseModel):
             "entity_type in single-entity mode, or the EntitySpec.name in "
             "multi-entity mode (where one row can mint some entities while "
             "skipping an all-empty one without the row itself being dropped)."
+        ),
+    )
+    # ONTA-177: free-text candidacy verdicts persisted during this ingest.
+    # Default keeps older callers and serialized payloads compatible.
+    free_text_attributes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "'Type.attr' entries that received a textKind='free_text' "
+            "ontology marker during this ingest (schema-time semantic-index "
+            "candidacy, ONTA-177)"
         ),
     )

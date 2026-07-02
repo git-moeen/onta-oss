@@ -328,6 +328,9 @@ describe("canonical paths + methods for every covered op", () => {
       url: `${BASE}/v1/me/tenants/${ENC("t 1")}`,
     },
     { name: "tenants", run: (c) => c.raw.tenants(), method: "GET", url: `${BASE}/v1/me/tenants` },
+    // ONTA-178: the canonical semantic instance search — one route for every
+    // interface (the MCP `search` tool rides this exact path via the SDK).
+    { name: "search", run: (c) => c.raw.search({ query: "q" }), method: "POST", url: `${PREFIX}/search` },
   ];
 
   for (const tc of cases) {
@@ -497,5 +500,63 @@ describe("new typed parsed variants of the missing methods", () => {
   it("typed missing method throws CographError on non-2xx", async () => {
     installFetch(new Response("boom", { status: 503 }));
     await expect(makeClient().exploreTypeEdges("kg1")).rejects.toBeInstanceOf(CographError);
+  });
+
+  it("search (typed, ONTA-178) maps opts to the canonical body and parses the envelope", async () => {
+    // Locks the SDK↔route field mapping the MCP tool depends on:
+    // kg → kg_name, type → type, topK → top_k, and the response envelope
+    // (hits/count/degraded/top_k) passed through unreshaped.
+    const envelope = {
+      hits: [
+        {
+          entity_uri: "e:solar",
+          attrs: { label: "Solar", type: "Speech" },
+          snippet: "rooftop solar…",
+          attr: "transcript",
+          score: 0.032,
+        },
+      ],
+      count: 1,
+      degraded: false,
+      top_k: 5,
+    };
+    const { calls } = installFetch(
+      new Response(JSON.stringify(envelope), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const got = await makeClient().search("solar subsidies", {
+      kg: "parliament",
+      type: "Speech",
+      topK: 5,
+    });
+    expect(got).toEqual(envelope);
+    expect(calls[0]!.url).toBe(`${PREFIX}/search`);
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+      query: "solar subsidies",
+      kg_name: "parliament",
+      type: "Speech",
+      top_k: 5,
+    });
+  });
+
+  it("search (typed) omits optional fields when not given", async () => {
+    const { calls } = installFetch(
+      new Response(JSON.stringify({ hits: [], count: 0, degraded: true, top_k: 10 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await makeClient().search("anything");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ query: "anything" });
+  });
+
+  it("search (typed) surfaces the disabled-deployment 503 as CographError", async () => {
+    installFetch(
+      new Response('{"detail":"… COGRAPH_SEMANTIC_INDEX_ENABLED …"}', { status: 503 }),
+    );
+    await expect(makeClient().search("x")).rejects.toBeInstanceOf(CographError);
   });
 });

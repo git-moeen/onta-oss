@@ -14,6 +14,7 @@ Tool → backend route (via the SDK):
   * delete_knowledge_graph → ``DELETE /graphs/{tenant}/kgs/{name}``     (SDK deleteKg)
   * list_jobs              → ``GET    /graphs/{tenant}/jobs``           (SDK jobs)
   * get_job                → ``GET    /graphs/{tenant}/enrich/jobs/{id}`` (SDK enrichJob)
+  * search                 → ``POST   /graphs/{tenant}/search``         (SDK search, ONTA-178)
 """
 
 from __future__ import annotations
@@ -66,3 +67,74 @@ def test_get_job_tool_target_404s_for_unknown_id(client, mock_neptune, auth_head
     (proving the route exists and is owner-scoped, not that it's unreachable)."""
     resp = client.get(f"/graphs/{TENANT}/enrich/jobs/does-not-exist", headers=auth_headers)
     assert resp.status_code == 404, resp.text
+
+
+def test_search_tool_target_contract(monkeypatch, client, auth_headers):
+    """search → POST /graphs/{tenant}/search returns the exact envelope the
+    MCP tool renders: hits[{entity_uri, attrs, snippet, attr, score}] + count +
+    degraded + top_k. The tool forwards query/kg_name/type/top_k verbatim —
+    this test proves those are the route's accepted body fields (ONTA-178).
+    Deeper behavior (clamping, filters, auth) is locked in
+    ``tests/test_search_route.py``."""
+    import asyncio
+
+    from cograph_client.semantic.extract import content_hash
+    from cograph_client.semantic.memory import InMemorySemanticIndex
+    from cograph_client.semantic.protocol import SemanticChunk
+    from cograph_client.semantic.registry import (
+        register_semantic_index,
+        reset_semantic_index,
+    )
+
+    monkeypatch.setenv("COGRAPH_SEMANTIC_INDEX_ENABLED", "true")
+    reset_semantic_index()
+    index = InMemorySemanticIndex()
+    register_semantic_index(index)
+    try:
+        text = "Rooftop solar subsidies for residential homes."
+        asyncio.run(
+            index.upsert_chunks(
+                [
+                    SemanticChunk(
+                        tenant_id=TENANT,
+                        kg_name="mcp-kg",
+                        entity_uri="e:solar",
+                        attr="description",
+                        chunk_ix=0,
+                        chunk_text=text,
+                        content_hash=content_hash(text),
+                        attrs={"label": "Solar", "type": "Report"},
+                    )
+                ]
+            )
+        )
+        resp = client.post(
+            f"/graphs/{TENANT}/search",
+            json={
+                "query": "solar subsidies",
+                "kg_name": "mcp-kg",
+                "type": "Report",
+                "top_k": 5,
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert set(body) == {"hits", "count", "degraded", "top_k"}
+        assert body["count"] == len(body["hits"]) == 1
+        hit = body["hits"][0]
+        assert set(hit) == {"entity_uri", "attrs", "snippet", "attr", "score"}
+        assert hit["entity_uri"] == "e:solar"
+    finally:
+        reset_semantic_index()
+
+
+def test_search_tool_disabled_deployment_503(monkeypatch, client, auth_headers):
+    """The MCP tool surfaces this 503 verbatim when the semantic index is off —
+    the detail must name the env gate so the operator knows the fix."""
+    monkeypatch.delenv("COGRAPH_SEMANTIC_INDEX_ENABLED", raising=False)
+    resp = client.post(
+        f"/graphs/{TENANT}/search", json={"query": "anything"}, headers=auth_headers
+    )
+    assert resp.status_code == 503
+    assert "COGRAPH_SEMANTIC_INDEX_ENABLED" in resp.json()["detail"]

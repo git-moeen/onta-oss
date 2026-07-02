@@ -1,0 +1,127 @@
+{
+  "description": "Listing remarks are unambiguous long prose (auto tier); the property address is text-shaped but structured and unadjudicated \u2192 unmarked.",
+  "headers": [
+    "mls_number",
+    "property_address",
+    "listing_remarks"
+  ],
+  "rows": [
+    {
+      "mls_number": "MLS-77000",
+      "property_address": "1180 Maple Court Unit 3B, Riverton",
+      "listing_remarks": "Sun drenched corner unit with floor to ceiling windows, a renovated chef's kitchen with quartz counters, and a private balcony overlooking the maple lined courtyard, steps from the farmers market and the riverfront trail."
+    },
+    {
+      "mls_number": "MLS-77001",
+      "property_address": "47 Alder Grove Street, Kingsview",
+      "listing_remarks": "Classic craftsman bungalow retaining its original fir floors and built-ins, updated with a new roof and tankless water heater, on a deep fenced lot with mature fruit trees and alley access ideal for a future accessory dwelling."
+    },
+    {
+      "mls_number": "MLS-77002",
+      "property_address": "2200 Summit Ridge Penthouse 12, Boulder",
+      "listing_remarks": "Rarely available penthouse offering panoramic mountain views from every room, a gas fireplace, two secure parking stalls, and access to the rooftop garden, gym, and guest suite in the building's amenity level below."
+    },
+    {
+      "mls_number": "MLS-77003",
+      "property_address": "615 Garfield Avenue, Tacoma",
+      "listing_remarks": "Fully permitted duplex with long term tenants in place, separate utility meters, newer windows throughout, and strong rental history, an excellent turn key opportunity for investors seeking stable neighborhood income."
+    },
+    {
+      "mls_number": "MLS-77004",
+      "property_address": "8 Rosewood Lane, Port Gamble",
+      "listing_remarks": "Storybook cottage tucked behind a rose covered fence featuring a remodeled bath, cozy window seats, and a detached studio with heat and power, perfect for a home office, art practice, or occasional overnight guests."
+    },
+    {
+      "mls_number": "MLS-77005",
+      "property_address": "3921 Juniper Row 7, Bellingham",
+      "listing_remarks": "Contemporary townhome built in 2021 with an open plan main level, a heat pump for efficient year round comfort, a fenced patio pre-wired for a hot tub, and an oversized garage with a dedicated EV charging circuit."
+    },
+    {
+      "mls_number": "MLS-77006",
+      "property_address": "14 Larchmont Circle, Spokane",
+      "listing_remarks": "Mid century ranch on a quiet cul de sac with vaulted cedar ceilings, a double sided brick fireplace, and an unfinished daylight basement offering obvious potential to nearly double the current living space over time."
+    },
+    {
+      "mls_number": "MLS-77007",
+      "property_address": "290 Bayshore Road, Anacortes",
+      "listing_remarks": "Waterfront cabin with sixty feet of private low bank shoreline, a newer dock with deep water moorage, and a wraparound deck positioned to catch both the sunrise over the bay and the evening light on the mountains."
+    }
+  ],
+  "recorded": {
+    "reason": {
+      "entities": [
+        {
+          "name": "listing",
+          "type_name": "Listing",
+          "key_strategy": "column",
+          "key_columns": [
+            "mls_number"
+          ]
+        }
+      ],
+      "columns": [
+        {
+          "column": "mls_number",
+          "role": "key",
+          "entity": "listing",
+          "predicate_or_attr": "mls_number"
+        },
+        {
+          "column": "property_address",
+          "role": "attribute",
+          "entity": "listing",
+          "predicate_or_attr": "property_address"
+        },
+        {
+          "column": "listing_remarks",
+          "role": "attribute",
+          "entity": "listing",
+          "predicate_or_attr": "listing_remarks"
+        }
+      ],
+      "relationships": []
+    }
+  },
+  "expected": {
+    "entity_type": "Listing",
+    "entities": [
+      {
+        "name": "listing",
+        "type_name": "Listing",
+        "key_strategy": "column",
+        "id_column": "mls_number",
+        "id_from": null
+      }
+    ],
+    "columns": [
+      {
+        "column_name": "mls_number",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "mls_number",
+        "entity": "listing",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "property_address",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "property_address",
+        "entity": "listing",
+        "target_type": null,
+        "text_kind": null
+      },
+      {
+        "column_name": "listing_remarks",
+        "role": "attribute",
+        "datatype": "string",
+        "attribute_name": "listing_remarks",
+        "entity": "listing",
+        "target_type": null,
+        "text_kind": "free_text"
+      }
+    ],
+    "relationships": null
+  }
+}

@@ -219,10 +219,11 @@ async def dispatch_scheduled_action(
     client: NeptuneClient,
     job_store,
     executor: EnrichmentExecutor,
-) -> EnrichJob:
+) -> Optional[EnrichJob]:
     """Create + run the job for a due ``schedule``, reusing the route workers.
 
-    Returns the created job. The worker runs to completion when awaited (the
+    Returns the created job (``None`` for the semantic maintenance actions,
+    which create no job rows). The worker runs to completion when awaited (the
     runner awaits it); callers that want fire-and-forget can wrap the returned
     coroutine themselves. Action → worker mapping is identical to the routes:
 
@@ -231,9 +232,24 @@ async def dispatch_scheduled_action(
     - ``suggest-relationships`` → :func:`_run_suggest` (premium recommender), or
       a terminal no-op job when no recommender is wired (mirrors the route's
       graceful degrade).
+    - ``semantic-embed-fill`` / ``semantic-reconcile`` (ONTA-181) →
+      ``semantic.reconciler.dispatch_semantic_schedule``. Routed through THIS
+      seam (not a private loop) so semantic maintenance inherits the runner's
+      SKIP LOCKED claim exclusivity. Deliberately job-row-free — a 5-minute
+      sweep would flood the unified Jobs feed; observability is the
+      reconciler's structlog counters.
     """
-    job = _job_from_schedule(schedule)
     action = schedule.action
+
+    if action in ("semantic-embed-fill", "semantic-reconcile"):
+        # Lazy import: keeps the semantic subsystem out of this module's import
+        # graph (mirrors the runner's lazy import of this function).
+        from cograph_client.semantic.reconciler import dispatch_semantic_schedule
+
+        await dispatch_semantic_schedule(schedule, client=client)
+        return None
+
+    job = _job_from_schedule(schedule)
 
     if action == "enrich":
         await job_store.create(job)

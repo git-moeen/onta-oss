@@ -1,4 +1,4 @@
-export { Client, CographError, RawApi } from "./client.js";
+export { Client, CographError, RawApi, USER_SCHEDULABLE_ACTIONS } from "./client.js";
 export type {
   ClientOptions,
   IngestOptions,
@@ -27,4 +27,11 @@ export type {
   TypeRecordsPage,
   TypeEdge,
   NormalizationRule,
+  // ONTA-178 — canonical semantic instance search
+  SemanticSearchHit,
+  SemanticSearchResponse,
+  // ONTA-173 — schedules: user-schedulable vs system-managed action split
+  Schedule,
+  ScheduleAction,
+  UserSchedulableAction,
 } from "./client.js";

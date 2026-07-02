@@ -373,6 +373,66 @@ def test_shared_writer_is_the_single_housekeeping_owner():
     assert "rewritten_subjects" in src
 
 
+# --- Structural tripwire: semantic-index writers (ONTA-181) --------------------
+#
+# Background workers escaped the original tripwire (it only covered request-path
+# writers). The semantic instance index has exactly TWO writers — the kg_writer
+# hook (freshness) and the reconciler (correctness) — and both must stay on the
+# shared seams: extraction via extract_semantic_chunks (one chunking/hashing
+# contract), writes via the SemanticIndex protocol (upsert_chunks / delete /
+# fill_embeddings / mark_embed_failed), and embeddings via the ONE shared embed
+# client (nlp/embed_client.embed_texts). Kept as a separate, clearly-named test
+# so a parallel extension of this file (route scanning) never collides with it.
+
+
+def test_semantic_index_writers_use_shared_seams():
+    """ONTA-181 drift guard for the semantic-index write hook + reconciler."""
+    import cograph_client.graph.kg_writer as kg_writer_mod
+    import cograph_client.semantic.reconciler as reconciler_mod
+
+    # The write hook (kg_writer._index_semantic) chunks via the shared extractor
+    # and writes via the protocol — no bespoke chunker/hasher, no direct rows.
+    kg_src = inspect.getsource(kg_writer_mod)
+    assert _calls(kg_src, "extract_semantic_chunks"), (
+        "the kg_writer semantic hook must chunk via semantic.extract."
+        "extract_semantic_chunks (one chunking/hashing contract)"
+    )
+    assert ".upsert_chunks(" in kg_src, (
+        "the kg_writer semantic hook must write via SemanticIndex.upsert_chunks"
+    )
+
+    # The reconciler: same extractor + protocol writes + the ONE embed client.
+    rec_src = inspect.getsource(reconciler_mod)
+    assert _calls(rec_src, "extract_semantic_chunks"), (
+        "the reconciler must re-extract via extract_semantic_chunks — a private "
+        "chunker would fork the content_hash contract"
+    )
+    assert ".upsert_chunks(" in rec_src, (
+        "the reconciler must upsert via SemanticIndex.upsert_chunks"
+    )
+    assert _calls(rec_src, "embed_texts"), (
+        "the embed-fill sweep must embed via nlp.embed_client.embed_texts — the "
+        "single embed-batch implementation (ONTA-174)"
+    )
+    assert ".fill_embeddings(" in rec_src and ".mark_embed_failed(" in rec_src, (
+        "the sweep must persist fills/failures via the protocol's "
+        "fill_embeddings / mark_embed_failed (content-hash guarded)"
+    )
+    assert "httpx" not in rec_src, (
+        "the reconciler re-inlined an HTTP embedding call — use "
+        "nlp.embed_client.embed_texts (shared embed client rule)."
+    )
+    # The reconciler is NOT an instance-data writer: it must never write
+    # Neptune instance triples (its only Neptune writes are textKind ontology
+    # markers via upsert_attribute_text_kind).
+    assert not _calls(rec_src, "insert_facts")
+    assert not _calls(rec_src, "insert_triples")
+    assert not _calls(rec_src, "batched_insert_triples"), (
+        "the reconciler grew a bespoke Neptune instance write — instance data "
+        "goes through graph/kg_writer.insert_facts (write-path convergence rule)."
+    )
+
+
 # --- Guard self-tests: the scan actually catches planted bespoke writes ---------
 
 
