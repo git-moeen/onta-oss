@@ -1,19 +1,21 @@
 """Tests for the second-pass `er rebuild` (MOE-22).
 
 The cluster computation is pure (no graph), so most of this exercises
-compute_clusters / choose_canonical / merge_operations directly. A couple of
-async tests drive rebuild_type with a fake Neptune client to cover the
-orchestration + idempotency end-to-end without a real store.
+compute_clusters / choose_canonical directly. A couple of async tests drive
+rebuild_type with a fake Neptune client to cover the orchestration + idempotency
+end-to-end without a real store. Since ADR 0007, the merge SPARQL lives in
+`kg_writer.rewrite_subject` (via `queries.rewrite_subject_update`), so the
+two-direction move is asserted against that builder here.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from cograph_client.graph.queries import rewrite_subject_update
 from cograph_client.resolver.er.rebuild import (
     choose_canonical,
     compute_clusters,
-    merge_operations,
     rebuild_type,
 )
 from cograph_client.resolver.er.types import DEFAULT_GUEST_CONFIG, NormalizedSignals
@@ -95,8 +97,8 @@ def test_choose_canonical_prefers_richest_then_stable() -> None:
     assert choose_canonical(["uri:zzz", "uri:aaa"], tie) == "uri:aaa"
 
 
-def test_merge_operations_move_both_directions() -> None:
-    op = merge_operations("graph:hotel", "uri:canon", "uri:loser")
+def test_rewrite_subject_update_moves_both_directions() -> None:
+    op = rewrite_subject_update("graph:hotel", "uri:loser", "uri:canon")
     # Outgoing edges of the loser move to the canonical...
     assert "DELETE { <uri:loser> ?p ?o }" in op
     assert "INSERT { <uri:canon> ?p ?o }" in op

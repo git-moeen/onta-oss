@@ -25,6 +25,19 @@ ones) but are identical in *how those facts get written and refreshed*:
   embedding after a new attribute lands), and schedule the Explorer type-stats
   recompute. Every successful write calls this with the types it touched.
 
+Removals join the same path (ADR 0007). A fact *leaving* the graph or a subject
+being *renamed* carries the identical fan-out obligation as an insert, so:
+
+- :func:`delete_facts` — the one removal primitive (batched whole-subject or
+  triple deletes) + a provenance *tombstone*.
+- :func:`rewrite_subject` — the one URI-rewrite primitive (ER merge) + a
+  provenance *rewrite* event; expressed as a single re-key event, NOT
+  delete-then-insert, so derived indexes re-key cheaply instead of recomputing.
+- :func:`refresh_after_write` grows ``deleted_subjects`` / ``rewritten_subjects``
+  kwargs (no sibling ``refresh_after_delete`` — that fork is the banned drift):
+  the same housekeeping pass evicts deleted subjects and re-keys renamed ones
+  from every derived secondary index.
+
 Layering note: this module sits in ``graph/`` and must stay importable without
 pulling in ``nlp`` or the API routes, so the embedding-service / ontology-cache /
 stats-recompute dependencies are imported lazily inside
@@ -38,15 +51,27 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 import structlog
 
-from cograph_client.graph.provenance import provenance_graph_uri
+from cograph_client.graph.parser import parse_sparql_results
+from cograph_client.graph.provenance import (
+    build_rewrite_triples,
+    build_tombstone_triples,
+    provenance_graph_uri,
+)
 from cograph_client.graph.queries import (
     _escape_literal,
+    batched_delete_triples,
     batched_insert_triples,
+    count_subject_predicates_query,
+    count_subjects_query,
+    delete_subject_predicates_query,
+    delete_subjects_query,
     parse_kg_graph_uri,
+    rewrite_subject_update,
     tenant_graph_uri,
 )
 
@@ -64,6 +89,35 @@ Triple = tuple[str, str, str]
 _INDEX_UPSERT_TIMEOUT_S = float(
     os.environ.get("COGRAPH_SPATIOTEMPORAL_UPSERT_TIMEOUT_S", "10")
 )
+
+
+def _provenance_enabled() -> bool:
+    """Whether removal/rename primitives write companion-graph provenance events.
+
+    Gated by the same ``COGRAPH_PROVENANCE_ENABLED`` env var the ingest path uses
+    for assertion provenance (default OFF), so tombstone/rewrite events only land
+    when governance/undo is switched on.
+    """
+    return os.environ.get("COGRAPH_PROVENANCE_ENABLED", "0") == "1"
+
+
+def _chunk(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+async def _count_matching(neptune, count_sparql: str) -> int:
+    """Best-effort ``SELECT (COUNT(*) AS ?n)`` → int (0 on any failure).
+
+    Used by :func:`delete_facts` to return an accurate removed-triple count for
+    the pattern-based (subject / predicate-scoped) removals, whose count can't be
+    known up front the way a concrete-triple list's can. Best-effort because the
+    count is informational — a hiccup here must never fail the delete."""
+    try:
+        _, rows = parse_sparql_results(await neptune.query(count_sparql))
+        return int(rows[0].get("n", 0)) if rows else 0
+    except Exception:  # noqa: BLE001 — the count is informational, never load-bearing
+        return 0
 
 # KG-registration triple shape — the `<kg_uri> <onto/kg_name> "name"` record in
 # the tenant metadata graph that ``list_kgs`` reads to populate the Explorer
@@ -217,6 +271,137 @@ async def _index_spatiotemporal(
         )
 
 
+async def delete_facts(
+    neptune,
+    instance_graph: str,
+    *,
+    subjects: Optional[list[str]] = None,
+    triples: Optional[list[Triple]] = None,
+    touched_types: Iterable[str] = (),
+    reason: str = "",
+) -> int:
+    """Remove instance triples from the KG — the single removal primitive (ADR 0007).
+
+    The mirror of :func:`insert_facts`: a fact *leaving* the graph must fan out to
+    the same places an arriving one does (a provenance record here; derived-index
+    eviction via :func:`refresh_after_write`), regardless of which writer produced
+    the removal. Two removal shapes, both **batched with the same discipline as**
+    ``insert_facts`` so a large removal never emits one oversized statement:
+
+    * ``subjects`` — delete EVERY triple whose subject is one of these URIs
+      (whole-entity removal: a normalization orphan sweep, an ER-merge loser, a
+      metadata upsert's clear-before-write).
+    * ``triples`` — delete specific ``(s, p, o)`` triples. An entry whose object
+      is ``None`` is a **predicate-scoped** delete: every object of that
+      ``(s, p)`` is removed — the "clear this attribute before writing the new
+      value" case (an attribute update = delete-old + insert-new), which avoids a
+      fragile literal round-trip on the old value.
+
+    Writes a ``tombstone`` event to the companion provenance graph
+    (:func:`cograph_client.graph.provenance.build_tombstone_triples`, gated by
+    ``COGRAPH_PROVENANCE_ENABLED`` exactly like assertion provenance) so
+    governance/undo can see removals, not just assertions. Returns the
+    removed-triple count.
+
+    Does NOT itself touch derived secondary indexes: call
+    :func:`refresh_after_write` with ``deleted_subjects`` once per operation so a
+    single housekeeping pass evicts them (batched refresh, not per-delete).
+    """
+    subjects = [s for s in (subjects or []) if s]
+    all_triples = list(triples or [])
+    concrete = [(s, p, o) for (s, p, o) in all_triples if o is not None and s and p]
+    sp_pairs = [(s, p) for (s, p, o) in all_triples if o is None and s and p]
+
+    removed = 0
+    # 1. Concrete-triple deletes (batched DELETE DATA) — exact count.
+    if concrete:
+        for sparql in batched_delete_triples(instance_graph, concrete):
+            await neptune.update(sparql)
+        removed += len(concrete)
+    # 2. Predicate-scoped deletes (every object of each (s, p)) — count per chunk.
+    for chunk in _chunk(sp_pairs, 500):
+        removed += await _count_matching(
+            neptune, count_subject_predicates_query(instance_graph, chunk)
+        )
+        await neptune.update(delete_subject_predicates_query(instance_graph, chunk))
+    # 3. Whole-subject deletes — count per chunk.
+    for chunk in _chunk(subjects, 500):
+        removed += await _count_matching(
+            neptune, count_subjects_query(instance_graph, chunk)
+        )
+        await neptune.update(delete_subjects_query(instance_graph, chunk))
+
+    # 4. Provenance tombstone (gated + best-effort — never fail a write on it).
+    if (subjects or all_triples) and _provenance_enabled():
+        try:
+            prov = build_tombstone_triples(
+                subjects=subjects,
+                triples=all_triples,
+                graph_uri=instance_graph,
+                reason=reason,
+                timestamp=datetime.now(timezone.utc),
+                touched_types=touched_types,
+            )
+            if prov:
+                prov_graph = provenance_graph_uri(instance_graph)
+                for sparql in batched_insert_triples(prov_graph, prov):
+                    await neptune.update(sparql)
+        except Exception:  # noqa: BLE001 — provenance is governance metadata, not the write
+            logger.warning(
+                "delete_facts_provenance_failed",
+                instance_graph=instance_graph,
+                exc_info=True,
+            )
+    return removed
+
+
+async def rewrite_subject(
+    neptune,
+    instance_graph: str,
+    old_uri: str,
+    new_uri: str,
+    *,
+    touched_types: Iterable[str] = (),
+    reason: str = "",
+) -> None:
+    """Rename a subject in place — the single URI-rewrite primitive (ADR 0007).
+
+    Moves every triple referencing ``old_uri`` (as subject AND as object) onto
+    ``new_uri`` in one batched update (``rewrite_subject_update``). Deliberately
+    **not** ``delete_facts`` + ``insert_facts``: a rename is ONE semantic event,
+    so derived indexes re-key (cheap) instead of evict-and-recompute (an embedding
+    recompute per merged entity is the full enrichment-embed cost for zero
+    information gain). Records a ``rewrite`` provenance event (old → new), gated by
+    ``COGRAPH_PROVENANCE_ENABLED``.
+
+    Does NOT itself touch derived secondary indexes: call
+    :func:`refresh_after_write` with ``rewritten_subjects={old: new}`` once per
+    rebuild batch so a single housekeeping pass re-keys them.
+    """
+    if not old_uri or not new_uri or old_uri == new_uri:
+        return
+    await neptune.update(rewrite_subject_update(instance_graph, old_uri, new_uri))
+    if _provenance_enabled():
+        try:
+            prov = build_rewrite_triples(
+                old_uri,
+                new_uri,
+                graph_uri=instance_graph,
+                reason=reason,
+                timestamp=datetime.now(timezone.utc),
+                touched_types=touched_types,
+            )
+            prov_graph = provenance_graph_uri(instance_graph)
+            for sparql in batched_insert_triples(prov_graph, prov):
+                await neptune.update(sparql)
+        except Exception:  # noqa: BLE001 — provenance is governance metadata, not the write
+            logger.warning(
+                "rewrite_subject_provenance_failed",
+                instance_graph=instance_graph,
+                exc_info=True,
+            )
+
+
 async def refresh_after_write(
     neptune,
     *,
@@ -224,8 +409,10 @@ async def refresh_after_write(
     kg_name: Optional[str],
     affected_types: Iterable[str] = (),
     recompute_stats: bool = True,
+    deleted_subjects: Iterable[str] = (),
+    rewritten_subjects: Optional[dict[str, str]] = None,
 ) -> None:
-    """Post-write housekeeping shared by ingest + enrichment.
+    """Post-write housekeeping shared by ingest + enrichment + removals (ADR 0007).
 
     Runs the refreshes a write can invalidate, in order:
 
@@ -242,6 +429,15 @@ async def refresh_after_write(
        not just KGs created via the "New KG" button (ONTA-153).
     4. **Schedule the Explorer type-stats recompute** for the KG (coverage %,
        counts) when ``kg_name`` is given and ``recompute_stats`` is set.
+    5. **Evict / re-key derived secondary indexes** for removals and renames:
+       ``deleted_subjects`` are dropped from the spatiotemporal index (and the
+       upcoming semantic index); ``rewritten_subjects`` (old → new, from an ER
+       merge) are re-keyed rather than evicted. Both default empty so every
+       existing call site is untouched. This is the removal-side mirror of
+       ``insert_facts``'s ``_index_spatiotemporal`` — a sibling
+       ``refresh_after_delete`` is deliberately NOT added (a forked refresh is the
+       exact drift this convergence bans; an attribute *update* is a delete +
+       insert and must run one refresh, not two).
 
     Best-effort: embedding and stats failures are logged and swallowed (a write
     must not fail because a downstream refresh hiccuped), matching the ingest
@@ -283,3 +479,62 @@ async def refresh_after_write(
             schedule_recompute(neptune, tenant_id, kg_name)
         except Exception:  # noqa: BLE001
             logger.warning("schedule_recompute_failed", exc_info=True)
+
+    # 5. Derived secondary-index maintenance for removals / renames.
+    await _deindex_secondary(
+        tenant_id, kg_name, list(deleted_subjects), rewritten_subjects or {}
+    )
+
+
+async def _deindex_secondary(
+    tenant_id: str,
+    kg_name: Optional[str],
+    deleted_subjects: list[str],
+    rewritten_subjects: dict[str, str],
+) -> None:
+    """Evict deleted subjects and re-key renamed ones from derived secondary indexes.
+
+    The removal-side mirror of :func:`_index_spatiotemporal`: when a fact LEAVES
+    the graph (delete) or a subject is RENAMED (ER merge), every derived index
+    keyed by subject URI must drop the ghost row (delete) or move it to the new
+    key (re-key), exactly as an insert upserts. Leaving this out is what let the
+    spatiotemporal index accumulate ghost rows for merged-away / deleted subjects
+    (ADR 0007). Best-effort + time-bounded, same isolation as the insert side —
+    Neptune is the source of truth and this index is eventually consistent.
+
+    SEMANTIC-INDEX SEAM (ONTA-173): the upcoming embeddings-keyed-by-node-URI
+    index subscribes to the SAME three event kinds — insert (via
+    ``_index_spatiotemporal``), delete (evict below), rewrite (re-key below). Add
+    its ``delete`` / ``rekey`` calls right alongside the spatiotemporal ones here
+    so it never inherits the ghost-row problem this function exists to prevent.
+    """
+    if not deleted_subjects and not rewritten_subjects:
+        return
+    try:
+        from cograph_client.spatiotemporal.registry import get_spatiotemporal_index
+
+        index = get_spatiotemporal_index()
+
+        async def _work() -> None:
+            for uri in deleted_subjects:
+                await index.delete(uri, tenant_id, kg_name=kg_name)
+            for old, new in rewritten_subjects.items():
+                rekey = getattr(index, "rekey", None)
+                if rekey is not None:
+                    await rekey(old, new, tenant_id, kg_name=kg_name)
+                else:
+                    # A backend that predates re-key (an out-of-tree override):
+                    # evict the stale key so a ghost row can't survive. Correctness
+                    # (no ghost) over the re-key cost saving.
+                    await index.delete(old, tenant_id, kg_name=kg_name)
+
+        # Time-bounded so a hung backend can't block the write (see the
+        # _INDEX_UPSERT_TIMEOUT_S note); TimeoutError is caught below.
+        await asyncio.wait_for(_work(), timeout=_INDEX_UPSERT_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — never fail a write on a derived-index hiccup
+        logger.warning(
+            "spatiotemporal_index_deindex_failed",
+            tenant_id=tenant_id,
+            kg_name=kg_name,
+            exc_info=True,
+        )

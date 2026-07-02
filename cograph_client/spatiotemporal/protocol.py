@@ -166,6 +166,25 @@ class SpatioTemporalIndex(Protocol):
         ``None`` removes the entity's facts across every KG in the tenant."""
         ...
 
+    async def rekey(
+        self,
+        old_uri: str,
+        new_uri: str,
+        tenant_id: str,
+        *,
+        kg_name: Optional[str] = None,
+    ) -> None:
+        """Move every fact for ``old_uri`` onto ``new_uri`` (ER-merge re-key).
+
+        The removal-side counterpart of a rename: instead of evicting ``old_uri``'s
+        rows and recomputing ``new_uri``'s from scratch (an embedding recompute per
+        merged entity — full enrichment cost for zero information gain), the index
+        simply re-keys the rows. ``new_uri`` (the ER-merge winner) keeps precedence
+        on a ``(valid_time)`` collision — a row that already exists under
+        ``new_uri`` is NOT clobbered by the loser's row. ``kg_name`` narrows to a
+        single KG; ``None`` re-keys across every KG in the tenant."""
+        ...
+
     async def clear(self, tenant_id: str, *, kg_name: Optional[str] = None) -> None:
         """Remove facts for a tenant. ``kg_name`` clears just that KG (the KG-delete
         path); ``None`` clears the whole tenant (e.g. tenant teardown)."""

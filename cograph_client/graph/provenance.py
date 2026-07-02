@@ -58,6 +58,20 @@ PROV_CONFIDENCE = f"{PROV_NS}confidence"
 PROV_TIMESTAMP = f"{PROV_NS}timestamp"
 PROV_GRAPH = f"{PROV_NS}graph"
 
+# Removal / rename events (ADR 0007). Assertions above record a fact ARRIVING;
+# these record a fact LEAVING (``tombstone``) or a subject being RENAMED
+# (``rewrite``), so governance/undo sees the full lifecycle — not just inserts.
+# They live in the same companion provenance graph as assertions and are written
+# by the ``delete_facts`` / ``rewrite_subject`` primitives (kg_writer.py), gated
+# by ``COGRAPH_PROVENANCE_ENABLED`` exactly like assertion provenance.
+PROV_EVENT = f"{PROV_NS}event"  # "tombstone" | "rewrite"
+PROV_REASON = f"{PROV_NS}reason"
+PROV_REWRITTEN_TO = f"{PROV_NS}rewrittenTo"  # rewrite event: old subject → new URI
+PROV_AFFECTED_TYPE = f"{PROV_NS}affectedType"  # type(s) touched by the removal/rename
+
+EVENT_TOMBSTONE = "tombstone"
+EVENT_REWRITE = "rewrite"
+
 _XSD = "http://www.w3.org/2001/XMLSchema"
 
 
@@ -119,6 +133,106 @@ def build_provenance_triples(
     if graph_uri:
         triples.append((node, PROV_GRAPH, graph_uri))
     return triples
+
+
+def _event_uri(event: str, subject: str, obj: str, ts: str) -> str:
+    """Metadata node URI for one removal/rename event.
+
+    Keyed by ``sha1(event|subject|obj|timestamp)`` so distinct removals of the
+    same subject over time are distinct nodes (idempotent for a fixed timestamp,
+    which is how tests pin them).
+    """
+    eid = hashlib.sha1(f"{event}|{subject}|{obj}|{ts}".encode("utf-8")).hexdigest()
+    return f"{PROV_NS}event/{eid}"
+
+
+def _event_common(
+    node: str,
+    event: str,
+    subject: str,
+    reason: str,
+    ts: str,
+    graph_uri: str,
+    touched_types,
+) -> list[tuple[str, str, str]]:
+    triples = [
+        (node, PROV_EVENT, event),
+        (node, PROV_SUBJECT, subject),
+    ]
+    if reason:
+        triples.append((node, PROV_REASON, reason))
+    if ts:
+        triples.append((node, PROV_TIMESTAMP, f"{ts}^^{_XSD}#dateTime"))
+    if graph_uri:
+        triples.append((node, PROV_GRAPH, graph_uri))
+    for t in touched_types or ():
+        if t:
+            triples.append((node, PROV_AFFECTED_TYPE, t))
+    return triples
+
+
+def build_tombstone_triples(
+    *,
+    subjects=(),
+    triples=(),
+    graph_uri: str = "",
+    reason: str = "",
+    timestamp: datetime | str = "",
+    touched_types=(),
+) -> list[tuple[str, str, str]]:
+    """Build the statement-metadata triples for a removal (``delete_facts``).
+
+    One ``tombstone`` event node per removed **subject** (whole-subject delete)
+    and per removed **triple** (concrete or predicate-scoped). Each records the
+    subject (and predicate/object where applicable), the reason, a timestamp, the
+    data graph, and any affected types — the mirror of
+    :func:`build_provenance_triples`'s assertion node so an undo can see exactly
+    what left the graph. ``o is None`` in a ``triples`` entry means a
+    predicate-scoped removal (all objects of that ``(subject, predicate)``), so no
+    ``prov:object`` is recorded. Returned triples target the companion provenance
+    graph; the caller inserts them there.
+    """
+    ts = timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp
+    out: list[tuple[str, str, str]] = []
+    for s in subjects or ():
+        if not s:
+            continue
+        node = _event_uri(EVENT_TOMBSTONE, s, "", ts)
+        out.extend(_event_common(node, EVENT_TOMBSTONE, s, reason, ts, graph_uri, touched_types))
+    for triple in triples or ():
+        s, p, o = triple
+        if not s:
+            continue
+        node = _event_uri(EVENT_TOMBSTONE, s, f"{p}|{'' if o is None else o}", ts)
+        node_triples = _event_common(node, EVENT_TOMBSTONE, s, reason, ts, graph_uri, touched_types)
+        if p:
+            node_triples.append((node, PROV_PREDICATE, p))
+        if o is not None:
+            node_triples.append((node, PROV_OBJECT, o))
+        out.extend(node_triples)
+    return out
+
+
+def build_rewrite_triples(
+    old_uri: str,
+    new_uri: str,
+    *,
+    graph_uri: str = "",
+    reason: str = "",
+    timestamp: datetime | str = "",
+    touched_types=(),
+) -> list[tuple[str, str, str]]:
+    """Build the statement-metadata triples for a subject rename (``rewrite_subject``).
+
+    One ``rewrite`` event node mapping ``old_uri → new_uri`` (``prov:rewrittenTo``)
+    so governance/undo can follow an ER merge, and derived indexes have a record
+    of the re-key. Returned triples target the companion provenance graph.
+    """
+    ts = timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp
+    node = _event_uri(EVENT_REWRITE, old_uri, new_uri, ts)
+    out = _event_common(node, EVENT_REWRITE, old_uri, reason, ts, graph_uri, touched_types)
+    out.append((node, PROV_REWRITTEN_TO, new_uri))
+    return out
 
 
 def provenance_query(graph_uri: str, subject: str, predicate: str | None = None, limit: int = 1000) -> str:
